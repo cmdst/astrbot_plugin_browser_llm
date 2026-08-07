@@ -1,0 +1,178 @@
+{
+  "browser_type": {
+    "type": "string",
+    "description": "浏览器引擎类型",
+    "hint": "驱动网页浏览使用的 Playwright 浏览器内核。chromium 兼容性最好，firefox/webkit 视环境支持情况选择。",
+    "options": [
+      "chromium",
+      "firefox",
+      "webkit"
+    ],
+    "default": "chromium"
+  },
+  "default_url": {
+    "type": "string",
+    "description": "默认起始页",
+    "hint": "会话首次打开浏览器时加载的地址；Agent 通常会根据用户问题导航到目标页，此地址仅作兜底。",
+    "default": "https://www.baidu.com"
+  },
+  "default_search_engine": {
+    "type": "string",
+    "description": "默认搜索引擎",
+    "hint": "Agent 执行搜索时使用的搜索引擎。",
+    "options": [
+      "必应搜索",
+      "百度搜索",
+      "谷歌搜索",
+      "B站搜索"
+    ],
+    "default": "必应搜索"
+  },
+  "banned_words": {
+    "type": "list",
+    "description": "内容禁词列表",
+    "hint": "命中这些关键词的网页内容 / 搜索结果会被安全过滤拦截，禁止返回给 LLM 与用户。",
+    "default": [
+      "pornhub",
+      "色情",
+      "成人",
+      "赌博",
+      "暴力",
+      "政治",
+      "反动",
+      "恐怖",
+      "谣言",
+      "诈骗",
+      "病毒"
+    ]
+  },
+  "block_internal_ip": {
+    "type": "bool",
+    "description": "拦截内网地址",
+    "hint": "开启后拒绝访问内网/本机地址（如 127.0.0.1、192.168.x.x），防止 SSRF 风险。关闭后不拦截内网地址（不推荐）。",
+    "default": true
+  },
+  "max_chars": {
+    "type": "int",
+    "description": "单页正文提取上限（字符）",
+    "hint": "每次提取网页正文时最多返回的字符数，超长内容按此截断，控制注入 token 消耗。",
+    "default": 4000
+  },
+  "max_links": {
+    "type": "int",
+    "description": "单页链接提取上限",
+    "hint": "每次提取网页时最多返回多少条链接供 Agent 选择点击。",
+    "default": 20
+  },
+  "timeout": {
+    "type": "int",
+    "description": "页面操作超时（秒）",
+    "hint": "页面加载、点击、搜索等单次浏览器操作的超时时间。",
+    "default": 30
+  },
+  "max_pages": {
+    "type": "int",
+    "description": "每会话最大标签页数",
+    "hint": "同一浏览会话内最多可同时打开的标签页数量，达到上限后新标签/新会话将被拒绝，防止 Agent 无限开标签消耗资源。",
+    "default": 5
+  },
+  "idle_timeout": {
+    "type": "int",
+    "description": "会话空闲回收时间（秒）",
+    "hint": "浏览会话闲置超过该秒数后自动关闭，释放浏览器资源。",
+    "default": 1800
+  },
+  "session_whitelist": {
+    "type": "list",
+    "description": "会话白名单",
+    "hint": "仅允许在这些会话中使用浏览能力。每个条目可以是完整 UMO（用 /sid 获取）或群号/用户 ID。留空表示允许全部会话",
+    "default": []
+  },
+  "session_blacklist": {
+    "type": "list",
+    "description": "会话黑名单",
+    "hint": "禁止在这些会话中使用浏览能力。格式同白名单。黑名单优先级高于白名单",
+    "default": []
+  },
+  "enable_screenshot": {
+    "type": "bool",
+    "description": "启用页面截图",
+    "hint": "开启后浏览网页时截取页面截图返回给用户；关闭后仅返回文字内容。",
+    "default": true
+  },
+  "vision_provider_id": {
+    "type": "string",
+    "description": "多模态识图模型 Provider ID",
+    "hint": "下拉选择多模态模型对截图做识图总结；留空则截图仅发用户不做识图。若列表中没有你的识图模型，可先在 AstrBot 模型配置中添加，再手动编辑本插件配置文件填写",
+    "options": [
+      "opencode-go/mimo-v2.5",
+      ""
+    ],
+    "default": "opencode-go/mimo-v2.5"
+  },
+  "vision_prompt": {
+    "type": "string",
+    "description": "识图提示词模板",
+    "hint": "发给多模态模型的识图提示词，可自定义以提升识图准确性。留空使用默认提示词",
+    "editor_mode": true,
+    "editor_language": "text",
+    "editor_theme": "vs-light",
+    "default": "请用中文描述这张网页截图的重点内容，包括主要文字、按钮、链接和页面结构。"
+  },
+  "silent_mode": {
+    "type": "bool",
+    "description": "静默模式",
+    "hint": "开启后浏览截图仅内部识图，不发送到群聊（减少刷屏）；关闭后截图会发送给用户",
+    "default": true
+  },
+  "page_perception": {
+    "type": "string",
+    "description": "页面感知方式",
+    "hint": "text=仅文字读取（最快，不用截图识图）；text_image=文字为主+必要时截图识图（平衡，推荐）；image=以截图识图为主",
+    "options": ["text", "text_image", "image"],
+    "default": "text_image"
+  },
+  "proxy": {
+    "type": "string",
+    "description": "浏览器代理地址",
+    "hint": "Playwright 浏览器使用的代理，如 http://127.0.0.1:7890。留空表示直连",
+    "default": ""
+  },
+  "viewport": {
+    "description": "浏览器视口尺寸",
+    "type": "object",
+    "hint": "浏览器窗口视口大小，宽高单位为像素。",
+    "items": {
+      "width": {
+        "description": "视口宽度",
+        "type": "int",
+        "hint": "影响页面渲染与截图宽度",
+        "default": 1280
+      },
+      "height": {
+        "description": "视口高度",
+        "type": "int",
+        "hint": "影响页面渲染与截图高度",
+        "default": 800
+      }
+    }
+  },
+  "agent_max_steps": {
+    "type": "int",
+    "description": "浏览器子代理最大工具调用步数",
+    "hint": "浏览器子代理（browser_agent）在一次委托任务中最多执行的工具调用次数，防止无限循环消耗资源。复杂长任务（如逐题作答15题）建议 60-80。",
+    "default": 70
+  },
+  "agent_tool_timeout": {
+    "type": "int",
+    "description": "浏览器子代理单次工具调用超时（秒）",
+    "hint": "浏览器子代理执行单个 browse_* 工具的超时上限；完成一整套长任务（如完整做题/多步表单）时此值会叠加，建议保持 300-600。若超长任务仍被中断，请同步调大 AstrBot 全局“工具调用超时”（WebUI 模型设置）。",
+    "default": 1200
+  },
+  "cache_days": {
+    "type": "int",
+    "description": "媒体缓存保留天数",
+    "hint": "下载的图片/视频等媒体缓存超过该天数后自动清理，节省磁盘",
+    "default": 3
+  }
+}
