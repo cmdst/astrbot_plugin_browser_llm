@@ -1,0 +1,23 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build release zip
+        run: |
+          mkdir -p dist
+          zip -r "dist/astrbot_plugin_browser_llm_${GITHUB_REF_NAME}.zip" . \
+            -x ".git/*" -x ".github/*" -x "data/*" -x "__pycache__/*" -x "core/__pycache__/*" -x "tests/__pycache__/*" -x ".pytest_cache/*" -x "*.pyc"
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true
