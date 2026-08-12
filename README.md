@@ -4,10 +4,11 @@ Agent 驱动的网页浏览插件 —— 让 LLM 通过 function-calling 自主�
 
 ## ✨ 功能特性
 
-- **工具化子代理架构**：主 LLM 只看到一个 `browse_web` 入口工具，24 个 `browse_*` 工具在子代理上下文中运行，显著减少主 LLM 的 token 占用
+- **工具化子代理架构**：主 LLM 只看到一个 `browse_web` 入口工具，25 个 `browse_*` 工具在子代理上下文中运行，显著减少主 LLM 的 token 占用
 - **完整网页交互**：打开网页、提取正文/链接、按文本/坐标点击、填表、按键、滚动、滑块、下拉框、复选框、标签页管理
 - **识图辅助**：接入多模态模型（如 opencode-go/mimo-v2.5）对截图做视觉理解，支持区域裁剪放大识图（`browse_zoom_crop`）
 - **媒体嗅探**：从页面嗅探图片/视频资源，下载并发送到群聊（`browse_sniff_media`）
+- **本地页面自检**：`browse_local_page` 渲染查看本地 HTML 供子代理/开发者自检页面（无头渲染 + 截图 + 视觉描述，视觉不可用时降级文本提取；路径白名单仅限工作区与插件 data 目录）
 - **静默模式**：浏览截图仅内部识图，不往群聊刷图（`silent_mode`）
 - **安全防护**：SSRF 内网拦截、内容禁词过滤、图形验证码自动停止、下载大小上限
 
@@ -15,12 +16,16 @@ Agent 驱动的网页浏览插件 —— 让 LLM 通过 function-calling 自主�
 
 ```
 主 LLM（main agent）
-  └── browse_web（唯一入口 llm_tool）
-        └── 子代理 tool_loop_agent（24 个 browse_* 工具）
-              ├── Playwright 浏览器（chromium）
-              ├── SessionManager（会话/标签页隔离）
-              ├── SafetyFilter（SSRF/禁词）
-              └── 多模态识图（vision_provider_id）
+  ├── browse_web（网页浏览入口 llm_tool）
+  │     └── 子代理 tool_loop_agent（25 个 browse_* 工具）
+  │           ├── Playwright 浏览器（chromium）
+  │           ├── SessionManager（会话/标签页隔离）
+  │           ├── SafetyFilter（SSRF/禁词）
+  │           └── 多模态识图（vision_provider_id）
+  └── browse_local_page（本地 HTML 渲染查看入口 llm_tool，供子代理/开发者自检）
+        ├── 无头渲染（独立页面，用完即关）
+        ├── 路径白名单（工作区 + 插件 data 目录）
+        └── 视觉描述 / 降级文本提取
 ```
 
 ## 📦 安装

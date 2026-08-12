@@ -159,7 +159,13 @@ def _eval_params_call(node: ast.Call) -> dict:
 # ------------------------------------------------------------
 
 def test_no_llm_tool_decorators():
-    """15 个 browse_* 方法不应有 @filter.llm_tool 装饰器（仅 browse_web 入口）。"""
+    """browse_* 方法不应有 @filter.llm_tool 装饰器（仅两个对外入口例外）。
+
+    例外入口：
+    - browse_web：浏览器子代理委托入口（主 LLM / 子代理均可调用）；
+    - browse_local_page：本地页面渲染预览入口（面向 frontend/engineer 子代理）。
+    """
+    allowed_entries = {"browse_web", "browse_local_page"}
     for node in ast.walk(_TREE):
         if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
             for dec in node.decorator_list:
@@ -168,8 +174,8 @@ def test_no_llm_tool_decorators():
                     and isinstance(dec.func, ast.Attribute)
                     and dec.func.attr == "llm_tool"
                 ):
-                    # 唯一例外：browse_web 入口工具
-                    assert node.name == "browse_web", (
+                    # 仅允许两个对外入口工具带装饰器
+                    assert node.name in allowed_entries, (
                         f"{node.name} 不应有 @filter.llm_tool 装饰器"
                     )
 

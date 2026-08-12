@@ -43,6 +43,49 @@ _DATA_DIR = Path(__file__).resolve().parent / "data"
 # 浏览器子代理名称（tool_loop_agent 内层 LLM 的 system_prompt 标识）。
 _BROWSER_AGENT_NAME = "browser_agent"
 
+# ---------------------------------------------------------------
+# browse_local_page（本地页面渲染预览，面向子代理）安全白名单常量
+# ---------------------------------------------------------------
+# 允许渲染查看的根目录：AstrBot 工作区 + 插件 data 目录。
+# 子代理（frontend/engineer 等）仅能预览这两处目录下的 HTML 文件，
+# 其余路径一律拒绝（防路径穿越与越权读取）。运行时会用
+# get_astrbot_workspaces_path() 解析真实工作区路径，解析失败回退此默认值。
+_LOCAL_PAGE_WORKSPACE_FALLBACK = Path("/root/AstrBot/data/workspaces").resolve()
+# 允许渲染的文件扩展名。
+_LOCAL_PAGE_ALLOWED_EXTS = (".html", ".htm")
+# 渲染完成后等待 JS 执行的默认时长（毫秒），保证动态内容渲染完成后再截图。
+_LOCAL_PAGE_DEFAULT_WAIT_MS = 500
+
+
+def _resolve_local_page_roots() -> tuple[Path, ...]:
+    """解析 browse_local_page 允许访问的根目录白名单（去重保序）。
+
+    默认以任务约定的工作区绝对路径为准（/root/AstrBot/data/workspaces，
+    与服务实际工作区一致）；仅当该路径不存在（AstrBot 迁移到其他根目录、
+    如通过 ASTRBOT_ROOT 重定位）时，才用运行时解析值兜底——避免进程 CWD
+    不确定导致白名单根漂移（get_astrbot_root() 默认取 CWD）。插件 data
+    目录始终在列（路径由插件自身位置推导，天然稳定）。
+    """
+    roots: list[Path] = [_LOCAL_PAGE_WORKSPACE_FALLBACK]
+    try:
+        from astrbot.core.utils.astrbot_path import (  # noqa: PLC0415 — 延迟导入
+            get_astrbot_workspaces_path,
+        )
+
+        live = Path(get_astrbot_workspaces_path()).resolve()
+    except Exception:  # noqa: BLE001 — 解析失败忽略，仅用默认值
+        live = None
+    if (
+        live is not None
+        and live != _LOCAL_PAGE_WORKSPACE_FALLBACK
+        and not _LOCAL_PAGE_WORKSPACE_FALLBACK.is_dir()
+        and live.is_dir()
+    ):
+        roots.append(live)
+    roots.append(_DATA_DIR.resolve())
+    # dict.fromkeys 去重且保序（工作区与插件 data 目录重叠时只保留一份）。
+    return tuple(dict.fromkeys(roots))
+
 
 def _params(
     required: dict[str, tuple[str, str]],
@@ -371,6 +414,12 @@ class BrowserLLMPlugin(Star):
         self.extractor: ContentExtractor | None = None
         self.safety: SafetyFilter | None = None
 
+        # browse_local_page 专用的 per-umo 锁（独立于 SessionManager，
+        # 本地页面预览不走浏览会话，避免与既有 browse_* 会话互相污染）。
+        self._local_page_locks: dict[str, asyncio.Lock] = {}
+        # 本地页面预览允许访问的根目录白名单（initialize 时解析真实路径）。
+        self._local_page_allowed_roots: tuple[Path, ...] = _resolve_local_page_roots()
+
         # 搜索引擎模板：{keyword} 会被 URL 编码后替换。
         self._search_engines = {
             "必应搜索": "https://cn.bing.com/search?q={keyword}&FORM=BESBTB&ensearch=1",
@@ -453,6 +502,8 @@ class BrowserLLMPlugin(Star):
         )
         self.extractor = ContentExtractor()
         self.safety = SafetyFilter(self.banned_words, self.block_internal_ip)
+        # 本地页面预览白名单：运行时解析真实工作区路径（防硬编码漂移）。
+        self._local_page_allowed_roots = _resolve_local_page_roots()
         # 截图保存目录：data/screenshots/。
         self._screenshot_dir = Path(__file__).resolve().parent / "data" / "screenshots"
         self._screenshot_dir.mkdir(parents=True, exist_ok=True)
@@ -634,6 +685,187 @@ class BrowserLLMPlugin(Star):
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[DIAG] browse_web 执行异常: {e}")
             return f"【错误】浏览器子代理执行失败：{e}"
+
+    # ================================================================
+    # 本地页面渲染预览入口（面向子代理：browse_local_page）
+    # ================================================================
+
+    @filter.llm_tool(name="browse_local_page")
+    async def browse_local_page(
+        self,
+        event: AstrMessageEvent,
+        path: str = "",
+        full_page: bool = False,
+        wait_ms: int = 0,
+    ) -> str:
+        """渲染本地 HTML 页面并返回渲染结果的视觉描述（本地页面预览工具，面向子代理）。
+
+        用于子代理在无视觉模型时「查看」渲染后的本地 HTML 页面：以无头浏览器真实
+        渲染（含 CSS/JS 执行），截图后调用视觉模型（如 mimo-v2.5）生成中文视觉描述
+        （页面结构/主要文字/样式渲染异常）；视觉模型不可用时自动降级为页面文本提取，
+        保证工具不空转。本工具不经过浏览会话管理器，每次渲染使用独立页面用完即关，
+        不影响既有 browse_* 浏览会话状态。
+
+        Args:
+            path(string): 本地 HTML 文件的绝对路径。仅允许 AstrBot 工作区
+                （/root/AstrBot/data/workspaces/）与插件 data 目录下的 .html/.htm 文件，
+                其余路径一律拒绝。
+            full_page(boolean): 是否截取整页长截图（默认 false，仅截首屏视口）。可省略
+            wait_ms(number): 页面加载后等待 JS 渲染的毫秒数（默认 500）。可省略
+        """
+        try:
+            # 会话权限：与既有浏览工具一致，过白/黑名单（默认配置为空即放行）。
+            allowed, deny_reason = self._is_session_allowed(event)
+            if not allowed:
+                return f"【拒绝】{deny_reason}"
+
+            # 1. 参数与路径安全校验（白名单 + 防路径穿越，越权路径直接拒绝）。
+            raw = str(path or "").strip()
+            if not raw:
+                return (
+                    "【错误】path 不能为空：请传入要渲染查看的本地 HTML 文件绝对路径。"
+                )
+            if raw.lower().startswith("file://"):
+                raw = raw[len("file://"):]
+            try:
+                target = Path(raw).expanduser().resolve()
+            except Exception as e:  # noqa: BLE001
+                return f"【错误】路径解析失败：{e}"
+            ok, reason = self._check_local_page_path(target)
+            if not ok:
+                return f"【拒绝】{reason}"
+            if not target.is_file():
+                return f"【错误】文件不存在或不是普通文件：{target}"
+            if target.suffix.lower() not in _LOCAL_PAGE_ALLOWED_EXTS:
+                return f"【拒绝】仅支持 .html/.htm 文件：{target.name}"
+
+            # 2. per-umo 串行化（同一会话的本地页面渲染不并发）。
+            async with self._local_lock_for(self._umo_of(event)):
+                # 3. 独立页面渲染：不经过 SessionManager，不占浏览会话额度。
+                page = await self.browser.new_page()
+                try:
+                    file_uri = target.as_uri()
+                    await page.goto(
+                        file_uri,
+                        wait_until="domcontentloaded",
+                        timeout=int(self.timeout) * 1000,
+                    )
+                    try:
+                        wait = int(wait_ms)
+                    except (TypeError, ValueError):
+                        wait = 0
+                    if wait <= 0:
+                        wait = _LOCAL_PAGE_DEFAULT_WAIT_MS
+                    # 等待 JS 执行完成，保证动态渲染内容进入截图/文本。
+                    await page.wait_for_timeout(wait)
+
+                    # 4. 截图（保存到插件 data/screenshots/，可作交付附件路径）。
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                    umo_hash = hashlib.md5(
+                        self._umo_of(event).encode("utf-8")
+                    ).hexdigest()[:8]
+                    path_hash = hashlib.md5(
+                        str(target).encode("utf-8")
+                    ).hexdigest()[:8]
+                    save_path = str(
+                        self._screenshot_dir
+                        / f"localpage_{umo_hash}_{path_hash}_{ts}.png"
+                    )
+                    screenshot_ok = False
+                    if bool(full_page):
+                        try:
+                            await page.screenshot(path=save_path, full_page=True)
+                            screenshot_ok = True
+                        except Exception as e:  # noqa: BLE001 — 整页截图失败降级视口
+                            logger.debug(f"整页截图失败，降级视口截图: {e}")
+                    if not screenshot_ok:
+                        screenshot_ok = bool(
+                            await self.browser.screenshot(page, save_path)
+                        )
+
+                    info = await self.extractor.extract_page_info(page)
+                    text = await self.extractor.extract_text(
+                        page, max_chars=int(self.max_chars)
+                    )
+
+                    # 5. 视觉描述（mimo-v2.5 等）：成功返回描述；失败降级文本。
+                    desc = ""
+                    if screenshot_ok:
+                        desc = await self._describe_screenshot(save_path)
+                    if desc:
+                        banned = self._check_banned(desc)
+                        if banned:
+                            return (
+                                f"【拒绝】页面识图结果包含违禁内容：{banned}，"
+                                "已拒绝输出。"
+                            )
+                        return (
+                            f"【本地页面预览】{target}\n"
+                            f"标题: {info['title']}\n"
+                            f"截图: {save_path}\n"
+                            f"渲染视觉描述：\n{desc}"
+                        )
+
+                    # 6. 降级路径：视觉模型不可用/截图失败 → 文本提取，保证不空转。
+                    if text:
+                        banned = self._check_banned(text)
+                        if banned:
+                            return (
+                                f"【拒绝】页面内容包含违禁内容：{banned}，"
+                                "已拒绝输出。"
+                            )
+                        return (
+                            f"【本地页面预览·文本模式】{target}\n"
+                            f"标题: {info['title']}\n"
+                            f"（视觉模型不可用或截图失败，已降级为文本提取）\n"
+                            f"页面文本：\n{text}"
+                        )
+                    if screenshot_ok:
+                        return (
+                            f"【本地页面预览】{target}\n"
+                            "页面渲染成功，但未提取到文本内容"
+                            f"（可能为纯图形页面）。截图: {save_path}"
+                        )
+                    return f"【错误】页面渲染成功但截图与文本提取均失败：{target}"
+                finally:
+                    # 用完即关：独立页面不残留，不影响既有浏览会话。
+                    await self.browser.close_page(page)
+        except Exception as e:  # noqa: BLE001 — LLM 工具必须容错
+            logger.warning(f"[{METADATA_NAME}] browse_local_page 失败: {e}")
+            return f"【错误】本地页面渲染预览失败：{e}"
+
+    def _local_lock_for(self, umo: str) -> asyncio.Lock:
+        """返回该会话的本地页面预览专用锁（不存在则创建）。"""
+        lock = self._local_page_locks.get(umo)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._local_page_locks[umo] = lock
+        return lock
+
+    def _check_local_page_path(self, target: Path) -> tuple[bool, str]:
+        """本地页面白名单校验：仅允许工作区与插件 data 目录下的路径。
+
+        target 已 resolve()（消解 .. 与符号链接），此处用 is_relative_to
+        做前缀白名单判断，杜绝路径穿越与软链逃逸。
+
+        Returns:
+            tuple[bool, str]: (是否允许, 拒绝原因或空串)。
+        """
+        roots = getattr(
+            self, "_local_page_allowed_roots", None
+        ) or _resolve_local_page_roots()
+        for root in roots:
+            try:
+                if target.is_relative_to(root):
+                    return True, ""
+            except Exception:  # noqa: BLE001 — is_relative_to 异常按不匹配处理
+                continue
+        allowed_desc = "、".join(str(r) for r in roots)
+        return (
+            False,
+            f"路径不在允许范围内（仅允许 {allowed_desc} 下的 .html/.htm 文件），"
+            f"已拒绝访问：{target}",
+        )
 
     # ================================================================
     # 私有辅助方法
