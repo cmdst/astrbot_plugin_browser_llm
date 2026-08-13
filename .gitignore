@@ -9,6 +9,7 @@ data/
 # 环境变量文件（含密钥，绝不入库）
 .env
 .env.*
+!.env.example
 
 # 日志与临时/备份文件
 *.log
