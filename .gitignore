@@ -1,6 +1,14 @@
+# Python 缓存
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# 运行时数据目录（截图、运行时配置、临时文件，绝不入库）
 data/
+
+# 日志与临时/备份文件
 *.log
-.env
+*.tmp
+*.swp
+*.bak
+*~
