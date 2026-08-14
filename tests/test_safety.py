@@ -5,7 +5,7 @@ import asyncio
 
 import pytest
 
-from core.safety import SafetyFilter
+from core.safety import SafetyFilter, acheck_hostname_internal
 
 BANNED = ["pornhub", "色情", "成人", "赌博", "暴力", "政治", "反动", "恐怖", "谣言", "诈骗", "病毒"]
 
@@ -136,5 +136,43 @@ def test_acheck_url_matches_check_url(sf):
             sync_ok, _ = sf.check_url(url)
             async_ok, _ = await sf.acheck_url(url)
             assert sync_ok == async_ok, f"结论不一致: {url}"
+
+    asyncio.run(_check())
+
+
+# ------------------------------------------------------------
+# acheck_hostname_internal（页面级 SSRF 兜底判定）
+# ------------------------------------------------------------
+
+def test_acheck_hostname_internal_literals():
+    """IP 字面量（含混淆形式）直接判定，无需 DNS。"""
+    async def _check():
+        assert await acheck_hostname_internal("127.0.0.1") is True
+        assert await acheck_hostname_internal("::1") is True
+        assert await acheck_hostname_internal("fe80::1") is True
+        assert await acheck_hostname_internal("10.0.0.1") is True
+        assert await acheck_hostname_internal("169.254.169.254") is True
+        assert await acheck_hostname_internal("2130706433") is True, "十进制混淆"
+        assert await acheck_hostname_internal("127.1") is True, "短点分混淆"
+        assert await acheck_hostname_internal("0177.0.0.1") is True, "八进制混淆"
+        assert await acheck_hostname_internal("93.184.216.34") is False
+
+    asyncio.run(_check())
+
+
+def test_acheck_hostname_internal_dns():
+    """域名经 DNS 判定：localhost 为内网，公网域名为 False/None（离线不判定）。"""
+    async def _check():
+        assert await acheck_hostname_internal("localhost") is True
+        verdict = await acheck_hostname_internal("example.com")
+        assert verdict in (False, None), f"公网域名不应判为内网: {verdict}"
+
+    asyncio.run(_check())
+
+
+def test_acheck_hostname_internal_empty():
+    async def _check():
+        assert await acheck_hostname_internal("") is False
+        assert await acheck_hostname_internal(None) is False
 
     asyncio.run(_check())

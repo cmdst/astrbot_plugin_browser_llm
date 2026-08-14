@@ -15,11 +15,12 @@ SafetyFilter（禁词过滤与 SSRF 防护），以及 15 个 FunctionTool 构�
 import asyncio
 import functools
 import hashlib
+import re
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urljoin
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -37,6 +38,10 @@ if TYPE_CHECKING:  # pragma: no cover — 仅类型检查
 # 插件注册名，与 metadata.yaml 的 name 一致；日志与管理命令判权时使用。
 METADATA_NAME = "astrbot_plugin_browser_llm"
 
+# 插件版本，与 metadata.yaml 的 version 保持一致（发布版本变更时两处同步修改；
+# 真实运行时 Star 实例无 self.metadata 属性，无法动态读取，故集中为单一常量）。
+PLUGIN_VERSION = "v1.1.1"
+
 # 数据目录：截图等资源保存位置。
 _DATA_DIR = Path(__file__).resolve().parent / "data"
 
@@ -50,21 +55,68 @@ _BROWSER_AGENT_NAME = "browser_agent"
 # 子代理（frontend/engineer 等）仅能预览这两处目录下的 HTML 文件，
 # 其余路径一律拒绝（防路径穿越与越权读取）。运行时会用
 # get_astrbot_workspaces_path() 解析真实工作区路径，解析失败回退此默认值。
-_LOCAL_PAGE_WORKSPACE_FALLBACK = Path("/root/AstrBot/data/workspaces").resolve()
+# 默认值由插件安装位置平台无关推导：插件位于 <astrbot_root>/data/plugins/
+# <plugin>/，其上级两级即 <astrbot_root>/data，同级即部署环境的 workspaces
+# 目录；不硬编码任何真实服务器路径。
+_LOCAL_PAGE_WORKSPACE_FALLBACK = (_DATA_DIR.parents[2] / "workspaces").resolve()
 # 允许渲染的文件扩展名。
 _LOCAL_PAGE_ALLOWED_EXTS = (".html", ".htm")
 # 渲染完成后等待 JS 执行的默认时长（毫秒），保证动态内容渲染完成后再截图。
 _LOCAL_PAGE_DEFAULT_WAIT_MS = 500
 
+# ---------------------------------------------------------------
+# 识图拒识检测：纯文本模型拒识文案识别
+# ---------------------------------------------------------------
+# 部分纯文本模型（如 deepseek-v4-flash）收到图片请求时返回固定拒识文案
+# （如 "[Unsupported Image]"）而非真实视觉描述。命中任一特征即判定识图
+# 失败，返回明确提示而非把拒识文本静默透传为「视觉描述」。正则大小写不敏感，
+# 覆盖中英文常见拒识表达。
+_VISION_REJECTION_HINT = "识图模型不支持图片，请更换多模态模型或清空识图配置"
+_VISION_REJECTION_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        # deepseek 等纯文本模型的固定拒识文案
+        r"\[unsupported image\]",
+        # 英文：无法查看/处理图片
+        r"(?:cannot|can'?t|unable to|not able to)\s+(?:view|see|process)\s+"
+        r"(?:the\s+)?(?:image|picture)s?",
+        # 英文：不支持/不接受/不理解图片或视觉输入
+        r"(?:do|does|did|am|is|are|was|were)\s+not\s+(?:support|accept|"
+        r"understand|process)\s+(?:the\s+)?(?:image|picture|vision|multimodal)s?",
+        # 英文：无视觉/多模态能力
+        r"no\s+(?:vision|multimodal|image)\s+(?:support|capabilit)",
+        # 英文：纯文本模型自述
+        r"text[- ]?only\s+(?:model|llm|ai)",
+        # 中文：纯文本模型自述
+        r"纯文本(?:模型|llm|ai)?",
+        # 中文：图片无法/不能/不支持（处理/识别/查看/理解）
+        r"图片?(?:无法|不能|不支持)(?:处理|识别|查看|理解)?",
+        r"无法(?:处理|识别|查看|理解)(?:图片|图像|截图)",
+        r"不支持(?:图片|图像|多模态|视觉)",
+        r"不是(?:多模态|视觉)(?:模型)?",
+        r"没有(?:视觉|识图|图像处理)(?:能力|功能)?",
+    )
+)
+
+
+def _is_vision_rejection(text: str) -> bool:
+    """判断模型返回文本是否为「拒识」而非真实视觉描述。
+
+    命中任一拒识特征（大小写不敏感、中英文）返回 True；空文本返回 False。
+    """
+    if not text:
+        return False
+    return any(pattern.search(text) for pattern in _VISION_REJECTION_PATTERNS)
+
 
 def _resolve_local_page_roots() -> tuple[Path, ...]:
     """解析 browse_local_page 允许访问的根目录白名单（去重保序）。
 
-    默认以任务约定的工作区绝对路径为准（/root/AstrBot/data/workspaces，
-    与服务实际工作区一致）；仅当该路径不存在（AstrBot 迁移到其他根目录、
-    如通过 ASTRBOT_ROOT 重定位）时，才用运行时解析值兜底——避免进程 CWD
-    不确定导致白名单根漂移（get_astrbot_root() 默认取 CWD）。插件 data
-    目录始终在列（路径由插件自身位置推导，天然稳定）。
+    默认以任务约定的工作区绝对路径为准（由插件安装位置推导的 AstrBot
+    工作区目录，标准部署下与服务实际工作区一致）；仅当该路径不存在
+    （如 AstrBot 重定位到其他根目录）时，才用运行时解析值兜底——避免
+    进程 CWD 不确定导致白名单根漂移（get_astrbot_root() 默认取 CWD）。
+    插件 data 目录始终在列（路径由插件自身位置推导，天然稳定）。
     """
     roots: list[Path] = [_LOCAL_PAGE_WORKSPACE_FALLBACK]
     try:
@@ -349,7 +401,7 @@ _BROWSER_AGENT_INSTRUCTION = (
     "- browse_input / browse_press_key：在页面输入文本 / 按键提交；\n"
     "- browse_scroll：滚动页面查看更多内容；\n"
     "- browse_reload：刷新页面；\n"
-    "- browse_inspect_region：裁剪页面指定区域放大识图（读小字/图标/图表细节时用）；\n"
+    "- browse_zoom_crop：裁剪页面指定区域放大识图（读小字/图标/图表细节时用）；\n"
     "- browse_go_back / browse_go_forward：后退 / 前进；\n"
     "- browse_screenshot：截取页面截图发送给用户。\n\n"
     "操作原则：\n"
@@ -369,7 +421,7 @@ _BROWSER_AGENT_INSTRUCTION = (
     "5. 页面交互（点击/滚动/翻页/填表/按键/标签页切换）通过对应工具完成；\n"
     "6. 需要向用户展示页面外观时用 browse_screenshot；需要读取页面小字、"
     "图标、图表数据等细节时，先 browse_screenshot 全图定位，再用 "
-    "browse_inspect_region 裁剪放大关键区域识别；\n"
+    "browse_zoom_crop 裁剪放大关键区域识别；\n"
     "7. 图形验证码（人机验证/点选图标验证/滑块拼图验证）无法自动可靠"
     "通过：遇到时立即停止操作，不要尝试点击、刷新、重试或盲猜坐标；"
     "如实报告『遇到图形验证码，需要用户手动处理』并返回当前页面状态；\n"
@@ -401,7 +453,7 @@ class BrowserLLMPlugin(Star):
         Args:
             context: AstrBot 插件上下文，提供事件注册与消息发送能力。
             config: 插件配置对象，对应 _conf_schema.json 中定义的
-                18 个配置项（含默认值）；未传入时使用空字典兜底。
+                22 个配置项（含默认值）；未传入时使用空字典兜底。
         """
         super().__init__(context)
         self.config = config or {}
@@ -431,7 +483,7 @@ class BrowserLLMPlugin(Star):
     def _load_config(self) -> None:
         """将 _conf_schema.json 中的配置项读取为实例属性。
 
-        全部 16 个配置项：浏览器引擎 / 默认页 / 搜索引擎 / 禁词 /
+        全部 22 个配置项：浏览器引擎 / 默认页 / 搜索引擎 / 禁词 /
         内网拦截 / 提取与链接上限 / 超时 / 页数上限 / 空闲回收 /
         会话黑白名单 / 截图与识图 / 代理 / 视口。
         """
@@ -524,10 +576,17 @@ class BrowserLLMPlugin(Star):
         self._browser_toolset = self._build_toolset(self._browser_tools)
         # 按页面感知方式动态生成子代理指令（基础模板 + 感知方式段）。
         self._browser_instruction = self._build_subagent_instruction()
+        # 识图 provider 下拉同步：把 AstrBot 已加载 provider 写进内存 schema
+        # 的 options（Dashboard 面板每次请求实时读取该 schema，无需重启）。
+        # 注意 AstrBot 启动顺序是「插件加载先于 provider 初始化」，此处可能
+        # 暂时拿不到 provider 列表，由后台轮询任务兜底补齐。
+        self._vision_sync_task: Optional[asyncio.Task] = None
+        self._sync_vision_provider_options()
+        self._start_vision_provider_sync_task()
         logger.info(f"[{self.metadata_name}] 浏览器子代理工具集: "
                     f"{len(self._browser_tools)} 个浏览工具")
         logger.info(f"[{self.metadata_name}] 页面感知方式: {self.page_perception}")
-        logger.info(f"[{self.metadata_name}] 插件 v1.0.0 已激活")
+        logger.info(f"[{self.metadata_name}] 插件 {PLUGIN_VERSION} 已激活")
         logger.info(f"[{self.metadata_name}] 浏览器引擎: {self.browser_type}")
         logger.info(f"[{self.metadata_name}] 默认搜索引擎: {self.default_search_engine}")
 
@@ -607,6 +666,190 @@ class BrowserLLMPlugin(Star):
         )
         logger.info(f"[{self.metadata_name}] 缓存定期清理任务已启动（每 6 小时）")
 
+    # ------------------------------------------------------------
+    # 识图 provider 下拉动态同步（Bug #1 修复）
+    # ------------------------------------------------------------
+
+    def _collect_provider_ids(self) -> list[str]:
+        """从 ProviderManager 提取已加载聊天 Provider 的 ID 列表（保序去重）。
+
+        优先 provider_insts（仅聊天 Provider，识图用 llm_generate 需要
+        聊天 Provider；inst_map 还混有 STT/TTS/Embedding/Rerank 实例）；
+        provider_insts 不可用时退回 inst_map 键（仅用于面板展示兜底）。
+        """
+        pm = getattr(self.context, "provider_manager", None)
+        if pm is None:
+            return []
+        ids: list[str] = []
+        for inst in getattr(pm, "provider_insts", None) or []:
+            pid = ""
+            try:
+                pid = inst.meta().id
+            except Exception:  # noqa: BLE001 — meta() 异常时尝试属性兜底
+                pid = getattr(inst, "provider_id", "") or ""
+            if pid:
+                ids.append(str(pid))
+        if not ids:
+            inst_map = getattr(pm, "inst_map", None)
+            if isinstance(inst_map, dict):
+                ids = [str(pid) for pid in inst_map if pid]
+        return list(dict.fromkeys(ids))
+
+    def _sync_vision_provider_options(self) -> list[str]:
+        """把已加载 provider 同步到配置面板的识图模型下拉（内存 schema）。
+
+        AstrBot Dashboard 的 ConfigDisplayService.get_plugin_config() 每次
+        请求都直接返回 plugin_md.config.schema（与 self.config.schema 是
+        同一对象），因此就地更新 options 即可让面板实时生效，无需重启。
+        始终保留 "" 空选项（留空 = 不做识图）；default 若已不在候选中则
+        修正为空串，避免 Dashboard「恢复默认」写回一个不存在的 provider。
+
+        Returns:
+            list[str]: 当前生效的 options 列表（含 "" 空选项）。
+        """
+        ids = self._collect_provider_ids()
+        options = list(dict.fromkeys([""] + ids))
+        schema = getattr(self.config, "schema", None)
+        if isinstance(schema, dict):
+            item = schema.get("vision_provider_id")
+            if isinstance(item, dict) and isinstance(item.get("options"), list):
+                if item["options"] != options:
+                    item["options"] = options
+                    if item.get("default") not in options:
+                        item["default"] = ""
+        return options
+
+    def _start_vision_provider_sync_task(self) -> None:
+        """启动识图 provider 下拉同步的启动期兜底任务。
+
+        AstrBot 启动顺序为「插件 reload 先于 provider 初始化」，因此
+        initialize() 内的首次同步可能拿不到 provider 列表；本任务每 5s
+        轮询一次，直到 provider 就绪后同步一次即退出（最长等待 2 分钟），
+        保证启动后面板下拉自动填充，无需任何浏览活动触发。
+        """
+        if self._vision_sync_task is not None and not self._vision_sync_task.done():
+            return
+
+        async def _loop() -> None:
+            deadline = time.monotonic() + 120
+            while True:
+                if self._collect_provider_ids():
+                    options = self._sync_vision_provider_options()
+                    logger.info(
+                        f"[{self.metadata_name}] 识图 provider 下拉已同步 "
+                        f"({len(options) - 1} 个 Provider)"
+                    )
+                    return
+                if time.monotonic() > deadline:
+                    return
+                try:
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    raise
+
+        self._vision_sync_task = asyncio.create_task(
+            _loop(), name="browser-vision-provider-sync"
+        )
+
+    def _stop_vision_provider_sync_task(self) -> None:
+        """停止识图 provider 下拉同步任务（幂等）。"""
+        task = self._vision_sync_task
+        if task is None:
+            return
+        self._vision_sync_task = None
+        if not task.done():
+            task.cancel()
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._await_task(task))  # 不阻塞 terminate
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _provider_loaded(self, provider_id: str) -> bool:
+        """provider_id 是否在 ProviderManager 已加载实例中。"""
+        if not provider_id:
+            return False
+        pm = getattr(self.context, "provider_manager", None)
+        if pm is None:
+            # 无 ProviderManager（如单测桩）：不做存在性校验，信任配置值。
+            return True
+        inst_map = getattr(pm, "inst_map", None)
+        if isinstance(inst_map, dict):
+            return provider_id in inst_map
+        for inst in getattr(pm, "provider_insts", None) or []:
+            try:
+                if str(inst.meta().id) == provider_id:
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+
+    def _live_vision_provider_id(self) -> str:
+        """实时读取识图 provider 配置值。
+
+        优先读共享 config dict（AstrBotConfig 与 Dashboard 保存为同一实例，
+        面板改配置立即生效，不必等插件重载）；仅在 config 无此键时回退
+        __init__ 快照属性（测试/手动装配场景）。
+        """
+        cfg = self.config
+        if isinstance(cfg, dict) and "vision_provider_id" in cfg:
+            return str(cfg.get("vision_provider_id") or "").strip()
+        return str(getattr(self, "vision_provider_id", "") or "").strip()
+
+    def _live_vision_prompt(self) -> str:
+        """实时读取识图提示词（同 _live_vision_provider_id 的时效语义）。"""
+        cfg = self.config
+        if isinstance(cfg, dict) and "vision_prompt" in cfg:
+            return str(cfg.get("vision_prompt") or "").strip()
+        return str(getattr(self, "vision_prompt", "") or "").strip()
+
+    async def _resolve_vision_provider_id(
+        self, event: AstrMessageEvent | None = None
+    ) -> str:
+        """解析实际使用的识图 provider：配置实时生效 + 失效自动降级。
+
+        逻辑：
+        1. 实时读取 vision_provider_id（Dashboard 保存立即生效）；
+        2. 顺带同步下拉选项（面板与运行一致性，廉价操作）；
+        3. 配置值已加载 → 直接使用；
+        4. 配置值为空（留空 = 显式关闭识图）→ 不做回退，返回空串；
+        5. 配置值失效（被删除/改名）→ 警告日志 + 回退当前会话聊天 Provider；
+        6. 全部不可用 → 返回空串（调用方不做识图）。
+
+        Args:
+            event: 消息事件（回退 provider 时用于确定会话），可为 None。
+
+        Returns:
+            str: 实际 provider_id；空串表示不做识图。
+        """
+        provider_id = self._live_vision_provider_id()
+        # 顺带同步下拉（面板每次识图相关调用后保持最新）。
+        self._sync_vision_provider_options()
+        if provider_id and self._provider_loaded(provider_id):
+            return provider_id
+        if not provider_id:
+            # 留空 = 用户显式关闭识图，不触发回退。
+            return ""
+        # 配置值失效（被删除/改名）：警告 + 回退当前会话 provider。
+        logger.warning(
+            f"[{self.metadata_name}] vision_provider_id={provider_id!r} "
+            "未在已加载 Provider 中，识图自动回退到当前会话聊天 Provider。"
+            "请确认该 Provider 已在 AstrBot 模型配置中启用，或重新选择识图模型。"
+        )
+        if event is not None:
+            try:
+                fallback = await self.context.get_current_chat_provider_id(
+                    umo=self._umo_of(event)
+                )
+            except Exception as e:  # noqa: BLE001 — 回退失败不抛异常
+                logger.warning(
+                    f"[{self.metadata_name}] 识图回退 provider 获取失败: {e}"
+                )
+                return ""
+            if fallback and self._provider_loaded(fallback):
+                return str(fallback)
+        return ""
+
     def _stop_cache_cleanup_task(self) -> None:
         """停止定期缓存清理任务（幂等）。"""
         task = self._cache_cleanup_task
@@ -631,6 +874,7 @@ class BrowserLLMPlugin(Star):
     async def terminate(self) -> None:
         """AstrBot 禁用/重载时释放全部浏览器资源。"""
         self._stop_cache_cleanup_task()
+        self._stop_vision_provider_sync_task()
         if self.sessions is not None:
             try:
                 await self.sessions.shutdown()
@@ -659,17 +903,25 @@ class BrowserLLMPlugin(Star):
         子 Agent 工具内部持有锁完成（同一会话的浏览器操作被串行化）。
         """
         try:
-            logger.info(f"[DIAG] browse_web 进入，input={input!r}")
+            logger.debug(f"[{self.metadata_name}] browse_web 进入，input={input!r}")
+            # 顺带同步识图 provider 下拉（面板每次请求实时读取内存 schema，
+            # 此入口被主 LLM 高频调用，可保持面板选项跟随运行时 provider 变化）。
+            self._sync_vision_provider_options()
             allowed, deny_reason = self._is_session_allowed(event)
             if not allowed:
                 return f"【拒绝】{deny_reason}"
-            provider_id = await self.context.get_current_chat_provider_id(
-                umo=self._umo_of(event)
-            )
-            logger.info(f"[DIAG] browse_web prov_id={provider_id!r}")
+            try:
+                provider_id = await self.context.get_current_chat_provider_id(
+                    umo=self._umo_of(event)
+                )
+            except Exception as e:  # noqa: BLE001 — ProviderNotFoundError 等
+                logger.warning(
+                    f"[{self.metadata_name}] 获取当前对话 Provider 失败: {e}"
+                )
+                return "【错误】无法确定当前对话模型，浏览器子代理不可用。"
             if not provider_id:
                 return "【错误】无法确定当前对话模型，浏览器子代理不可用。"
-            logger.info("[DIAG] browse_web 调用 tool_loop_agent")
+            logger.debug(f"[{self.metadata_name}] browse_web prov_id={provider_id!r}")
             resp = await self.context.tool_loop_agent(
                 event=event,
                 chat_provider_id=provider_id,
@@ -680,10 +932,12 @@ class BrowserLLMPlugin(Star):
                 tool_call_timeout=self.agent_tool_timeout,
             )
             text = getattr(resp, "completion_text", "") or ""
-            logger.info(f"[DIAG] browse_web tool_loop_agent 返回，len={len(text)}")
+            logger.debug(
+                f"[{self.metadata_name}] browse_web tool_loop_agent 返回，len={len(text)}"
+            )
             return text or "（浏览器子代理未返回内容）"
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"[DIAG] browse_web 执行异常: {e}")
+            logger.warning(f"[{self.metadata_name}] browse_web 执行异常: {e}")
             return f"【错误】浏览器子代理执行失败：{e}"
 
     # ================================================================
@@ -707,9 +961,8 @@ class BrowserLLMPlugin(Star):
         不影响既有 browse_* 浏览会话状态。
 
         Args:
-            path(string): 本地 HTML 文件的绝对路径。仅允许 AstrBot 工作区
-                （/root/AstrBot/data/workspaces/）与插件 data 目录下的 .html/.htm 文件，
-                其余路径一律拒绝。
+            path(string): 本地 HTML 文件的绝对路径。仅允许 AstrBot 工作区目录
+                与插件 data 目录下的 .html/.htm 文件，其余路径一律拒绝。
             full_page(boolean): 是否截取整页长截图（默认 false，仅截首屏视口）。可省略
             wait_ms(number): 页面加载后等待 JS 渲染的毫秒数（默认 500）。可省略
         """
@@ -791,7 +1044,7 @@ class BrowserLLMPlugin(Star):
                     # 5. 视觉描述（mimo-v2.5 等）：成功返回描述；失败降级文本。
                     desc = ""
                     if screenshot_ok:
-                        desc = await self._describe_screenshot(save_path)
+                        desc = await self._describe_screenshot(save_path, event)
                     if desc:
                         banned = self._check_banned(desc)
                         if banned:
@@ -985,29 +1238,23 @@ class BrowserLLMPlugin(Star):
             url(string): 目标网页完整地址，须以 http:// 或 https:// 开头，如 https://example.com。
         """
         try:
-            logger.info(f"[DIAG] browse_open 进入 url={url!r}")
+            logger.debug(f"[{self.metadata_name}] browse_open 进入 url={url!r}")
             async with self._lock_for(event):
-                logger.info("[DIAG] browse_open 已拿锁")
                 page, err = await self._get_page(event)
-                logger.info(f"[DIAG] browse_open page={page is not None} err={err!r}")
                 if page is None:
                     return f"【错误】{err}"
                 ok, reason = await self.safety.acheck_url(url)
-                logger.info(f"[DIAG] browse_open 安全校验 ok={ok} reason={reason!r}")
                 if not ok:
                     return f"【拒绝】{reason}"
                 banned = self._check_banned(url)
                 if banned:
                     return f"【拒绝】URL 包含违禁内容：{banned}"
-                logger.info("[DIAG] browse_open goto 前")
                 await page.goto(url, wait_until='domcontentloaded')
-                logger.info("[DIAG] browse_open goto 完成")
-                logger.info("[DIAG] browse_open summary 前")
                 text = await self._page_summary(page)
-                logger.info(f"[DIAG] browse_open 返回 len={len(text)}")
+                logger.debug(f"[{self.metadata_name}] browse_open 返回 len={len(text)}")
                 return text
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"[DIAG] browse_open 异常: {e}")
+            logger.warning(f"[{self.metadata_name}] browse_open 异常: {e}")
             return f"【错误】打开网页失败：{e}"
 
     async def browse_current_page(self, event: AstrMessageEvent) -> str:
@@ -1313,7 +1560,7 @@ class BrowserLLMPlugin(Star):
                     except Exception as e:  # noqa: BLE001 — 发图失败不阻塞识图
                         logger.warning(f"[{METADATA_NAME}] 发送截图失败: {e}")
                 # 识图（可选）：配置了 vision_provider_id 才尝试。
-                desc = await self._describe_screenshot(result)
+                desc = await self._describe_screenshot(result, event)
                 if desc:
                     prefix = "截图已识图（静默模式，未发送）" if self.silent_mode else "截图已发送给用户"
                     return f"{prefix}。识图结果：\n{desc}"
@@ -1546,7 +1793,7 @@ class BrowserLLMPlugin(Star):
                     f"[{METADATA_NAME}] 已裁剪截图 ({cx},{cy},{cw}x{ch}) -> {save_path}"
                 )
                 # 识图该区域（配置了 vision_provider_id 才执行）。
-                desc = await self._describe_screenshot(save_path)
+                desc = await self._describe_screenshot(save_path, event)
                 if desc:
                     return f"裁剪区域识图结果：\n{desc}"
                 return f"已裁剪区域截图并保存：{save_path}（如需识图请配置 vision_provider_id 多模态模型）。"
@@ -1696,49 +1943,89 @@ class BrowserLLMPlugin(Star):
         save_path = str(self._media_dir / f"media_{umo_hash}_{ts}_{index}{ext}")
         # 下载大小上限（字节）。
         max_bytes = 50 * 1024 * 1024
+        # 重定向跳数上限：aiohttp 默认自动跟随重定向，可绕过调用方 acheck_url
+        # 的前置 SSRF 校验直达内网；此处关闭自动跟随，逐跳手动跟随并每跳
+        # 重新过安全校验（协议白名单 + 内网拦截）。
+        max_redirects = 5
+        current_url = url
         try:
             import aiohttp  # noqa: PLC0415 — 延迟导入（沙箱无 aiohttp 时不影响模块加载）
 
             headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=60)) as resp:
-                    if resp.status != 200:
-                        logger.warning(f"[{METADATA_NAME}] 媒体下载非 200: {url} -> {resp.status}")
-                        return ""
-                    # Content-Length 预检：超限直接跳过。
-                    length = resp.content_length
-                    if length is not None and length > max_bytes:
-                        logger.warning(
-                            f"[{METADATA_NAME}] 媒体超 {max_bytes // 1024 // 1024}MB 上限，跳过: {url} ({length} bytes)"
-                        )
-                        return ""
-                    # 流式写入并累计大小，超过上限中止并删除半成品。
-                    total = 0
-                    tmp_path = save_path + ".part"
+                tmp_path = save_path + ".part"
 
-                    def _cleanup_tmp() -> None:
-                        try:
-                            Path(tmp_path).unlink(missing_ok=True)
-                        except Exception:  # noqa: BLE001
-                            pass
-
+                def _cleanup_tmp() -> None:
                     try:
-                        with open(tmp_path, "wb") as f:
-                            async for chunk in resp.content.iter_chunked(64 * 1024):
-                                total += len(chunk)
-                                if total > max_bytes:
-                                    logger.warning(
-                                        f"[{METADATA_NAME}] 媒体流式累计超 {max_bytes // 1024 // 1024}MB 上限，中止: {url}"
-                                    )
-                                    _cleanup_tmp()
-                                    return ""
-                                f.write(chunk)
-                    except Exception:
-                        # 异常时清理半成品文件。
-                        _cleanup_tmp()
-                        raise
-                    if total == 0:
-                        return ""
+                        Path(tmp_path).unlink(missing_ok=True)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                downloaded_ok = False
+                for _hop in range(max_redirects + 1):
+                    async with session.get(
+                        current_url,
+                        headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=60),
+                        allow_redirects=False,
+                    ) as resp:
+                        if resp.status in (301, 302, 303, 307, 308):
+                            location = resp.headers.get("Location")
+                            if not location:
+                                logger.warning(
+                                    f"[{METADATA_NAME}] 媒体重定向缺少 Location，终止: {current_url}"
+                                )
+                                return ""
+                            next_url = urljoin(current_url, location)
+                            ok, reason = await self.safety.acheck_url(next_url)
+                            if not ok:
+                                logger.warning(
+                                    f"[{METADATA_NAME}] 媒体重定向目标未通过安全校验，"
+                                    f"终止下载: {next_url} ({reason})"
+                                )
+                                return ""
+                            current_url = next_url
+                            continue
+                        if resp.status != 200:
+                            logger.warning(
+                                f"[{METADATA_NAME}] 媒体下载非 200: {current_url} -> {resp.status}"
+                            )
+                            return ""
+                        # Content-Length 预检：超限直接跳过。
+                        length = resp.content_length
+                        if length is not None and length > max_bytes:
+                            logger.warning(
+                                f"[{METADATA_NAME}] 媒体超 {max_bytes // 1024 // 1024}MB 上限，跳过: {current_url} ({length} bytes)"
+                            )
+                            return ""
+                        # 流式写入并累计大小，超过上限中止并删除半成品。
+                        total = 0
+                        try:
+                            with open(tmp_path, "wb") as f:
+                                async for chunk in resp.content.iter_chunked(64 * 1024):
+                                    total += len(chunk)
+                                    if total > max_bytes:
+                                        logger.warning(
+                                            f"[{METADATA_NAME}] 媒体流式累计超 {max_bytes // 1024 // 1024}MB 上限，中止: {current_url}"
+                                        )
+                                        _cleanup_tmp()
+                                        return ""
+                                    f.write(chunk)
+                        except Exception:
+                            # 异常时清理半成品文件。
+                            _cleanup_tmp()
+                            raise
+                        if total == 0:
+                            return ""
+                        downloaded_ok = True
+                        break
+                if not downloaded_ok:
+                    # 重定向跳数超限：未拿到最终 200 响应。
+                    _cleanup_tmp()
+                    logger.warning(
+                        f"[{METADATA_NAME}] 媒体重定向超过 {max_redirects} 跳，终止: {url}"
+                    )
+                    return ""
             # 流式写入成功：临时文件改名成正式路径。
             Path(tmp_path).rename(save_path)
             return save_path
@@ -1746,17 +2033,31 @@ class BrowserLLMPlugin(Star):
             logger.warning(f"[{METADATA_NAME}] 媒体下载失败 {url}: {e}")
             return ""
 
-    async def _describe_screenshot(self, image_path: str) -> str:
+    async def _describe_screenshot(
+        self, image_path: str, event: AstrMessageEvent | None = None
+    ) -> str:
         """用多模态模型描述截图（配置了 vision_provider_id 才执行）。
 
+        行为：配置的识图 provider 未加载/失效时自动回退当前会话聊天
+        Provider（带警告日志）；未配置或全部不可用时返回空串（不抛异常）。
+        模型返回拒识文案（纯文本模型不支持图片，如 "[Unsupported Image]"）
+        时记警告日志并返回明确提示文案，不把拒识文本误当视觉描述。
+        双通道降级：contexts（ImageURLPart）失败后回退 image_urls。
+
+        Args:
+            image_path: 截图本地路径。
+            event: 消息事件（失效回退时确定会话），可为 None。
+
         Returns:
-            str: 识图描述文本；未配置或调用失败返回空串（不抛异常）。
+            str: 识图描述文本；未配置或调用失败返回空串；拒识时返回提示
+            文案（均不抛异常）。
         """
-        provider_id = (self.vision_provider_id or "").strip()
+        provider_id = await self._resolve_vision_provider_id(event)
         if not provider_id:
             return ""
-        # 识图提示词：优先用用户配置的 vision_prompt，空则回退默认提示词。
-        prompt = (self.vision_prompt or "").strip() or (
+        # 识图提示词：优先用用户配置的 vision_prompt（实时读取），空则回退
+        # 默认提示词。
+        prompt = self._live_vision_prompt() or (
             "请用中文描述这张网页截图的重点内容，"
             "包括主要文字、按钮、链接和页面结构。"
         )
@@ -1779,9 +2080,15 @@ class BrowserLLMPlugin(Star):
             )
             text = getattr(resp, "completion_text", "") or ""
             if text.strip():
+                if _is_vision_rejection(text):
+                    logger.warning(
+                        f"[{self.metadata_name}] 识图返回拒识文本，判定模型不支持图片"
+                        f"（provider={provider_id}, text={text.strip()[:60]!r}）"
+                    )
+                    return _VISION_REJECTION_HINT
                 return text.strip()
         except Exception as e:  # noqa: BLE001 — contexts 方式失败，降级 image_urls
-            logger.debug(f"[{METADATA_NAME}] 识图 contexts 方式失败，降级 image_urls: {e}")
+            logger.debug(f"[{self.metadata_name}] 识图 contexts 方式失败，降级 image_urls: {e}")
         try:
             resp = await asyncio.wait_for(
                 self.context.llm_generate(
@@ -1791,9 +2098,16 @@ class BrowserLLMPlugin(Star):
                 ),
                 timeout=60,
             )
-            return (getattr(resp, "completion_text", "") or "").strip()
+            text = (getattr(resp, "completion_text", "") or "").strip()
+            if _is_vision_rejection(text):
+                logger.warning(
+                    f"[{self.metadata_name}] 识图返回拒识文本，判定模型不支持图片"
+                    f"（provider={provider_id}, text={text[:60]!r}）"
+                )
+                return _VISION_REJECTION_HINT
+            return text
         except Exception as e:  # noqa: BLE001 — 识图失败必须降级不抛异常
-            logger.warning(f"[{METADATA_NAME}] 识图失败: {e}")
+            logger.warning(f"[{self.metadata_name}] 识图失败: {e}")
             return ""
 
     # ================================================================

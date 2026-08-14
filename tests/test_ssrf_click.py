@@ -6,6 +6,7 @@
 """
 
 import asyncio
+from pathlib import Path
 
 import pytest
 
@@ -286,3 +287,97 @@ def test_sniff_media_max_items_invalid():
     plugin = _make_media_plugin(page)
     out = _run(plugin.browse_sniff_media(FakeEvent(), "all", "abc"))
     assert "【错误】max_items 参数无效" in out, out
+
+
+# ------------------------------------------------------------
+# _download_media：重定向逐跳 SSRF 校验（P1 修复验证）
+# ------------------------------------------------------------
+
+class _FakeResp:
+    def __init__(self, status=200, location=None, chunks=None):
+        self.status = status
+        self.headers = {"Location": location} if location else {}
+        self._chunks = chunks if chunks is not None else [b"media-bytes"]
+        self.content_length = sum(len(c) for c in self._chunks)
+
+    @property
+    def content(self):
+        return self
+
+    async def iter_chunked(self, n):
+        for c in self._chunks:
+            yield c
+
+
+class _FakeRespCtx:
+    """模拟 aiohttp 的 _RequestContextManager：async with 进入返回 resp。"""
+
+    def __init__(self, resp):
+        self._resp = resp
+
+    async def __aenter__(self):
+        return self._resp
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeSession:
+    """脚本化 aiohttp 会话：首跳 302（可指向内网/公网），二跳 200。"""
+
+    def __init__(self, redirect_location):
+        self.redirect_location = redirect_location
+        self.calls = []  # [(url, allow_redirects)]
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs.get("allow_redirects")))
+        if url == "https://example.com/evil.png":
+            return _FakeRespCtx(_FakeResp(status=302, location=self.redirect_location))
+        return _FakeRespCtx(_FakeResp(status=200, chunks=[b"final-bytes"]))
+
+
+def _make_download_plugin(tmp_path) -> BrowserLLMPlugin:
+    plugin = _make_plugin(FakePage(), "")
+    plugin._media_dir = tmp_path
+    plugin.safety = SafetyFilter(BANNED, block_internal_ip=True)
+    return plugin
+
+
+def test_download_media_blocks_redirect_to_internal(tmp_path, monkeypatch):
+    """302 重定向到内网 → 每跳重新过安全校验并终止（防 SSRF 绕过）。"""
+    import aiohttp as _real_aiohttp
+
+    session = _FakeSession(redirect_location="http://127.0.0.1/secret")
+    monkeypatch.setattr(_real_aiohttp, "ClientSession", lambda: session)
+
+    plugin = _make_download_plugin(tmp_path)
+    out = _run(plugin._download_media("https://example.com/evil.png", 1, "image"))
+    assert out == "", "重定向到内网必须终止下载"
+    assert session.calls == [("https://example.com/evil.png", False)], (
+        "应关闭自动跟随重定向（allow_redirects=False）"
+    )
+    assert not any(tmp_path.iterdir()), "不得残留下载文件"
+
+
+def test_download_media_follows_public_redirect(tmp_path, monkeypatch):
+    """重定向到公网目标 → 逐跳校验通过后正常下载。
+
+    用公网 IP 字面量做重定向目标，避免测试环境 DNS 不可用导致误判。
+    """
+    import aiohttp as _real_aiohttp
+
+    session = _FakeSession(redirect_location="http://93.184.216.34/ok.png")
+    monkeypatch.setattr(_real_aiohttp, "ClientSession", lambda: session)
+
+    plugin = _make_download_plugin(tmp_path)
+    out = _run(plugin._download_media("https://example.com/evil.png", 1, "image"))
+    assert out and Path(out).is_file(), "公网重定向应下载成功"
+    assert Path(out).read_bytes() == b"final-bytes"
+    assert len(session.calls) == 2, "应逐跳请求（首跳 302 + 二跳 200）"
+    assert session.calls[1][0] == "http://93.184.216.34/ok.png"

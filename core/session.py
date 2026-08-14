@@ -142,13 +142,23 @@ class SessionManager:
             self._active[umo] = active
 
     async def _new_page_goto(self, url: str) -> Optional["Page"]:
-        """创建新标签页并跳转（失败返回 None，不抛出）。"""
+        """创建新标签页并跳转（失败返回 None，不抛出）。
+
+        注意：new_page 成功但 goto 失败时，必须关闭该页面（含其 context），
+        否则每次失败导航都会泄漏一个浏览器页面/上下文。
+        """
+        page = None
         try:
             page = await self.browser.new_page()
             await page.goto(url, wait_until='domcontentloaded')
             return page
         except Exception as e:  # noqa: BLE001 — 创建失败不抛出
             logger.warning("创建标签页失败: %s", e)
+            if page is not None:
+                try:
+                    await self.browser.close_page(page)
+                except Exception:  # noqa: BLE001 — 关闭失败忽略
+                    pass
             return None
 
     # ------------------------------------------------------------
@@ -167,7 +177,7 @@ class SessionManager:
         Returns:
             激活页；总标签数达 max_pages 或创建失败时返回 None。
         """
-        logger.info(f"[DIAG] ensure_page 进入 umo={umo!r}")
+        logger.debug(f"ensure_page 进入 umo={umo!r}")
         async with self._global_lock:
             pages = self._pages.get(umo)
             if pages:
@@ -175,7 +185,7 @@ class SessionManager:
                 page = pages[active] if active < len(pages) else None
                 if page is not None and self._page_alive(page):
                     self._touch(umo)
-                    logger.info("[DIAG] ensure_page 复用 page")
+                    logger.debug("ensure_page 复用 page")
                     return page
                 # 激活页失效：关闭并移除该标签后走新建路径。
                 if page is not None:
@@ -187,15 +197,15 @@ class SessionManager:
                 logger.warning("标签总数达上限 %d，拒绝新建（umo=%s）", self.max_pages, umo)
                 return None
 
-            logger.info("[DIAG] ensure_page 新建 page")
+            page = None
             try:
                 page = await self.browser.new_page()
-                logger.info("[DIAG] ensure_page new_page 完成")
-                logger.info("[DIAG] ensure_page goto default 前")
                 await page.goto(self.default_url, wait_until='domcontentloaded')
-                logger.info("[DIAG] ensure_page goto default 后")
-            except Exception as e:  # noqa: BLE001 — 创建失败不抛出（与原 _new_page_goto 一致）
-                logger.warning("[DIAG] ensure_page 新建页面失败: %s", e)
+            except Exception as e:  # noqa: BLE001 — 创建失败不抛出
+                logger.warning("新建页面失败（umo=%s）: %s", umo, e)
+                # 防泄漏：new_page 成功但 goto 失败时关闭页面（含其 context）。
+                if page is not None:
+                    await self._close_page(umo, page)
                 return None
             self._pages.setdefault(umo, []).append(page)
             self._active[umo] = len(self._pages[umo]) - 1
@@ -204,7 +214,7 @@ class SessionManager:
                 "新建浏览会话标签 umo=%s（标签 %d/%d）",
                 umo, self._total_tabs(), self.max_pages,
             )
-            logger.info("[DIAG] ensure_page 返回")
+            logger.debug("ensure_page 返回")
             return page
 
     async def new_tab(self, umo: str, url: str) -> Optional["Page"]:

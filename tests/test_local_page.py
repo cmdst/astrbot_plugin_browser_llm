@@ -120,7 +120,7 @@ def _make_plugin(tmp_path, page=None, screenshot_ok=True, session_blacklist=None
         "session_whitelist": session_whitelist or [],
         "session_blacklist": session_blacklist or [],
         "enable_screenshot": True,
-        "vision_provider_id": "opencode-go/mimo-v2.5",
+        "vision_provider_id": "fake/vision",
         "silent_mode": True,
     }
     context = SimpleNamespace(
@@ -275,7 +275,7 @@ def test_banned_text_rejected(tmp_path):
     """降级文本模式：提取文本命中禁词 → 拒绝输出。"""
     page = FakePage(text="页面包含赌博相关内容")
     plugin = _make_plugin(tmp_path, page=page)
-    plugin.vision_provider_id = ""  # 关闭视觉，强制走文本降级路径
+    plugin.config["vision_provider_id"] = ""  # 关闭视觉，强制走文本降级路径
     html = _write_html(tmp_path / "workspaces", "index.html", text="页面包含赌博相关内容")
     result = _run(plugin.browse_local_page(FakeEvent(), path=str(html)))
     assert "【拒绝】" in result and "赌博" in result
@@ -322,7 +322,7 @@ def test_degraded_text_mode_when_vision_unavailable(tmp_path):
     """视觉模型不可用（描述为空）→ 降级文本提取，保证不空转。"""
     page = FakePage(text="正文一 正文二 正文三")
     plugin = _make_plugin(tmp_path, page=page)
-    plugin.vision_provider_id = ""
+    plugin.config["vision_provider_id"] = ""
     html = _write_html(tmp_path / "workspaces", "index.html")
     result = _run(plugin.browse_local_page(FakeEvent(), path=str(html)))
     assert "【本地页面预览·文本模式】" in result

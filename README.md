@@ -41,7 +41,7 @@ Agent 驱动的网页浏览插件 —— 让 LLM 通过 function-calling 自主�
 | `browser_type` | chromium | 浏览器内核 |
 | `silent_mode` | true | 静默模式：截图仅内部识图不发群 |
 | `page_perception` | text_image | 页面感知方式：text / text_image / image |
-| `vision_provider_id` | - | 多模态识图模型 Provider ID（如 opencode-go/mimo-v2.5） |
+| `vision_provider_id` | - | 多模态识图模型 Provider ID。下拉选项自动同步 AstrBot 已配置的聊天模型 Provider（启动时与每次识图调用时刷新）；留空则截图仅发用户不做识图 |
 | `vision_prompt` | - | 自定义识图提示词 |
 | `cache_days` | 3 | 媒体缓存保留天数，超期自动清理 |
 | `agent_max_steps` | 70 | 子代理单次委托最大工具步数 |

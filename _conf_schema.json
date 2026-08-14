@@ -72,8 +72,8 @@
   },
   "max_pages": {
     "type": "int",
-    "description": "每会话最大标签页数",
-    "hint": "同一浏览会话内最多可同时打开的标签页数量，达到上限后新标签/新会话将被拒绝，防止 Agent 无限开标签消耗资源。",
+    "description": "所有会话标签页总数上限",
+    "hint": "所有浏览会话合计最多可同时打开的标签页数量（全局上限），达到上限后新标签/新会话将被拒绝，防止 Agent 无限开标签消耗资源。",
     "default": 5
   },
   "idle_timeout": {
@@ -103,12 +103,11 @@
   "vision_provider_id": {
     "type": "string",
     "description": "多模态识图模型 Provider ID",
-    "hint": "下拉选择多模态模型对截图做识图总结；留空则截图仅发用户不做识图。若列表中没有你的识图模型，可先在 AstrBot 模型配置中添加，再手动编辑本插件配置文件填写",
+    "hint": "下拉选择多模态模型对截图做识图总结；留空则截图仅发用户不做识图。下拉选项自动同步 AstrBot 已配置的聊天模型 Provider（插件启动时与每次识图调用时刷新，无需手动编辑本文件）；若列表中没有你的识图模型，请先在 AstrBot 模型配置中添加对应 Provider。",
     "options": [
-      "opencode-go/mimo-v2.5",
       ""
     ],
-    "default": "opencode-go/mimo-v2.5"
+    "default": ""
   },
   "vision_prompt": {
     "type": "string",

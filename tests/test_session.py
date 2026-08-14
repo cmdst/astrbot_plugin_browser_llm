@@ -268,3 +268,67 @@ def test_sweeper_start_stop_idempotent(sm):
         assert sm._sweeper_task is None
 
     _run(_go())
+
+
+# ------------------------------------------------------------
+# 资源泄漏回归：goto 失败时页面必须被关闭（P1 修复验证）
+# ------------------------------------------------------------
+
+class _GotoFailPage(FakePage):
+    """goto 必失败的页面（模拟域名解析失败/目标不可达）。"""
+
+    async def goto(self, url, wait_until="domcontentloaded"):
+        raise RuntimeError("net::ERR_NAME_NOT_RESOLVED")
+
+
+class _GotoFailBrowser(MockBrowser):
+    async def new_page(self):
+        p = _GotoFailPage()
+        self.created.append(p)
+        return p
+
+
+class _FlakyGotoBrowser(MockBrowser):
+    """首次 goto 失败、之后成功的浏览器（验证失败后可自动恢复）。"""
+
+    def __init__(self):
+        super().__init__()
+        self._fail_goto = True
+
+    async def new_page(self):
+        if self._fail_goto:
+            self._fail_goto = False
+            p = _GotoFailPage()
+        else:
+            p = FakePage()
+        self.created.append(p)
+        return p
+
+
+def test_ensure_page_no_leak_when_goto_fails():
+    """首标签 goto 失败 → 页面必须关闭，不得残留映射（防泄漏）。"""
+    browser = _GotoFailBrowser()
+    sm = SessionManager(browser, max_pages=4, idle_timeout=60)
+    assert _run(sm.ensure_page("grp-a")) is None
+    assert sm.tab_count("grp-a") == 0, "失败后不应残留标签映射"
+    assert len(browser.closed) == 1, "goto 失败后页面必须交给 browser.close_page"
+
+
+def test_new_tab_no_leak_when_goto_fails():
+    """新标签 goto 失败 → 页面必须关闭（防泄漏）。"""
+    browser = _GotoFailBrowser()
+    sm = SessionManager(browser, max_pages=4, idle_timeout=60)
+    assert _run(sm.new_tab("grp-a", "https://example.com/x")) is None
+    assert sm.tab_count("grp-a") == 0
+    assert len(browser.closed) == 1
+
+
+def test_ensure_page_recovers_after_failed_goto():
+    """失败后重试应能正常建页（失败不污染后续状态）。"""
+    browser = _FlakyGotoBrowser()
+    sm = SessionManager(browser, max_pages=4, idle_timeout=60)
+    assert _run(sm.ensure_page("grp-a")) is None
+    assert len(browser.closed) == 1
+    page = _run(sm.ensure_page("grp-a"))
+    assert page is not None and sm.tab_count("grp-a") == 1
+    assert len(browser.closed) == 1, "成功路径不应误关页面"

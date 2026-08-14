@@ -82,6 +82,49 @@ def _hostname_to_ip(hostname: str):
     return None
 
 
+async def acheck_hostname_internal(
+    hostname: str, timeout: float = _DNS_RESOLVE_TIMEOUT
+) -> bool | None:
+    """异步判断主机名是否解析到内网/保留地址。
+
+    用于页面级 SSRF 兜底（重定向/子资源拦截）：IP 字面量（含十进制/
+    八进制/短点分混淆）直接判定；域名做带超时的 DNS 解析，任一结果
+    命中内网即返回 True（防 DNS 混合应答）。
+
+    Args:
+        hostname: 主机名（不含协议与端口）。
+        timeout: DNS 解析超时（秒）。
+
+    Returns:
+        bool | None: True=内网/保留；False=公网；None=无法判定
+        （DNS 失败等，调用方应放行并短缓存，避免误伤正常页面）。
+    """
+    if not hostname:
+        return False
+    ip = _hostname_to_ip(hostname)
+    if ip is not None:
+        return _is_internal_ip(ip)
+    try:
+        loop = asyncio.get_running_loop()
+        infos = await asyncio.wait_for(
+            loop.getaddrinfo(hostname, None, type=socket.SOCK_STREAM),
+            timeout=timeout,
+        )
+    except Exception:  # noqa: BLE001 — 解析失败按无法判定处理
+        return None
+    if not infos:
+        return None
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip_obj = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if _is_internal_ip(ip_obj):
+            return True
+    return False
+
+
 class SafetyFilter:
     """安全过滤器：内容禁词检测与 URL 内网拦截（SSRF 防护）。"""
 

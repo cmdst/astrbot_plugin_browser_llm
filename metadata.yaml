@@ -2,9 +2,9 @@ name: astrbot_plugin_browser_llm
 display_name: LLM浏览器
 desc: Agent 驱动的网页浏览插件。LLM 通过 function-calling 自主浏览网页：导航、搜索、点击链接、提取正文与截图，无需用户手动指令，返回结构化浏览结果。
 short_desc: Agent 自主浏览网页
-version: v1.1.0
+version: v1.1.1
 author: AstrBot Community
-repo: ""
+repo: "https://github.com/cmdst/astrbot_plugin_browser_llm"
 astrbot_version: ">=4.24.0"
 support_platforms:
   - aiocqhttp

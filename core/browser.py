@@ -9,19 +9,30 @@ import（单测环境无此依赖亦可加载本模块）；类型标注仅用�
 TYPE_CHECKING / 字符串形式。
 """
 
+import asyncio
 import logging
 import os
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
 if TYPE_CHECKING:  # pragma: no cover — 仅类型检查，运行时永不导入
     from playwright.async_api import Browser, Page, Playwright
+
+from .safety import acheck_hostname_internal
 
 logger = logging.getLogger(__name__)
 
 # 浏览器启动默认参数：容器环境普遍需要 --no-sandbox 与
 # --disable-dev-shm-usage（/dev/shm 过小导致渲染进程崩溃）。
 _LAUNCH_ARGS = ["--no-sandbox", "--disable-dev-shm-usage"]
+
+# SSRF 兜底拦截的 host 判定缓存 TTL（秒）：页面内大量子资源共享同一 host，
+# 缓存可避免每个请求都做 DNS 解析。
+_SSRF_GUARD_CACHE_TTL = 300.0
+# DNS 无法判定（失败）时的短缓存 TTL（秒）。
+_SSRF_GUARD_DNS_FAIL_TTL = 30.0
 
 
 class BrowserCore:
@@ -49,6 +60,9 @@ class BrowserCore:
         self.viewport: dict = cfg.get("viewport") or {"width": 1280, "height": 800}
         self.timeout: float = float(cfg.get("timeout", 30))
         self.enable_screenshot: bool = bool(cfg.get("enable_screenshot", True))
+        # 是否启用页面级 SSRF 兜底拦截（与 SafetyFilter.block_internal_ip 联动；
+        # 关闭内网拦截时也不安装路由拦截，保持行为一致）。
+        self.block_internal_ip: bool = bool(cfg.get("block_internal_ip", True))
         data_dir = cfg.get("data_dir") or str(Path(__file__).resolve().parent.parent / "data")
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -58,6 +72,8 @@ class BrowserCore:
         self._browser: Browser | None = None
         # 已创建页面 -> 所属 context 的映射，close_page 时成对清理。
         self._page_contexts: dict = {}
+        # SSRF 兜底拦截的 host 判定缓存：host -> (过期时间戳, 是否内网)。
+        self._ssrf_host_cache: dict[str, tuple[float, bool]] = {}
 
     # ------------------------------------------------------------
     # 生命周期：启动 / 存活检查 / 关闭
@@ -78,12 +94,12 @@ class BrowserCore:
         p = Path(path)
         if not p.exists() or not any(p.iterdir()):
             logger.warning(
-                "[DIAG] _fix_browsers_path 清除无效 PLAYWRIGHT_BROWSERS_PATH=%s",
+                "_fix_browsers_path 清除无效 PLAYWRIGHT_BROWSERS_PATH=%s",
                 path,
             )
             os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
         else:
-            logger.info("[DIAG] _fix_browsers_path 保留有效路径: %s", path)
+            logger.debug("_fix_browsers_path 保留有效路径: %s", path)
 
     async def ensure_browser(self) -> None:
         """懒加载启动浏览器；已启动则直接返回。
@@ -99,7 +115,7 @@ class BrowserCore:
         # 延迟导入：单测环境无 playwright 时本模块仍可加载。
         from playwright.async_api import async_playwright  # noqa: PLC0415
 
-        logger.info("[DIAG] ensure_browser 启动中")
+        logger.debug("ensure_browser 启动中")
         if self._playwright is None:
             self._playwright = await async_playwright().start()
         try:
@@ -121,8 +137,8 @@ class BrowserCore:
                     pass
                 self._playwright = None
             raise
-        logger.info("[DIAG] ensure_browser 完成: type=%s proxy=%s",
-                    self.browser_type, self.proxy or "(直连)")
+        logger.debug("ensure_browser 完成: type=%s proxy=%s",
+                     self.browser_type, self.proxy or "(直连)")
 
     def _browser_alive(self) -> bool:
         """浏览器是否存活且已连接（崩溃/手动关闭后返回 False）。"""
@@ -166,7 +182,9 @@ class BrowserCore:
         await self.ensure_browser()
         if self._browser is None:
             raise RuntimeError("浏览器启动失败")
-        logger.info("[DIAG] new_page 创建中")
+        logger.debug("new_page 创建中")
+        context = None
+        page = None
         try:
             context = await self._browser.new_context(
                 viewport={"width": int(self.viewport.get("width", 1280)),
@@ -174,14 +192,92 @@ class BrowserCore:
             )
             page = await context.new_page()
             page.set_default_timeout(self.timeout * 1000)
+            # SSRF 兜底：拦截解析到内网/保留地址的页面请求（防 302 重定向
+            # 与子资源绕过 acheck_url 的前置校验）。context 级拦截可覆盖
+            # target=_blank 弹窗页。mock/降级环境无 route API 时自动跳过。
+            if self.block_internal_ip:
+                await self._install_ssrf_guard(context)
         except Exception:
+            # 创建失败：清理半成品 context/page，避免资源泄漏。
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            if context is not None:
+                try:
+                    await context.close()
+                except Exception:  # noqa: BLE001
+                    pass
             # 创建期间浏览器断开：标记重建后向上抛，调用方捕获。
             if not self._browser_alive():
                 self._invalidate()
             raise
         self._page_contexts[id(page)] = context
-        logger.info("[DIAG] new_page 完成")
+        logger.debug("new_page 完成")
         return page
+
+    # ------------------------------------------------------------
+    # SSRF 兜底拦截（重定向/子资源绕过防护）
+    # ------------------------------------------------------------
+
+    async def _install_ssrf_guard(self, context) -> None:
+        """在 context 级安装 SSRF 兜底路由拦截。
+
+        acheck_url 只校验 goto 前的初始 URL；页面 302/JS 重定向与子资源
+        请求可绕过该前置校验直达内网。此处拦截 context 内全部 http(s)
+        请求，目标主机解析到内网/保留地址即 abort。host 判定带缓存，
+        避免对页面内大量子资源重复 DNS 解析。
+        """
+        if not hasattr(context, "route"):
+            return  # mock/降级环境无 route API 时跳过
+
+        async def _handler(route) -> None:
+            try:
+                url = route.request.url or ""
+                if not url.lower().startswith(("http://", "https://")):
+                    await route.continue_()
+                    return
+                hostname = urlsplit(url).hostname
+                if not hostname:
+                    await route.continue_()
+                    return
+                if await self._ssrf_host_is_internal(hostname):
+                    logger.warning(
+                        "SSRF 兜底拦截内网请求: %s -> %s", url, hostname
+                    )
+                    await route.abort("blockedbyclient")
+                else:
+                    await route.continue_()
+            except Exception:  # noqa: BLE001 — 拦截器异常时放行，不阻断页面
+                try:
+                    await route.continue_()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        try:
+            await context.route("**/*", _handler)
+        except Exception as e:  # noqa: BLE001 — 安装失败仅告警，不影响浏览
+            logger.warning("安装 SSRF 兜底拦截失败: %s", e)
+
+    async def _ssrf_host_is_internal(self, hostname: str) -> bool:
+        """主机名是否解析到内网/保留地址（带缓存与 DNS 超时保护）。
+
+        判定结果缓存 _SSRF_GUARD_CACHE_TTL 秒；DNS 无法判定（失败）时按
+        放行处理并短缓存（第二道防线，宁可放行也不误伤正常页面）。
+        """
+        now = time.monotonic()
+        cached = self._ssrf_host_cache.get(hostname)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+        verdict = await acheck_hostname_internal(hostname)
+        ttl = (
+            _SSRF_GUARD_CACHE_TTL
+            if verdict is not None
+            else _SSRF_GUARD_DNS_FAIL_TTL
+        )
+        self._ssrf_host_cache[hostname] = (now + ttl, bool(verdict))
+        return bool(verdict)
 
     async def close_page(self, page) -> None:
         """关闭页面及其 context（容错忽略异常）。"""
