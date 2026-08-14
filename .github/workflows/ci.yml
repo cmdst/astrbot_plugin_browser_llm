@@ -15,6 +15,6 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install test deps
-        run: pip install pytest docstring_parser
+        run: pip install pytest docstring_parser aiohttp
       - name: Run tests
         run: python -m pytest tests/ -q
