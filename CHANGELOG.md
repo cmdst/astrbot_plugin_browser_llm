@@ -4,6 +4,14 @@
 `data/` 目录（主仓库 .gitignore 忽略）迁移初始化而来。仅跟踪插件源码与测试，运行时
 数据（`data/`：截图、运行时配置、临时文件）一律不入库。
 
+## [v1.2.1] - 2026-08-14
+
+### 修复
+
+- **release 打包**：zip 排除 `dist/*`，修复发布包内含空 dist/ 目录瑕疵；
+- **浏览器资源清理加固**：BrowserCore shutdown/close_page 增加单步超时保护（5s）与 warning 日志提级（带实例标识）；terminate 增加总超时兜底（20s）并重构清理顺序（先停 sweeper → browser.shutdown → sessions.shutdown），修复 WebUI 重载场景下旧实例 chromium 残留进程问题；
+- 测试：新增 shutdown 清理路径与 terminate 契约用例 13 个（249 passed）。
+
 ## [v1.2.0] - 2026-08-14
 
 ### 优化：P2 五项（2026-08-14 修复报告建议清单）
