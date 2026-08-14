@@ -28,6 +28,14 @@ logger = logging.getLogger(__name__)
 # --disable-dev-shm-usage（/dev/shm 过小导致渲染进程崩溃）。
 _LAUNCH_ARGS = ["--no-sandbox", "--disable-dev-shm-usage"]
 
+# 关闭超时保护（秒）：playwright 的 close/stop 在渲染进程卡死、页面
+# 悬挂等场景下可能永久悬挂；不加超时会导致插件 terminate 卡死，重载后
+# 遗留 chromium 进程（v1.2.0 发布后曾实测：browser.close 悬挂 2 小时+，
+# playwright driver 与 chromium 进程均未退出）。单步超时阈值。
+_BROWSER_CLOSE_TIMEOUT = 5.0
+# 单页面 / 单 context 关闭超时（秒）：页面关闭悬挂不应阻塞会话回收链路。
+_PAGE_CLOSE_TIMEOUT = 5.0
+
 # SSRF 兜底拦截的 host 判定缓存 TTL（秒）：页面内大量子资源共享同一 host，
 # 缓存可避免每个请求都做 DNS 解析。
 _SSRF_GUARD_CACHE_TTL = 300.0
@@ -153,21 +161,45 @@ class BrowserCore:
         self._page_contexts.clear()
 
     async def shutdown(self) -> None:
-        """关闭浏览器与 playwright（幂等，容错）。"""
-        if self._browser is not None:
-            try:
-                await self._browser.close()
-            except Exception as e:  # noqa: BLE001
-                logger.debug("关闭浏览器失败（忽略）: %s", e)
-        if self._playwright is not None:
-            try:
-                await self._playwright.stop()
-            except Exception as e:  # noqa: BLE001
-                logger.debug("停止 playwright 失败（忽略）: %s", e)
-        self._browser = None
-        self._playwright = None
-        self._page_contexts.clear()
-        logger.info("浏览器资源已释放")
+        """关闭浏览器与 playwright（幂等，容错，带超时保护）。
+
+        任一步超时/异常都继续执行后续清理，且无论结果如何都清空内部
+        引用：保证调用方（插件 terminate）不会被 close 悬挂卡死，避免
+        重载场景遗留 chromium 进程。失败/超时均以 warning 级日志带
+        实例标识上报，便于定位是哪个实例未清理干净。
+        """
+        tag = f"BrowserCore@{id(self):x}"
+        browser, playwright = self._browser, self._playwright
+        try:
+            if browser is not None:
+                try:
+                    await asyncio.wait_for(
+                        browser.close(), timeout=_BROWSER_CLOSE_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "[%s] browser.close 超时（%.1fs），继续执行清理",
+                        tag, _BROWSER_CLOSE_TIMEOUT,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("[%s] 关闭浏览器失败（继续执行清理）: %s", tag, e)
+            if playwright is not None:
+                try:
+                    await asyncio.wait_for(
+                        playwright.stop(), timeout=_BROWSER_CLOSE_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "[%s] playwright.stop 超时（%.1fs）", tag, _BROWSER_CLOSE_TIMEOUT
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("[%s] 停止 playwright 失败（忽略）: %s", tag, e)
+        finally:
+            # 无论成功/失败/超时，引用一律清空：避免半关闭状态残留。
+            self._browser = None
+            self._playwright = None
+            self._page_contexts.clear()
+        logger.info("[%s] 浏览器资源已释放", tag)
 
     # ------------------------------------------------------------
     # 页面管理
@@ -280,19 +312,28 @@ class BrowserCore:
         return bool(verdict)
 
     async def close_page(self, page) -> None:
-        """关闭页面及其 context（容错忽略异常）。"""
+        """关闭页面及其 context（容错，带超时保护）。
+
+        任一步超时/异常都继续执行后续清理；页面/context 关闭悬挂不会
+        阻塞会话回收与插件终止链路。失败/超时以 warning 级日志上报。
+        """
         if page is None:
             return
+        tag = f"BrowserCore@{id(self):x}"
         ctx = self._page_contexts.pop(id(page), None)
         try:
-            await page.close()
+            await asyncio.wait_for(page.close(), timeout=_PAGE_CLOSE_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning("[%s] 关闭页面超时（%.1fs，忽略）", tag, _PAGE_CLOSE_TIMEOUT)
         except Exception as e:  # noqa: BLE001
-            logger.debug("关闭页面失败（忽略）: %s", e)
+            logger.warning("[%s] 关闭页面失败（忽略）: %s", tag, e)
         if ctx is not None:
             try:
-                await ctx.close()
+                await asyncio.wait_for(ctx.close(), timeout=_PAGE_CLOSE_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning("[%s] 关闭 context 超时（%.1fs，忽略）", tag, _PAGE_CLOSE_TIMEOUT)
             except Exception as e:  # noqa: BLE001
-                logger.debug("关闭 context 失败（忽略）: %s", e)
+                logger.warning("[%s] 关闭 context 失败（忽略）: %s", tag, e)
 
     # ------------------------------------------------------------
     # 截图

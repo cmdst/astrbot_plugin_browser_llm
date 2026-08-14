@@ -10,10 +10,13 @@
 """
 
 import asyncio
+import logging
+import time
 from types import SimpleNamespace
 
 import pytest
 
+import core.browser as browser_module
 from core.browser import BrowserCore
 
 
@@ -55,14 +58,42 @@ class _FakeContext:
 
 
 class _FakeBrowser:
-    def __init__(self, ctx):
+    def __init__(self, ctx, fail_close=False, hang_close=False):
         self.ctx = ctx
+        self.closed = False
+        self.fail_close = fail_close
+        self.hang_close = hang_close
+        self.close_calls = 0
 
     def is_connected(self):
         return True
 
     async def new_context(self, **kwargs):
         return self.ctx
+
+    async def close(self):
+        self.close_calls += 1
+        if self.hang_close:
+            await asyncio.sleep(3600)
+        if self.fail_close:
+            raise RuntimeError("browser close broken")
+        self.closed = True
+
+
+class _FakePlaywright:
+    def __init__(self, fail_stop=False, hang_stop=False):
+        self.stopped = False
+        self.fail_stop = fail_stop
+        self.hang_stop = hang_stop
+        self.stop_calls = 0
+
+    async def stop(self):
+        self.stop_calls += 1
+        if self.hang_stop:
+            await asyncio.sleep(3600)
+        if self.fail_stop:
+            raise RuntimeError("playwright stop broken")
+        self.stopped = True
 
 
 def _make_core(ctx, block_internal_ip=True) -> BrowserCore:
@@ -71,6 +102,14 @@ def _make_core(ctx, block_internal_ip=True) -> BrowserCore:
     )
     core._browser = _FakeBrowser(ctx)
     core._playwright = object()  # ensure_browser 早退路径（_browser_alive 为真）
+    return core
+
+
+def _make_core_shutdown(browser, playwright) -> BrowserCore:
+    """构造带真实 browser/playwright 假件的实例（用于 shutdown 链路测试）。"""
+    core = BrowserCore({"browser_type": "chromium"})
+    core._browser = browser
+    core._playwright = playwright
     return core
 
 
@@ -206,3 +245,134 @@ def test_ssrf_host_cache_used():
     assert core._ssrf_host_cache["127.0.0.1"][1] is True
     # 二次查询命中缓存（无需再解析）。
     assert _run(core._ssrf_host_is_internal("127.0.0.1")) is True
+
+
+# ------------------------------------------------------------
+# shutdown：清理路径（正常 / 异常继续清理 / 超时不悬挂）
+# ------------------------------------------------------------
+
+def test_shutdown_normal_cleans_all():
+    browser = _FakeBrowser(_FakeContext())
+    playwright = _FakePlaywright()
+    core = _make_core_shutdown(browser, playwright)
+    core._page_contexts[1] = object()  # 模拟残留映射，必须一并清空
+    _run(core.shutdown())
+    assert browser.closed and browser.close_calls == 1
+    assert playwright.stopped and playwright.stop_calls == 1
+    assert core._browser is None and core._playwright is None
+    assert core._page_contexts == {}, "shutdown 后内部映射必须清空"
+
+
+def test_shutdown_close_exception_still_stops_playwright():
+    """browser.close 抛异常：不得中断 playwright.stop，且不向上抛。"""
+    browser = _FakeBrowser(_FakeContext(), fail_close=True)
+    playwright = _FakePlaywright()
+    core = _make_core_shutdown(browser, playwright)
+    _run(core.shutdown())  # 不得向上抛异常
+    assert playwright.stopped, "browser.close 抛异常后 playwright.stop 仍须执行"
+    assert core._browser is None and core._playwright is None
+
+
+def test_shutdown_close_timeout_does_not_hang(monkeypatch):
+    """browser.close 悬挂：shutdown 限时返回，playwright.stop 仍执行。"""
+    monkeypatch.setattr(browser_module, "_BROWSER_CLOSE_TIMEOUT", 0.05)
+    browser = _FakeBrowser(_FakeContext(), hang_close=True)
+    playwright = _FakePlaywright()
+    core = _make_core_shutdown(browser, playwright)
+    start = time.monotonic()
+    _run(core.shutdown())
+    elapsed = time.monotonic() - start
+    assert elapsed < 1.0, f"close 悬挂时 shutdown 必须限时返回，实际 {elapsed:.2f}s"
+    assert playwright.stopped, "browser.close 超时后 playwright.stop 仍须执行"
+    assert core._browser is None and core._playwright is None
+
+
+def test_shutdown_stop_exception_ignored():
+    browser = _FakeBrowser(_FakeContext())
+    playwright = _FakePlaywright(fail_stop=True)
+    core = _make_core_shutdown(browser, playwright)
+    _run(core.shutdown())  # 不得向上抛异常
+    assert browser.closed
+    assert core._browser is None and core._playwright is None
+
+
+def test_shutdown_both_hang_bounded(monkeypatch):
+    """browser.close 与 playwright.stop 同时悬挂：总时长受单步超时约束。"""
+    monkeypatch.setattr(browser_module, "_BROWSER_CLOSE_TIMEOUT", 0.05)
+    browser = _FakeBrowser(_FakeContext(), hang_close=True)
+    playwright = _FakePlaywright(hang_stop=True)
+    core = _make_core_shutdown(browser, playwright)
+    start = time.monotonic()
+    _run(core.shutdown())
+    elapsed = time.monotonic() - start
+    assert elapsed < 1.0, f"两步均悬挂时 shutdown 仍须限时返回，实际 {elapsed:.2f}s"
+    assert core._browser is None and core._playwright is None
+
+
+def test_shutdown_idempotent():
+    browser = _FakeBrowser(_FakeContext())
+    playwright = _FakePlaywright()
+    core = _make_core_shutdown(browser, playwright)
+    _run(core.shutdown())
+    _run(core.shutdown())  # 二次调用为 no-op，不得报错
+    assert browser.close_calls == 1 and playwright.stop_calls == 1
+
+
+def test_shutdown_failure_logs_warning_with_tag(caplog):
+    """关闭失败必须 warning 级且带实例标识（便于定位残留实例）。"""
+    browser = _FakeBrowser(_FakeContext(), fail_close=True)
+    playwright = _FakePlaywright()
+    core = _make_core_shutdown(browser, playwright)
+    with caplog.at_level(logging.WARNING):
+        _run(core.shutdown())
+    tag = f"BrowserCore@{id(core):x}"
+    assert any(
+        tag in r.message and r.levelno == logging.WARNING for r in caplog.records
+    ), "关闭失败日志须为 warning 级并带实例标识"
+
+
+def test_close_page_page_close_exception_context_still_closed():
+    class _BrokenPage(_FakePage):
+        async def close(self):
+            raise RuntimeError("page close broken")
+
+    ctx = _FakeContext()
+    page = _BrokenPage()
+    core = _make_core(_FakeBrowser(ctx))
+    core._page_contexts[id(page)] = ctx
+    _run(core.close_page(page))  # 不得向上抛异常
+    assert ctx.closed, "page.close 抛异常后 context 仍须关闭（防泄漏）"
+    assert id(page) not in core._page_contexts, "关闭后映射必须弹出"
+
+
+def test_close_page_timeout_bounded(monkeypatch):
+    """page.close 悬挂：close_page 限时返回，context 仍尝试关闭。"""
+    monkeypatch.setattr(browser_module, "_PAGE_CLOSE_TIMEOUT", 0.05)
+
+    class _HangPage(_FakePage):
+        async def close(self):
+            await asyncio.sleep(3600)
+
+    ctx = _FakeContext()
+    page = _HangPage()
+    core = _make_core(_FakeBrowser(ctx))
+    core._page_contexts[id(page)] = ctx
+    start = time.monotonic()
+    _run(core.close_page(page))
+    elapsed = time.monotonic() - start
+    assert elapsed < 1.0, f"page.close 悬挂时 close_page 必须限时返回，实际 {elapsed:.2f}s"
+    assert ctx.closed, "page.close 超时后 context 仍须尝试关闭"
+    assert id(page) not in core._page_contexts
+
+
+def test_close_page_context_close_exception_ignored():
+    class _BrokenContext(_FakeContext):
+        async def close(self):
+            raise RuntimeError("ctx close broken")
+
+    ctx = _BrokenContext()
+    page = _FakePage()
+    core = _make_core(_FakeBrowser(ctx))
+    core._page_contexts[id(page)] = ctx
+    _run(core.close_page(page))  # 不得向上抛异常
+    assert page.closed

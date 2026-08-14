@@ -461,3 +461,53 @@ def test_session_whitelist_blacklist_attrs():
     assert "self.session_whitelist" in src
     assert "self.session_blacklist" in src
     assert "def _is_session_allowed" in src
+
+
+# ------------------------------------------------------------
+# terminate：资源清理加固（重载场景 chromium 残留防护）
+# ------------------------------------------------------------
+
+def _terminate_body() -> str:
+    """提取 terminate 方法体源码（AST 定位，保持与模块实例无关）。"""
+    node = next(
+        (n for n in ast.walk(_TREE)
+         if isinstance(n, ast.AsyncFunctionDef) and n.name == "terminate"),
+        None,
+    )
+    assert node is not None, "terminate 方法必须存在"
+    return ast.get_source_segment(_SRC, node) or ""
+
+
+def test_terminate_has_overall_timeout_protection():
+    """terminate 必须带总超时保护（wait_for + _TERMINATE_TIMEOUT）。"""
+    body = _terminate_body()
+    assert "asyncio.wait_for" in body, "terminate 必须用 wait_for 包裹资源清理"
+    assert "_TERMINATE_TIMEOUT" in body, "terminate 必须引用总超时常量"
+    assert "asyncio.TimeoutError" in body, "必须捕获超时异常"
+
+
+def test_terminate_timeout_logs_error_with_tag():
+    """terminate 超时/异常日志必须 error 级并带插件实例标识。"""
+    body = _terminate_body()
+    assert "logger.error" in body, "超时/异常必须 error 级上报"
+    assert "metadata_name" in body, "日志必须带插件实例标识（便于定位）"
+
+
+def test_terminate_orders_browser_before_sessions_cleanup():
+    """浏览器关闭必须先于会话映射清理（browser.close 顺带关全部页面）。"""
+    body = _terminate_body()
+    assert "_shutdown_browser_resources" in body, "资源清理应抽为独立方法"
+    helper = next(
+        (n for n in ast.walk(_TREE)
+         if isinstance(n, ast.AsyncFunctionDef)
+         and n.name == "_shutdown_browser_resources"),
+        None,
+    )
+    assert helper is not None, "_shutdown_browser_resources 必须存在"
+    helper_src = ast.get_source_segment(_SRC, helper) or ""
+    browser_pos = helper_src.find("self.browser.shutdown()")
+    sessions_pos = helper_src.find("self.sessions.shutdown()")
+    assert browser_pos != -1 and sessions_pos != -1
+    assert browser_pos < sessions_pos, \
+        "browser.shutdown 必须先于 sessions.shutdown 执行（防 page.close 悬挂阻塞浏览器关闭）"
+    assert "stop_sweeper" in helper_src, "应先停止后台回收任务"

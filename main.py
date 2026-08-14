@@ -42,6 +42,11 @@ METADATA_NAME = "astrbot_plugin_browser_llm"
 # 真实运行时 Star 实例无 self.metadata 属性，无法动态读取，故集中为单一常量）。
 PLUGIN_VERSION = "v1.2.0"
 
+# terminate 资源清理总超时（秒）：超过则放弃等待并强制收尾，防止插件重载
+# 被悬挂的 close 阻塞（曾实测 browser.close 悬挂数小时，旧实例 chromium 进程
+# 与 playwright driver 长期残留）。底层 BrowserCore 已带单步超时，此为兜底。
+_TERMINATE_TIMEOUT = 20.0
+
 # 数据目录：截图等资源保存位置。
 _DATA_DIR = Path(__file__).resolve().parent / "data"
 
@@ -919,23 +924,57 @@ class BrowserLLMPlugin(Star):
         except asyncio.CancelledError:
             pass
 
-    async def terminate(self) -> None:
-        """AstrBot 禁用/重载时释放全部浏览器资源。"""
-        self._stop_cache_cleanup_task()
-        self._stop_vision_provider_sync_task()
+    async def _shutdown_browser_resources(self) -> None:
+        """按序释放浏览器资源（任一步失败/超时不中断后续清理）。
+
+        顺序说明：先停后台会话回收任务（快路径），再关浏览器
+        （browser.close 会顺带关闭全部页面/context，且 BrowserCore 内部
+        自带单步超时），最后清理会话内存映射（此时页面已随浏览器关闭，
+        仅剩内存态收尾，不会悬挂）。避免旧顺序下单个 page.close 悬挂
+        阻塞到 browser.shutdown 之前、导致 playwright driver 永不停止。
+        """
+        tag = f"[{self.metadata_name}]"
         if self.sessions is not None:
             try:
-                await self.sessions.shutdown()
+                await self.sessions.stop_sweeper()
             except Exception as e:  # noqa: BLE001
-                logger.warning(f"[{self.metadata_name}] 关闭会话管理器失败: {e}")
+                logger.warning(f"{tag} 停止会话回收任务失败: {e}")
         if self.browser is not None:
             try:
                 await self.browser.shutdown()
             except Exception as e:  # noqa: BLE001
-                logger.warning(f"[{self.metadata_name}] 关闭浏览器失败: {e}")
-        # 本地页面预览锁表清空（弱引用字典常规会自动清理，此处显式兜底）。
-        self._local_page_locks.clear()
-        logger.info(f"[{self.metadata_name}] 已终止")
+                logger.warning(f"{tag} 关闭浏览器失败: {e}")
+        if self.sessions is not None:
+            try:
+                await self.sessions.shutdown()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"{tag} 关闭会话管理器失败: {e}")
+
+    async def terminate(self) -> None:
+        """AstrBot 禁用/重载时释放全部浏览器资源（带总超时保护）。
+
+        总超时兜底：即使底层某步意外悬挂，terminate 也会在
+        _TERMINATE_TIMEOUT 秒后放弃等待并完成收尾，不阻塞插件重载，
+        避免旧实例 chromium 进程残留。超时以 error 级日志上报。
+        """
+        tag = f"[{self.metadata_name}]"
+        self._stop_cache_cleanup_task()
+        self._stop_vision_provider_sync_task()
+        try:
+            await asyncio.wait_for(
+                self._shutdown_browser_resources(), timeout=_TERMINATE_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                f"{tag} 资源清理总超时（%.1fs），部分资源可能未释放",
+                _TERMINATE_TIMEOUT,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"{tag} 资源清理异常: {e}")
+        finally:
+            # 本地页面预览锁表清空（弱引用字典常规会自动清理，此处显式兜底）。
+            self._local_page_locks.clear()
+        logger.info(f"{tag} 已终止")
 
     # ================================================================
     # 浏览器子代理入口（工具化子代理：browse_web）
