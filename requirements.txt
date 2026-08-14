@@ -5,4 +5,5 @@
 # 测试依赖（仅运行 tests/ 套件时需要，非插件运行依赖）：
 # - pytest：测试运行器
 # - docstring_parser：tests/test_main_contract.py 解析 llm_tool docstring 契约
+# - aiohttp：tests/test_ssrf_click.py 媒体下载重定向用例（真实 HTTP 客户端）
 #   （python3 -m pytest tests/ -q）
