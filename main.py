@@ -13,10 +13,10 @@ SafetyFilter（禁词过滤与 SSRF 防护），以及 15 个 FunctionTool 构�
 """
 
 import asyncio
-import functools
 import hashlib
 import re
 import time
+import weakref
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
@@ -40,7 +40,7 @@ METADATA_NAME = "astrbot_plugin_browser_llm"
 
 # 插件版本，与 metadata.yaml 的 version 保持一致（发布版本变更时两处同步修改；
 # 真实运行时 Star 实例无 self.metadata 属性，无法动态读取，故集中为单一常量）。
-PLUGIN_VERSION = "v1.1.1"
+PLUGIN_VERSION = "v1.2.0"
 
 # 数据目录：截图等资源保存位置。
 _DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -369,14 +369,25 @@ def _make_browser_tool(plugin: "BrowserLLMPlugin", spec: dict):
     调用，等效于 task 描述的子类覆写 call 方案，且避免 pydantic dataclass
     子类化的兼容风险。handler 绑定插件实例方法，签名与内部 browse_*
     方法一致（self, event, **kwargs）。
+
+    v1.2.0：handler 外层包一层配置热更新（_refresh_config），使 Dashboard
+    修改的配置（黑名单、截图开关、内网拦截等）在子代理工具调用时即生效，
+    无需重启；开销为若干次 dict 读取，可忽略。
     """
     from astrbot.core.agent.tool import FunctionTool  # noqa: PLC0415 — 延迟导入
+
+    method = getattr(plugin, spec["method"])
+
+    async def _handler(event, **kwargs):
+        # 工具入口轻量热更新配置（重读共享 config dict）。
+        plugin._refresh_config()
+        return await method(event, **kwargs)
 
     return FunctionTool(
         name=spec["name"],
         description=spec["description"],
         parameters=spec["parameters"],
-        handler=functools.partial(getattr(plugin, spec["method"])),
+        handler=_handler,
     )
 
 
@@ -468,7 +479,12 @@ class BrowserLLMPlugin(Star):
 
         # browse_local_page 专用的 per-umo 锁（独立于 SessionManager，
         # 本地页面预览不走浏览会话，避免与既有 browse_* 会话互相污染）。
-        self._local_page_locks: dict[str, asyncio.Lock] = {}
+        # v1.2.0：改用弱引用字典——渲染结束、锁对象无任何强引用（无持锁/
+        # 无等待协程）时条目自动移除，防止长期运行后字典无限增长；弱引用
+        # 语义天然避免「手动 pop 与并发取锁」之间的清理竞态。
+        self._local_page_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
         # 本地页面预览允许访问的根目录白名单（initialize 时解析真实路径）。
         self._local_page_allowed_roots: tuple[Path, ...] = _resolve_local_page_roots()
 
@@ -535,6 +551,38 @@ class BrowserLLMPlugin(Star):
         # 浏览器子 Agent 控制（agent-as-tool）
         self.agent_max_steps: int = int(cfg.get("agent_max_steps", 70))
         self.agent_tool_timeout: int = int(cfg.get("agent_tool_timeout", 1200))
+
+    def _refresh_config(self) -> None:
+        """轻量热更新配置：工具入口重读共享 config dict 并同步固化组件。
+
+        Dashboard 保存配置时 AstrBot 会就地 update 传入插件的同一 config
+        dict（面板保存即更新，并触发插件热重载兜底）；_load_config 把最新
+        值刷入实例属性，本方法再同步进 SessionManager / SafetyFilter /
+        BrowserCore 的运行期参数（max_pages、idle_timeout、default_url、
+        禁词、内网拦截），使黑名单、内网拦截、截图开关等配置修改无需
+        重启即生效。仅浏览工具入口调用，开销为若干次 dict 读取。
+
+        说明：既有 context 的 SSRF 兜底路由安装与否按创建时的开关决定，
+        此处同步 BrowserCore.block_internal_ip 仅影响之后新建的 context；
+        关闭开关不会摘除已装拦截（保持安全方向）。
+        """
+        self._load_config()
+        # max_pages / idle_timeout / default_url 固化在 SessionManager，
+        # 同步热更新：新额度/新阈值对新标签与下一轮回收立即生效。
+        if self.sessions is not None:
+            self.sessions.max_pages = int(self.max_pages)
+            self.sessions.idle_timeout = float(self.idle_timeout)
+            self.sessions.default_url = self.default_url
+        if self.safety is not None:
+            self.safety.update_config(
+                banned_words=self.banned_words,
+                block_internal_ip=bool(self.block_internal_ip),
+            )
+        if self.browser is not None:
+            self.browser.block_internal_ip = bool(self.block_internal_ip)
+        # 页面感知方式变化后重建子代理指令（下次 browse_web 生效）。
+        if getattr(self, "_browser_instruction", None) is not None:
+            self._browser_instruction = self._build_subagent_instruction()
 
     # ================================================================
     # 生命周期
@@ -885,6 +933,8 @@ class BrowserLLMPlugin(Star):
                 await self.browser.shutdown()
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"[{self.metadata_name}] 关闭浏览器失败: {e}")
+        # 本地页面预览锁表清空（弱引用字典常规会自动清理，此处显式兜底）。
+        self._local_page_locks.clear()
         logger.info(f"[{self.metadata_name}] 已终止")
 
     # ================================================================
@@ -904,6 +954,9 @@ class BrowserLLMPlugin(Star):
         """
         try:
             logger.debug(f"[{self.metadata_name}] browse_web 进入，input={input!r}")
+            # 轻量热更新配置：Dashboard 保存的配置（黑名单/截图/内网拦截等）
+            # 在下次入口调用即生效，无需重启。
+            self._refresh_config()
             # 顺带同步识图 provider 下拉（面板每次请求实时读取内存 schema，
             # 此入口被主 LLM 高频调用，可保持面板选项跟随运行时 provider 变化）。
             self._sync_vision_provider_options()
@@ -967,6 +1020,8 @@ class BrowserLLMPlugin(Star):
             wait_ms(number): 页面加载后等待 JS 渲染的毫秒数（默认 500）。可省略
         """
         try:
+            # 轻量热更新配置：黑名单/截图/内网拦截等修改无需重启即生效。
+            self._refresh_config()
             # 会话权限：与既有浏览工具一致，过白/黑名单（默认配置为空即放行）。
             allowed, deny_reason = self._is_session_allowed(event)
             if not allowed:
@@ -1088,7 +1143,11 @@ class BrowserLLMPlugin(Star):
             return f"【错误】本地页面渲染预览失败：{e}"
 
     def _local_lock_for(self, umo: str) -> asyncio.Lock:
-        """返回该会话的本地页面预览专用锁（不存在则创建）。"""
+        """返回该会话的本地页面预览专用锁（不存在则创建）。
+
+        锁表为弱引用字典：browse_local_page 结束、锁无任何强引用时
+        条目自动清理（见 __init__ 注释），无需手动 pop。
+        """
         lock = self._local_page_locks.get(umo)
         if lock is None:
             lock = asyncio.Lock()
@@ -1135,18 +1194,37 @@ class BrowserLLMPlugin(Star):
     def _is_session_allowed(self, event: AstrMessageEvent) -> tuple[bool, str]:
         """会话白/黑名单检查（参考 AtTool 实现）。
 
+        匹配规则（v1.2.0 起精确匹配，修复子串误伤）：
+        - 条目与 umo 按分隔符（: / |）切分后的字段精确比对，黑名单
+          "123" 不再误伤群 "1234"（旧实现为子串匹配）；
+        - 兼容完整 UMO 条目：条目与 umo 整体精确相等也命中（_conf_schema
+          提示支持填写完整 UMO，保留该写法）；
+        - 群号精确比对兜底。
+
         Returns:
             tuple[bool, str]: (是否允许, 拒绝原因或空串)。
         """
         umo = self._umo_of(event)
         group_id = event.get_group_id() or ""
+        # umo 标准格式 platform:type:session_id；_umo_of 兜底格式
+        # group|sender。切分为字段集合后精确比对，杜绝子串误伤。
+        umo_fields = {
+            field
+            for segment in umo.split(":")
+            for field in segment.split("|")
+            if field
+        }
 
         if self.session_blacklist:
             for entry in self.session_blacklist:
                 entry = entry.strip()
                 if not entry:
                     continue
-                if entry in umo or (group_id and entry == group_id):
+                if (
+                    entry in umo_fields
+                    or entry == umo
+                    or (group_id and entry == group_id)
+                ):
                     return False, "此会话已被列入浏览器功能黑名单"
 
         if self.session_whitelist:
@@ -1155,7 +1233,11 @@ class BrowserLLMPlugin(Star):
                 entry = entry.strip()
                 if not entry:
                     continue
-                if entry in umo or (group_id and entry == group_id):
+                if (
+                    entry in umo_fields
+                    or entry == umo
+                    or (group_id and entry == group_id)
+                ):
                     allowed = True
                     break
             if not allowed:

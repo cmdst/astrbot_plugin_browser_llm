@@ -4,6 +4,46 @@
 `data/` 目录（主仓库 .gitignore 忽略）迁移初始化而来。仅跟踪插件源码与测试，运行时
 数据（`data/`：截图、运行时配置、临时文件）一律不入库。
 
+## [v1.2.0] - 2026-08-14
+
+### 优化：P2 五项（2026-08-14 修复报告建议清单）
+
+- **空闲回收竞态**（P2）：`sweep_idle` 回收前检查会话锁
+  （`self._locks[umo].locked()`），会话正在执行工具调用时跳过本轮不回收，
+  锁释放后下一轮再回收，避免关闭正在使用的页面；
+- **全局锁粒度**（P2）：`ensure_page` / `new_tab` 的 `_global_lock` 不再
+  持有到 goto 完成——容量检查与页面挂载在锁内完成，页面创建与 goto（慢
+  操作）移出锁外执行，避免单个会话的慢导航串行阻塞全部会话的标签操作；
+  锁外创建期间产生的并发重复页/超额页在挂载阶段去重复用或关闭，不泄漏
+  页面、不突破 max_pages 上限；
+- **会话黑白名单匹配过宽**（P2）：`_is_session_allowed` 由子串匹配改为
+  精确匹配——按分隔符（`:` / `|`，覆盖 umo 标准格式与 `_umo_of` 兜底格式）
+  切分 umo 后与条目逐字段精确比对，黑名单 `"123"` 不再误伤群 `"1234"`；
+  兼容既有配置写法：完整 UMO 条目与 umo 整体精确相等仍命中，群号精确
+  比对兜底；
+- **配置热更新覆盖不全**（P2）：新增 `_refresh_config()`，在浏览工具入口
+  （`browse_web` / `browse_local_page` / 24 个子代理工具 handler 外层）轻量
+  重读共享 config dict（Dashboard 保存即 update 的同一对象），并同步
+  SessionManager（max_pages / idle_timeout / default_url 由固化改为热更新）、
+  SafetyFilter（禁词 / block_internal_ip，新增 `update_config` 方法）、
+  BrowserCore（block_internal_ip，作用于新建 context）与子代理指令
+  （page_perception 变化下次 browse_web 生效）；黑名单、内网拦截、截图
+  开关等配置修改无需重启即生效；
+- **锁表清理**（P2）：`_local_page_locks` 改为弱引用字典
+  （`weakref.WeakValueDictionary`），browse_local_page 结束、锁无任何强
+  引用（无持锁/无等待协程）时条目自动移除，防止字典无限增长；弱引用
+  语义天然避免「手动 pop 与并发取锁」的清理竞态，`terminate` 增加显式
+  清空兜底。
+
+### 兼容性说明
+
+- 会话黑白名单语义由「子串包含」收紧为「字段精确匹配」：旧配置若依赖
+  子串命中（如仅填群号前缀）需改为填写完整字段（群号/用户 ID/平台名或
+  完整 UMO）；完整 UMO 条目不受影响。
+- `max_pages` / `idle_timeout` / `default_url` 从「重启生效」改为热更新
+  （工具入口同步）；既有 context 的 SSRF 兜底路由按创建时的
+  `block_internal_ip` 安装，关闭开关不摘除已装拦截（安全方向）。
+
 ## [v1.1.1] - 2026-08-14
 
 ### 修复：识图模型下拉动态读取 AstrBot 已配置 Provider（Bug #1）

@@ -85,13 +85,13 @@
   "session_whitelist": {
     "type": "list",
     "description": "会话白名单",
-    "hint": "仅允许在这些会话中使用浏览能力。每个条目可以是完整 UMO（用 /sid 获取）或群号/用户 ID。留空表示允许全部会话",
+    "hint": "仅允许在这些会话中使用浏览能力。每个条目可以是完整 UMO（用 /sid 获取）或群号/用户 ID。匹配为精确匹配（按 : 或 | 切分后逐字段比对，或与完整 UMO 整体相等），黑名单如 '123' 不会误伤群 '1234'。留空表示允许全部会话",
     "default": []
   },
   "session_blacklist": {
     "type": "list",
     "description": "会话黑名单",
-    "hint": "禁止在这些会话中使用浏览能力。格式同白名单。黑名单优先级高于白名单",
+    "hint": "禁止在这些会话中使用浏览能力。格式同白名单（完整 UMO 或群号/用户 ID，精确匹配）。黑名单优先级高于白名单",
     "default": []
   },
   "enable_screenshot": {
@@ -128,7 +128,11 @@
     "type": "string",
     "description": "页面感知方式",
     "hint": "text=仅文字读取（最快，不用截图识图）；text_image=文字为主+必要时截图识图（平衡，推荐）；image=以截图识图为主",
-    "options": ["text", "text_image", "image"],
+    "options": [
+      "text",
+      "text_image",
+      "image"
+    ],
     "default": "text_image"
   },
   "proxy": {

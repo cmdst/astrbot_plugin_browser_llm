@@ -171,6 +171,11 @@ class SessionManager:
         兼容 T4 单页用法：同一 umo 重复调用返回同一（激活）页；
         激活页失效时尝试重建该标签。
 
+        锁粒度（v1.2.0）：_global_lock 仅在容量检查与页面挂载期间持有，
+        页面创建与 goto（慢操作）在锁外执行，避免某个会话的慢导航
+        串行阻塞全部会话的标签操作；锁外创建期间并发产生的重复页/超额
+        页在挂载阶段去重或关闭，不泄漏页面。
+
         Args:
             umo: 会话标识（unified_msg_origin）。
 
@@ -178,6 +183,9 @@ class SessionManager:
             激活页；总标签数达 max_pages 或创建失败时返回 None。
         """
         logger.debug(f"ensure_page 进入 umo={umo!r}")
+        # 阶段一（全局锁内）：会话复用判断、失效页移除与容量预检。
+        stale_page = None
+        capacity_ok = True
         async with self._global_lock:
             pages = self._pages.get(umo)
             if pages:
@@ -187,25 +195,46 @@ class SessionManager:
                     self._touch(umo)
                     logger.debug("ensure_page 复用 page")
                     return page
-                # 激活页失效：关闭并移除该标签后走新建路径。
+                # 激活页失效：先移除映射（容量即时释放），关闭动作移到锁外。
                 if page is not None:
-                    await self._close_page(umo, page)
                     self._drop_tab(umo, active)
+                    stale_page = page
 
             # 总标签数达上限 → 拒绝新标签。
             if self._total_tabs() >= self.max_pages:
                 logger.warning("标签总数达上限 %d，拒绝新建（umo=%s）", self.max_pages, umo)
-                return None
+                capacity_ok = False
 
-            page = None
-            try:
-                page = await self.browser.new_page()
-                await page.goto(self.default_url, wait_until='domcontentloaded')
-            except Exception as e:  # noqa: BLE001 — 创建失败不抛出
-                logger.warning("新建页面失败（umo=%s）: %s", umo, e)
-                # 防泄漏：new_page 成功但 goto 失败时关闭页面（含其 context）。
-                if page is not None:
+        # 锁外：失效页无论能否新建都必须关闭（防 context 泄漏）。
+        if stale_page is not None:
+            await self._close_page(umo, stale_page)
+        if not capacity_ok:
+            return None
+
+        # 锁外：创建并导航新页（goto 不占全局锁）。
+        page = await self._new_page_goto(self.default_url)
+        if page is None:
+            return None
+
+        # 阶段二（全局锁内）：并发复用复检 + 容量复检 + 挂载。
+        async with self._global_lock:
+            pages = self._pages.get(umo)
+            if pages:
+                active = self._active.get(umo, 0)
+                existing = pages[active] if active < len(pages) else None
+                if existing is not None and self._page_alive(existing):
+                    # 锁外创建期间本会话已被其他协程建好可用页：复用，丢弃新页。
                     await self._close_page(umo, page)
+                    logger.debug("ensure_page 复用 page（并发创建去重）")
+                    return existing
+                if existing is not None:
+                    # 并发期间激活页再次失效：移除并关闭后走新建路径。
+                    self._drop_tab(umo, active)
+                    await self._close_page(umo, existing)
+            if self._total_tabs() >= self.max_pages:
+                # 锁外等待期间额度被其他会话占满：关闭刚建的页，拒绝。
+                await self._close_page(umo, page)
+                logger.warning("标签总数达上限 %d，拒绝新建（umo=%s）", self.max_pages, umo)
                 return None
             self._pages.setdefault(umo, []).append(page)
             self._active[umo] = len(self._pages[umo]) - 1
@@ -222,6 +251,10 @@ class SessionManager:
 
         新建后自动激活新标签。总标签数达 max_pages 时返回 None。
 
+        锁粒度（v1.2.0）：容量检查与页面挂载在 _global_lock 内完成，
+        页面创建与 goto（慢操作）在锁外执行，避免串行阻塞全部会话；
+        挂载前复检容量，超额时关闭刚建的页并拒绝（不泄漏）。
+
         Args:
             umo: 会话标识。
             url: 新标签要打开的地址。
@@ -229,35 +262,29 @@ class SessionManager:
         Returns:
             新标签页；超限或创建失败返回 None。
         """
+        # 阶段一（全局锁内）：容量预检（无会话时同样受全局额度约束）。
         async with self._global_lock:
-            # 无会话：直接以 url 作为首标签创建（不额外开 default_url 占额度）。
-            if umo not in self._pages:
-                if self._total_tabs() >= self.max_pages:
-                    logger.warning(
-                        "标签总数达上限 %d，拒绝新标签（umo=%s）", self.max_pages, umo
-                    )
-                    return None
-                page = await self._new_page_goto(url)
-                if page is None:
-                    return None
-                self._pages[umo] = [page]
-                self._active[umo] = 0
-                self._touch(umo)
-                logger.info(
-                    "新建会话标签 umo=%s（标签 %d/%d）",
-                    umo, self._total_tabs(), self.max_pages,
-                )
-                return page
-
             if self._total_tabs() >= self.max_pages:
+                logger.warning(
+                    "标签总数达上限 %d，拒绝新标签（umo=%s）", self.max_pages, umo
+                )
+                return None
+
+        # 锁外：创建并导航新页（goto 不占全局锁）。
+        page = await self._new_page_goto(url)
+        if page is None:
+            return None
+
+        # 阶段二（全局锁内）：容量复检 + 挂载（无会话时以 url 为首标签）。
+        async with self._global_lock:
+            if self._total_tabs() >= self.max_pages:
+                # 锁外等待期间额度被其他会话占满：关闭刚建的页，拒绝。
+                await self._close_page(umo, page)
                 logger.warning("标签总数达上限 %d，拒绝新标签（umo=%s）", self.max_pages, umo)
                 return None
-
-            page = await self._new_page_goto(url)
-            if page is None:
-                return None
-            self._pages[umo].append(page)
-            self._active[umo] = len(self._pages[umo]) - 1
+            pages = self._pages.setdefault(umo, [])
+            pages.append(page)
+            self._active[umo] = len(pages) - 1
             self._touch(umo)
             logger.info(
                 "新建标签 umo=%s（标签 %d/%d）", umo, self._total_tabs(), self.max_pages
@@ -342,7 +369,11 @@ class SessionManager:
         logger.info("已释放浏览会话 umo=%s（关闭 %d 个标签）", umo, len(pages))
 
     async def sweep_idle(self) -> int:
-        """回收超过 idle_timeout 未活动的会话，返回回收数。"""
+        """回收超过 idle_timeout 未活动的会话，返回回收数。
+
+        竞态防护（v1.2.0）：会话锁被占用（正在执行工具调用）时跳过
+        该会话，避免关闭使用中的页面；锁释放后下一轮再尝试回收。
+        """
         if not self._last_active:
             return 0
         now = time.monotonic()
@@ -350,11 +381,18 @@ class SessionManager:
             umo for umo, ts in self._last_active.items()
             if now - ts > self.idle_timeout
         ]
+        reclaimed_umos = []
         for umo in expired:
+            lock = self._locks.get(umo)
+            if lock is not None and lock.locked():
+                # 会话正在执行工具调用：跳过本轮，避免回收使用中的页面。
+                logger.debug("会话 %s 正在使用中，跳过本轮空闲回收", umo)
+                continue
             await self.release(umo)
-        if expired:
-            logger.info("空闲回收 %d 个会话: %s", len(expired), expired)
-        return len(expired)
+            reclaimed_umos.append(umo)
+        if reclaimed_umos:
+            logger.info("空闲回收 %d 个会话: %s", len(reclaimed_umos), reclaimed_umos)
+        return len(reclaimed_umos)
 
     # ------------------------------------------------------------
     # 后台回收任务

@@ -141,6 +141,23 @@ class SafetyFilter:
         self._banned_lower = [w.lower() for w in self.banned_words]
         self.block_internal_ip = bool(block_internal_ip)
 
+    def update_config(
+        self,
+        banned_words: list[str] | None = None,
+        block_internal_ip: bool | None = None,
+    ) -> None:
+        """运行期热更新安全配置（Dashboard 保存配置后由插件入口同步）。
+
+        Args:
+            banned_words: 新的禁词列表；为 None 时保持原值。
+            block_internal_ip: 新的内网拦截开关；为 None 时保持原值。
+        """
+        if banned_words is not None:
+            self.banned_words = [w for w in (banned_words or []) if w]
+            self._banned_lower = [w.lower() for w in self.banned_words]
+        if block_internal_ip is not None:
+            self.block_internal_ip = bool(block_internal_ip)
+
     # ------------------------------------------------------------
     # URL 检查
     # ------------------------------------------------------------
