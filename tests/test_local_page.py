@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+import main as main_module
 from core.extract import ContentExtractor
 from core.safety import SafetyFilter
 from main import (
@@ -350,6 +351,156 @@ def test_vision_mode_with_full_page(tmp_path):
     )
     assert "【本地页面预览】" in result
     assert len(page.screenshot_paths) == 1
+
+
+# ------------------------------------------------------------
+# 感知模式（v1.3.0 补强）：perception 参数
+# ------------------------------------------------------------
+
+def _capture_logger(monkeypatch, level="debug"):
+    """把 main.logger 指定级别替换为记录函数，返回记录列表。"""
+    records = []
+    monkeypatch.setattr(main_module.logger, level, records.append)
+    return records
+
+
+def test_perception_text_skips_screenshot_and_vision(tmp_path, monkeypatch):
+    """perception='text'：跳过截图与识图调用，仅返回页面文本。"""
+    page = FakePage(text="文档正文 报错信息 ERROR-123")
+    plugin = _make_plugin(tmp_path, page=page)
+    html = _write_html(tmp_path / "workspaces", "index.html")
+    debug_records = _capture_logger(monkeypatch, "debug")
+    result = _run(
+        plugin.browse_local_page(FakeEvent(), path=str(html), perception="text")
+    )
+    # 返回文本模式结果，含页面文本与模式说明。
+    assert "【本地页面预览·文本模式】" in result
+    assert "文档正文 报错信息 ERROR-123" in result
+    assert "仅文本提取" in result
+    # 未触发识图 provider 调用（无 llm_generate）。
+    plugin.context.llm_generate.assert_not_awaited()
+    # 未产生任何截图（页面级与浏览器级截图均未执行、无落盘文件）。
+    assert page.screenshot_paths == []
+    assert not list(plugin._screenshot_dir.glob("localpage_*.png"))
+    # debug 日志记录本次感知模式。
+    assert any("感知模式=text" in r for r in debug_records)
+
+
+def test_perception_text_image_default_behavior(tmp_path):
+    """perception='text_image'：文本 + 截图识图（与 v1.3.0 默认行为一致）。"""
+    page = FakePage(text="正文内容")
+    plugin = _make_plugin(tmp_path, page=page)
+    html = _write_html(tmp_path / "workspaces", "index.html")
+    result = _run(
+        plugin.browse_local_page(FakeEvent(), path=str(html), perception="text_image")
+    )
+    assert "【本地页面预览】" in result
+    assert "模拟视觉描述" in result
+    assert "截图:" in result
+    # 截图经 browser.screenshot 落盘（viewport 模式不走 page.screenshot）。
+    assert len(list(plugin._screenshot_dir.glob("localpage_*.png"))) == 1
+
+
+def test_perception_image_vision_primary_text_aux(tmp_path):
+    """perception='image'：以截图识图为主，页面文本为辅（追加在描述后）。"""
+    page = FakePage(text="辅助正文")
+    plugin = _make_plugin(tmp_path, page=page)
+    html = _write_html(tmp_path / "workspaces", "index.html")
+    result = _run(
+        plugin.browse_local_page(FakeEvent(), path=str(html), perception="image")
+    )
+    assert "【本地页面预览·识图模式】" in result
+    assert "模拟视觉描述" in result
+    assert "页面文本（辅助）" in result
+    assert "辅助正文" in result
+
+
+def test_perception_image_fallback_to_text_when_vision_unavailable(tmp_path):
+    """image 模式但视觉不可用 → 降级文本提取（工具不空转）。"""
+    page = FakePage(text="只有文字也能看")
+    plugin = _make_plugin(tmp_path, page=page)
+    plugin.config["vision_provider_id"] = ""
+    html = _write_html(tmp_path / "workspaces", "index.html")
+    result = _run(
+        plugin.browse_local_page(FakeEvent(), path=str(html), perception="image")
+    )
+    assert "【本地页面预览·文本模式】" in result
+    assert "只有文字也能看" in result
+
+
+def test_perception_invalid_falls_back_to_global(tmp_path, monkeypatch):
+    """非法 perception 值：warning 日志 + 回落全局 page_perception。"""
+    page = FakePage(text="正文")
+    plugin = _make_plugin(tmp_path, page=page)
+    plugin.config["page_perception"] = "text"  # 全局纯文本
+    html = _write_html(tmp_path / "workspaces", "index.html")
+    warning_records = _capture_logger(monkeypatch, "warning")
+    result = _run(
+        plugin.browse_local_page(FakeEvent(), path=str(html), perception="foo")
+    )
+    # 回落全局 text → 文本模式，未识图。
+    assert "【本地页面预览·文本模式】" in result
+    assert "正文" in result
+    plugin.context.llm_generate.assert_not_awaited()
+    assert any("感知模式非法" in r for r in warning_records)
+
+
+def test_perception_explicit_overrides_global(tmp_path):
+    """显式 perception 覆盖全局 page_perception。"""
+    page = FakePage(text="正文")
+    plugin = _make_plugin(tmp_path, page=page)
+    plugin.config["page_perception"] = "text"  # 全局纯文本
+    html = _write_html(tmp_path / "workspaces", "index.html")
+    result = _run(
+        plugin.browse_local_page(FakeEvent(), path=str(html), perception="text_image")
+    )
+    assert "模拟视觉描述" in result
+    assert len(list(plugin._screenshot_dir.glob("localpage_*.png"))) == 1
+
+
+def test_perception_default_follows_global(tmp_path):
+    """perception 缺省（""）→ 跟随全局 page_perception。"""
+    page = FakePage(text="正文")
+    plugin = _make_plugin(tmp_path, page=page)
+    plugin.config["page_perception"] = "text"
+    html = _write_html(tmp_path / "workspaces", "index.html")
+    result = _run(plugin.browse_local_page(FakeEvent(), path=str(html)))
+    assert "【本地页面预览·文本模式】" in result
+    assert "正文" in result
+    plugin.context.llm_generate.assert_not_awaited()
+    assert page.screenshot_paths == []
+
+
+def test_perception_debug_log_records_mode(tmp_path, monkeypatch):
+    """debug 日志记录本次感知模式与显式来源（可观测）。"""
+    page = FakePage(text="正文")
+    plugin = _make_plugin(tmp_path, page=page)
+    html = _write_html(tmp_path / "workspaces", "index.html")
+    debug_records = _capture_logger(monkeypatch, "debug")
+    _run(plugin.browse_local_page(FakeEvent(), path=str(html), perception="text"))
+    assert any("感知模式=text" in r and "显式=text" in r for r in debug_records)
+
+
+def test_browse_local_page_perception_docstring_contract():
+    """docstring Args 含 perception(string)，签名含 perception 参数（AST 断言）。"""
+    from docstring_parser import parse as dp_parse
+
+    src = Path(__file__).resolve().parent.parent / "main.py"
+    tree = ast.parse(src.read_text(encoding="utf-8"))
+    node = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, ast.AsyncFunctionDef) and n.name == "browse_local_page"),
+        None,
+    )
+    assert node is not None, "browse_local_page 方法不存在"
+    # 方法签名含 perception 参数（可省略）。
+    arg_names = [a.arg for a in node.args.args]
+    assert "perception" in arg_names, f"签名缺少 perception 参数: {arg_names}"
+    # docstring Args 契约：perception 类型为 string。
+    doc = ast.get_docstring(node) or ""
+    assert "Args:" in doc
+    params = {p.arg_name: p.type_name for p in dp_parse(doc).params}
+    assert params.get("perception") == "string", f"perception 参数类型错误: {params}"
 
 
 # ------------------------------------------------------------

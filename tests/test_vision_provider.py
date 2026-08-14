@@ -9,8 +9,9 @@
   环境信任配置值；
 - _describe_screenshot：失效 provider 自动回退并调用 llm_generate、空配置
   不调用、纯文本模型拒识文案返回明确提示；
-- _is_vision_rejection：中英文拒识特征识别（大小写不敏感），正常视觉描述
-  与空文本不误判；
+- _is_vision_rejection：中英文拒识特征识别（大小写不敏感），拒识短语须满足
+  「响应开头位置约束」或「整句独立」才命中（v1.3.0 收紧），正常视觉描述
+  （含与拒识短语同构的叙述性正文、引号引用的页面提示文案）与空文本不误判；
 - _conf_schema.json 静态契约：vision_provider_id 不再硬编码具体 provider。
 
 依赖 conftest.py 的 astrbot 桩与根目录 sys.path。
@@ -380,6 +381,93 @@ def test_is_vision_rejection_detects_chinese(text):
 def test_is_vision_rejection_accepts_normal_text(text):
     """正常视觉描述与无关文本（含“无法”等词但不构成拒识）不误判。"""
     assert not _is_vision_rejection(text), f"不应识别为拒识: {text!r}"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # 复现样例（tester 2026-08-15 03:43:33）：真实识图成功返回的结构化
+        # 视觉描述——页面标题 + 叙述句，正文含与拒识短语同构的「不支持图像」
+        # （命中位置 143，超出前缀窗口 60；所在子句含大量其它内容，非整句独立）。
+        (
+            "这张网页截图的重点内容如下：\n"
+            '### 1. 页面标题\n'
+            '顶部显示大标题 **"v1.3.0 冒烟测试页"**，副标题为 **"识图拒识判定器回归验证"**。\n'
+            "### 2. 页面正文\n"
+            "中部有一个提示框，内容为「该示例页面的图片资源无法处理加载，请检查网络」，"
+            '下方标注"此提示仅为演示，浏览器不支持图像懒加载功能"。\n'
+            "### 3. 底部\n"
+            "页脚显示版权信息与版本号。"
+        ),
+        # 长描述正文：叙述句含「不支持图像」（命中位置 94 > 60），非拒识语义。
+        (
+            "这张网页截图展示了一个深色主题的后台管理系统页面：顶部导航栏包含搜索框与"
+            "用户菜单，左侧为折叠侧边栏，中部是数据统计卡片区域，右侧为实时日志面板。"
+            "页面底部有一行说明文字：本演示环境中的浏览器不支持图像懒加载功能，图片以"
+            "占位符显示，滚动时才加载。"
+        ),
+        # 长描述正文：叙述句含「无法识别截图」（命中位置 70 > 60），描述降级逻辑。
+        (
+            "本次自检的目标是验证页面渲染效果，重点检查标题、导航与卡片布局，同时确认"
+            "视觉描述工具的降级逻辑：当视觉模型不可用时自动回退文本提取，此时工具无法"
+            "识别截图中的细节，但仍会返回页面文本供下游使用。"
+        ),
+        # 短描述 + 引号引用（命中位置 17 < 60，但短语紧贴左引号「，判为正文
+        # 引用非拒识；子句含其它内容，非整句独立）。
+        "页面中央有一个错误提示框，内容为「无法处理图片，请检查网络」，下方是重试按钮。",
+        # 短描述 + ASCII 单引号引用（命中位置 13 < 60，引号规则排除）。
+        "页面中有一个提示框，显示'无法识别截图中的二维码，请手动输入验证码'。",
+        # 短描述 + 引号引用（「不支持图像」，命中位置 17 < 60，引号规则排除）。
+        "截图显示一个弹窗，文案为「该浏览器不支持图像上传」，底部有确认按钮。",
+        # 长描述正文：叙述句含「图片无法识别」（命中位置 > 60），描述兜底展示。
+        (
+            "这张截图展示了一个表单校验页面的完整布局：顶部为标题栏与面包屑导航，中部"
+            "为输入区域与校验提示，底部为操作按钮区，右侧为帮助面板。其中有一张辅助"
+            "说明图，页面在图片无法识别时会显示兜底占位文案，供开发者参考。"
+        ),
+        # 长描述正文：叙述句含「无法处理图片」（命中位置 88 > 60），描述错误提示。
+        (
+            "这张网页截图的内容如下：### 1. 页面标题 顶部显示大标题 **自检报告**；"
+            "### 2. 页面正文 中部为一个内容卡片，卡片内展示了一条错误状态说明："
+            "系统提示图片资源暂时无法处理图片压缩任务，请稍后重试；"
+            "### 3. 底部 页脚显示版本号。"
+        ),
+    ],
+)
+def test_is_vision_rejection_accepts_narrative_sentences(text):
+    """真实视觉描述正文含拒识同构短语（叙述/引用语义）不误判（P2 修复）。"""
+    assert not _is_vision_rejection(text), f"不应误判为拒识: {text!r}"
+
+
+def test_is_vision_rejection_prefix_window_long_response():
+    """前缀窗口规则：长响应（>60 字符）开头即拒识仍命中。"""
+    text = "非常抱歉，当前模型不支持图片输入，仅支持文本对话。这是补充说明：" + "无关内容填充。" * 10
+    assert _is_vision_rejection(text)
+
+
+def test_is_vision_rejection_english_polite_long_prefix():
+    """英文礼貌长前缀拒识（命中位置 48，窗口内）仍命中，召回不下降。"""
+    text = (
+        "Thank you for your message! Unfortunately, I am unable to process images "
+        "at this time. Please describe your needs in text instead, and I will do "
+        "my best to help you."
+    )
+    assert _is_vision_rejection(text)
+
+
+def test_is_vision_rejection_standalone_clause_late_hit():
+    """整句独立规则：长导语后单独一行拒识短句（位置 >60）仍命中。"""
+    text = (
+        "这是一段用于验证长响应场景拒识判定的导语，其长度需要超过六十个字符才能覆盖"
+        "前缀窗口之外的情况，这里继续补充一些无关内容以拉长文本确保命中位置在后部。\n"
+        "无法处理图片。"
+    )
+    assert _is_vision_rejection(text)
+
+
+def test_is_vision_rejection_quoted_full_response_pure_clause():
+    """整句独立规则：引号包裹的纯拒识短句（整句响应）仍命中。"""
+    assert _is_vision_rejection("「无法处理图片」")
 
 
 def test_describe_screenshot_rejection_returns_hint():

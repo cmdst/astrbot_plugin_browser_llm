@@ -86,6 +86,18 @@ def test_refresh_config_reloads_blacklist_attrs():
     assert plugin.session_blacklist == ["222"]
 
 
+def test_refresh_config_reloads_perception_rules_and_ttl():
+    """perception_rules / vision_cache_ttl 随配置重读刷新（v1.3.0 热更新）。"""
+    plugin = _make_plugin()
+    assert plugin.perception_rules == []
+    assert plugin.vision_cache_ttl == 60
+    plugin.config["perception_rules"] = [{"match": "tester", "perception": "text"}]
+    plugin.config["vision_cache_ttl"] = 120
+    plugin._refresh_config()
+    assert plugin.perception_rules == [{"match": "tester", "perception": "text"}]
+    assert plugin.vision_cache_ttl == 120
+
+
 def test_refresh_config_tolerates_uninitialized_components():
     """initialize 之前调用（sessions/safety/browser 为 None）不抛异常。"""
     plugin = _make_plugin()

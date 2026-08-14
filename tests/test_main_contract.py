@@ -394,7 +394,7 @@ def test_screenshot_filename_has_milli_and_session():
 # ------------------------------------------------------------
 
 def test_new_configs_in_schema():
-    """_conf_schema.json 含 silent_mode / page_perception / cache_days。"""
+    """_conf_schema.json 含 silent_mode / page_perception / cache_days 及 v1.3.0 新配置。"""
     import json
     schema = json.loads((_ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
     assert "silent_mode" in schema and schema["silent_mode"]["type"] == "bool"
@@ -405,13 +405,25 @@ def test_new_configs_in_schema():
     assert set(schema["page_perception"]["options"]) == {"text", "text_image", "image"}
     assert "cache_days" in schema and schema["cache_days"]["type"] == "int"
     assert schema["cache_days"]["default"] == 3
+    # v1.3.0：perception_rules / vision_cache_ttl
+    assert "perception_rules" in schema
+    assert schema["perception_rules"]["type"] == "list"
+    assert schema["perception_rules"]["default"] == []
+    items = schema["perception_rules"]["items"]
+    assert set(items) == {"match", "perception", "note"}, items.keys()
+    assert items["perception"]["options"] == ["text", "text_image", "image"]
+    assert "vision_cache_ttl" in schema
+    assert schema["vision_cache_ttl"]["type"] == "int"
+    assert schema["vision_cache_ttl"]["default"] == 60
 
 
 def test_load_config_reads_new_configs():
-    """_load_config 读取 silent_mode / page_perception。"""
+    """_load_config 读取 silent_mode / page_perception / perception_rules / vision_cache_ttl。"""
     src = _SRC
     assert "self.silent_mode" in src and 'cfg.get("silent_mode", True)' in src
     assert "self.page_perception" in src and 'cfg.get("page_perception", "text_image")' in src
+    assert "self.perception_rules" in src and 'cfg.get("perception_rules", [])' in src
+    assert "self.vision_cache_ttl" in src and 'cfg.get("vision_cache_ttl", 60)' in src
 
 
 def test_build_browser_instruction_dynamic():
@@ -425,7 +437,12 @@ def test_build_browser_instruction_dynamic():
 
 
 def test_browse_web_uses_dynamic_instruction():
-    """browse_web 的 tool_loop_agent 用 self._browser_instruction。"""
+    """browse_web 按本次解析的感知模式动态构造子代理指令（v1.3.0）。
+
+    感知模式优先级：input 前缀显式参数 > perception_rules 会话规则 >
+    全局 page_perception；system_prompt 用本次模式动态构建，而不是
+    固定使用预构建的 self._browser_instruction。
+    """
     node = next(
         (n for n in ast.walk(_TREE)
          if isinstance(n, ast.AsyncFunctionDef) and n.name == "browse_web"),
@@ -433,7 +450,10 @@ def test_browse_web_uses_dynamic_instruction():
     )
     assert node is not None
     body = ast.get_source_segment(_SRC, node) or ""
-    assert "system_prompt=self._browser_instruction" in body, "应用动态指令"
+    assert "_parse_perception_prefix" in body, "应解析 input 感知模式前缀"
+    assert "_resolve_perception_mode" in body, "应按优先级解析感知模式"
+    assert "_build_subagent_instruction(" in body, "应按本次模式动态构造指令"
+    assert "system_prompt=instruction" in body, "system_prompt 应为动态指令"
 
 
 def test_screenshot_silent_mode_logic():

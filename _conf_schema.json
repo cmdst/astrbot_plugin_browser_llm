@@ -135,6 +135,43 @@
     ],
     "default": "text_image"
   },
+  "perception_rules": {
+    "type": "list",
+    "description": "会话级页面感知规则",
+    "hint": "按会话（UMO 子串匹配，不区分大小写）指定页面感知方式默认值，命中第一条生效。优先级：browse_web 参数前缀 perception= 显式指定 > 本规则 > 全局 page_perception。每条规则含 match（匹配字符串，与 UMO 做子串匹配）、perception（text/text_image/image）、note（可选备注）。示例：[{\"match\": \"tester\", \"perception\": \"text\", \"note\": \"测试子代理只需正文\"}]",
+    "items": {
+      "match": {
+        "type": "string",
+        "description": "匹配字符串（与 UMO 子串匹配，不区分大小写）",
+        "hint": "如 tester / frontend，命中该子串的会话默认使用对应感知模式",
+        "default": ""
+      },
+      "perception": {
+        "type": "string",
+        "description": "感知模式",
+        "hint": "text=仅文字；text_image=文字为主+截图辅助；image=截图为主",
+        "options": [
+          "text",
+          "text_image",
+          "image"
+        ],
+        "default": "text_image"
+      },
+      "note": {
+        "type": "string",
+        "description": "备注（可选）",
+        "hint": "该规则用途说明，仅作可读性",
+        "default": ""
+      }
+    },
+    "default": []
+  },
+  "vision_cache_ttl": {
+    "type": "int",
+    "description": "识图缓存时间（秒）",
+    "hint": "同一 URL 页面在缓存时间内重复截图识图直接复用上次结果（省识图耗时与 token，返回文本带 [缓存] 前缀）；0 表示关闭缓存。缓存键 = 规范化 URL（去 fragment/尾斜杠）+ 会话 UMO，插件重载/禁用时清空",
+    "default": 60
+  },
   "proxy": {
     "type": "string",
     "description": "浏览器代理地址",

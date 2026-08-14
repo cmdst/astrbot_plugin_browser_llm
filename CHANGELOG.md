@@ -4,13 +4,76 @@
 `data/` 目录（主仓库 .gitignore 忽略）迁移初始化而来。仅跟踪插件源码与测试，运行时
 数据（`data/`：截图、运行时配置、临时文件）一律不入库。
 
-## [v1.2.1] - 2026-08-14
+## [v1.3.0] - 2026-08-15
 
-### 修复
+### 特性：感知模式精细化（工具参数级 + 会话规则级 + 识图缓存）
 
-- **release 打包**：zip 排除 `dist/*`，修复发布包内含空 dist/ 目录瑕疵；
-- **浏览器资源清理加固**：BrowserCore shutdown/close_page 增加单步超时保护（5s）与 warning 日志提级（带实例标识）；terminate 增加总超时兜底（20s）并重构清理顺序（先停 sweeper → browser.shutdown → sessions.shutdown），修复 WebUI 重载场景下旧实例 chromium 残留进程问题；
-- 测试：新增 shutdown 清理路径与 terminate 契约用例 13 个（249 passed）。
+- **工具参数级感知模式**（P0）：`browse_web` 的 `input` 开头支持可选前缀
+  `perception=text|text_image|image`（大小写不敏感，后跟空格或换行再接任务描述），
+  解析后本次任务覆盖全局配置——动态构造子代理指令时优先用参数值；未带前缀则走
+  会话规则/全局链路；前缀非法值（如 `perception=foo`）记录警告并剔除该前缀，
+  回落默认链路。解析结果以 debug 日志记录（`感知模式=xxx（显式=xxx）`），可观测。
+  典型收益：全文本模型子代理（前端/测试等）浏览网页时不再每次执行截图识图
+  （mimo-v2.5，2-8s/次 + token 费）。
+- **会话规则级默认**（P0）：新增配置 `perception_rules`（list[dict]：`match`
+  与会话 UMO 做子串匹配、不区分大小写；`perception` 为 text/text_image/image；
+  可选 `note`），默认空列表。`browse_web` 未显式指定感知模式时，按当前会话 UMO
+  遍历规则取第一条命中；未命中回落全局 `page_perception`。优先级：
+  显式参数 > perception_rules 命中 > page_perception 全局。`_refresh_config()`
+  同步读取（热更新，Dashboard 保存即生效）。非法规则条目（缺字段/非法值）跳过
+  并记录警告。
+- **识图短时缓存**（P1）：`_describe_screenshot` 增加按 URL 的短时缓存——同一 URL
+  （规范化：去 fragment/尾斜杠差异）在 `vision_cache_ttl` 秒内（默认 60，0=关闭）
+  重复识图直接返回缓存文本（返回带 `[缓存]` 前缀，另记 debug 日志），省识图耗时
+  与 token。缓存键 = (规范化 URL, 会话 UMO)，按会话隔离；选择简单 dict 实现并
+  注明并发理由：asyncio 单线程事件循环内 dict 读写原子，同 URL 并发首识可能重复
+  调用 LLM 但结果一致、无害，不引入锁。缓存写入时超过 256 条即清理过期项防膨胀；
+  `terminate` 资源清理路径整体清空（防重载残留）。`browse_screenshot` /
+  `browse_zoom_crop` 以当前页 URL 为键，`browse_local_page` 以文件 URI 为键。
+- **schema 与文档**：`_conf_schema.json` 同步新增 `perception_rules`（含 items
+  结构：match/perception/note 与 options）与 `vision_cache_ttl`（含 hint）；
+  README.md 配置节与新增「感知模式控制」节同步说明三处控制点与优先级。
+- **版本**：metadata.yaml 与 main.py PLUGIN_VERSION 同步升至 v1.3.0。
+
+### 测试
+
+- 新增 `tests/test_perception_rules.py`（20 例）：前缀解析（大小写/分隔符/非法值
+  告警/无前缀/仅前缀）、规则匹配（UMO 子串、大小写、首条命中、非法规则跳过）、
+  优先级（显式 > 规则 > 全局）、browse_web 端到端（system_prompt 断言纯文字模式
+  不含截图识图指引、规则默认与显式覆盖、非法前缀回落+告警）；
+- 新增 `tests/test_vision_cache.py`（15 例）：TTL 内命中（带 `[缓存]` 前缀且不再
+  调 LLM）、TTL 过期重识图、ttl=0 关闭、URL 规范化（fragment/尾斜杠）、会话隔离、
+  无 URL/无会话不缓存、拒识不写缓存、超阈值清理过期项、terminate 清空；
+- 全量测试保持全绿。
+
+### 补强（同版 v1.3.0）：browse_local_page 感知模式参数
+
+- `browse_local_page` 新增可选参数 `perception`（string，可省略，默认 "" = 跟随
+  全局 `page_perception`）：`text` 仅页面文本提取（跳过截图与识图调用、不落盘截图，
+  复用既有降级文本提取路径，全文本子代理读文档/报错场景零识图开销）；`text_image`
+  默认行为（文本 + 截图识图）；`image` 以截图识图为主、页面文本为辅（辅助文本过
+  禁词，命中则不附带）。非法值记录 warning 并回落全局 `page_perception`（与
+  browse_web 非法前缀行为一致）；本次解析模式以 debug 日志记录（可观测）。
+- 设计说明：子代理无独立 UMO（继承调用方会话），`perception_rules` 按 UMO 子串
+  无法区分子代理，故本地页面工具不套用会话规则，感知控制靠工具显式参数（persona
+  指令驱动）；识图缓存（vision_cache）在 text_image/image 模式正常生效，text
+  模式不触发识图自然不读写缓存。
+- 测试：`tests/test_local_page.py` 新增 9 例（text 跳过截图/识图、text_image
+  默认行为、image 识图为主文本为辅、image 视觉不可用降级、非法值回落全局+告警、
+  显式覆盖全局、缺省跟随全局、感知模式 debug 日志、docstring 契约含
+  perception(string)）；README 感知模式节补充 browse_local_page 用法。
+
+### 修复（同版 v1.3.0）：识图拒识判定器误判真实视觉描述（P2）
+
+- **误判修复**：`_is_vision_rejection` 由「全文任意位置 search 命中」收紧为
+  「响应开头位置约束（前缀窗口 60 字符内且非引号引用）或整句独立（所在子句
+  去除拒识短语后仅剩标点/软化词）」——真实视觉描述正文中的叙述性同构短语
+  （如"浏览器不支持图像懒加载功能"）不再误判为拒识，不再破坏识图缓存链；
+  既有中英文拒识用例召回不变（24/24），收紧 `图片?(?:无法|不能|不支持)`
+  需动作词（处理/识别/查看/理解）必填，避免"图片无法加载"类叙述误命中；
+- 测试：`tests/test_vision_provider.py` 新增 12 例（8 个叙述/引用反例含
+  tester 复现样例、前缀窗口长响应、英文礼貌长前缀、整句独立兜底、引号包裹
+  纯拒识短句）；全量测试 306 全绿。
 
 ## [v1.2.0] - 2026-08-14
 

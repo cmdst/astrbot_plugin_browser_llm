@@ -40,7 +40,7 @@ METADATA_NAME = "astrbot_plugin_browser_llm"
 
 # 插件版本，与 metadata.yaml 的 version 保持一致（发布版本变更时两处同步修改；
 # 真实运行时 Star 实例无 self.metadata 属性，无法动态读取，故集中为单一常量）。
-PLUGIN_VERSION = "v1.2.0"
+PLUGIN_VERSION = "v1.3.0"
 
 # terminate 资源清理总超时（秒）：超过则放弃等待并强制收尾，防止插件重载
 # 被悬挂的 close 阻塞（曾实测 browser.close 悬挂数小时，旧实例 chromium 进程
@@ -70,13 +70,72 @@ _LOCAL_PAGE_ALLOWED_EXTS = (".html", ".htm")
 _LOCAL_PAGE_DEFAULT_WAIT_MS = 500
 
 # ---------------------------------------------------------------
+# 页面感知模式（v1.3.0 精细化）：工具参数级 + 会话规则级
+# ---------------------------------------------------------------
+# 可选值全集，browse_web 参数前缀 / perception_rules / page_perception
+# 三处共用，保证口径一致。
+_PERCEPTION_MODES = ("text", "text_image", "image")
+# browse_web input 开头的显式感知模式前缀：`perception=<mode>`（大小写
+# 不敏感），后跟空格或换行再接任务描述。命中后本次任务覆盖全局配置。
+_PERCEPTION_PREFIX_RE = re.compile(
+    r"^perception\s*=\s*(text|text_image|image)(?=\s|$)", re.IGNORECASE
+)
+# 非法前缀识别：`perception=xxx` 但值不在可选集（或格式错误）时，整段
+# 剔除并记录警告，回落「规则 > 全局」默认链路，不把前缀当任务内容。
+_INVALID_PERCEPTION_PREFIX_RE = re.compile(
+    r"^perception\s*=\s*\S+", re.IGNORECASE
+)
+# 识图短时缓存防膨胀阈值：写入后缓存条目数超过该值即清理过期项。
+_VISION_CACHE_MAX_ENTRIES = 256
+
+# ---------------------------------------------------------------
 # 识图拒识检测：纯文本模型拒识文案识别
 # ---------------------------------------------------------------
 # 部分纯文本模型（如 deepseek-v4-flash）收到图片请求时返回固定拒识文案
 # （如 "[Unsupported Image]"）而非真实视觉描述。命中任一特征即判定识图
 # 失败，返回明确提示而非把拒识文本静默透传为「视觉描述」。正则大小写不敏感，
 # 覆盖中英文常见拒识表达。
+#
+# 误判防线（v1.3.0 修复，P2）：真实视觉描述正文中可能包含与拒识短语同构的
+# 叙述性文本（如"浏览器不支持图像懒加载功能"），全文 search 会误判为拒识、
+# 破坏识图缓存链。故单次短语命中须满足以下二者之一才算拒识：
+#   A. 响应开头位置约束：命中位置在前缀窗口（_VISION_REJECTION_PREFIX_LEN）
+#      内，且短语左侧不是正文引号引用（左引号紧跟短语，如页面错误提示文案
+#      "「无法处理图片，请检查网络」"）。真实拒识均为短响应、短语紧邻开头
+#      （既有 24 个拒识用例最远命中位置约 18 字符，窗口 60 留 3 倍余量）；
+#      真实视觉描述则以结构化导语开头（"这张网页截图的重点内容如下："），
+#      叙述性同构短语出现在正文中后部（tester 复现样例实测 ≥140 字符），
+#      天然落在窗口之外。
+#   B. 整句独立：命中所在的子句（按 。！？!?；; 换行切分）去除拒识短语后
+#      仅剩标点/空白/语气软化词（抱歉/对不起/Sorry 等），即该子句本身就是
+#      一句纯粹的拒识短句——兜底"长导语后单独一行拒识"等少见场景。
+# 实现选择理由：前缀窗口最简单且对既有拒识用例召回 100%；子句独立规则补齐
+# 长响应场景。已知残余歧义（文档化，可接受）：短描述开头、未加引号的叙述句
+# （如"页面中有一张无法处理图片的占位符"）在字面上与真实拒识开头（"抱歉，
+# 无法处理图片内容。"）不可区分，前缀窗口无法排除，属设计取舍，不新增规则。
 _VISION_REJECTION_HINT = "识图模型不支持图片，请更换多模态模型或清空识图配置"
+# 拒识短语允许出现的响应开头窗口（字符数）：见上方误判防线说明 A。
+_VISION_REJECTION_PREFIX_LEN = 60
+# 左引号字符：短语左侧近距离内存在左引号视为正文引用（页面提示/说明文案）。
+_VISION_REJECTION_OPEN_QUOTES = ("「", "『", "“", '"', "'", "‘")
+# 语气软化词：判定「整句独立」时先从子句中剔除。
+_VISION_REJECTION_SOFTENERS = (
+    "抱歉",
+    "对不起",
+    "不好意思",
+    "很遗憾",
+    "遗憾",
+    "sorry",
+    "unfortunately",
+    "apologies",
+    "alas",
+)
+# 子句分隔符：中文句号/问号/叹号/分号 + 英文 !?; + 换行。不切分逗号——
+# 逗号连接的多分句拒识（如"图片无法识别，请换一种方式提问。"）仍属同一子句，
+# 由前缀窗口规则覆盖；若按逗号切分，叙述句"页面提示：无法处理图片，请重试"
+# 会被切出纯拒识子句造成误判。
+_VISION_REJECTION_CLAUSE_SPLIT_RE = re.compile(r"[。！？!?；;\n]+")
+
 _VISION_REJECTION_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(p, re.IGNORECASE)
     for p in (
@@ -94,8 +153,9 @@ _VISION_REJECTION_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         r"text[- ]?only\s+(?:model|llm|ai)",
         # 中文：纯文本模型自述
         r"纯文本(?:模型|llm|ai)?",
-        # 中文：图片无法/不能/不支持（处理/识别/查看/理解）
-        r"图片?(?:无法|不能|不支持)(?:处理|识别|查看|理解)?",
+        # 中文：图片无法/不能/不支持（处理/识别/查看/理解）——动作词必填，
+        # 避免"图片无法加载"等叙述性表达误命中（v1.3.0 收紧）
+        r"图片?(?:无法|不能|不支持)(?:处理|识别|查看|理解)",
         r"无法(?:处理|识别|查看|理解)(?:图片|图像|截图)",
         r"不支持(?:图片|图像|多模态|视觉)",
         r"不是(?:多模态|视觉)(?:模型)?",
@@ -107,11 +167,76 @@ _VISION_REJECTION_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
 def _is_vision_rejection(text: str) -> bool:
     """判断模型返回文本是否为「拒识」而非真实视觉描述。
 
-    命中任一拒识特征（大小写不敏感、中英文）返回 True；空文本返回 False。
+    单次短语命中须满足「响应开头位置约束」或「整句独立」（见
+    _VISION_REJECTION_PATTERNS 上方说明）；空文本返回 False。
     """
     if not text:
         return False
-    return any(pattern.search(text) for pattern in _VISION_REJECTION_PATTERNS)
+    for pattern in _VISION_REJECTION_PATTERNS:
+        for match in pattern.finditer(text):
+            if _rejection_match_hit(text, pattern, match):
+                return True
+    return False
+
+
+def _rejection_match_hit(
+    text: str, pattern: re.Pattern[str], match: re.Match[str]
+) -> bool:
+    """单次拒识短语命中的判定：条件 A（前缀窗口且非引号引用）或条件 B（整句独立）。"""
+    if (
+        match.start() <= _VISION_REJECTION_PREFIX_LEN
+        and not _match_is_quoted(text, match)
+    ):
+        return True
+    return _match_in_pure_clause(text, pattern, match)
+
+
+def _match_is_quoted(text: str, match: re.Match[str]) -> bool:
+    """短语左侧近距离内存在左引号 → 视为正文引用（页面提示文案）而非拒识。
+
+    真实拒识响应不会把拒识短语包进引号；而页面错误提示/说明文字常以
+    "「无法处理图片」"等形式出现。仅检查短语左侧 6 字符，避免误伤
+    "抱歉，无法处理图片内容。"这类短语前带软化词的真实拒识。
+    ASCII 撇号（I'm / don't）不视为引号：前后均为 ASCII 字母时跳过。
+    """
+    if match.start() == 0:
+        return False
+    prefix_start = max(0, match.start() - 6)
+    prefix = text[prefix_start:match.start()]
+    for idx, ch in enumerate(prefix):
+        if ch not in _VISION_REJECTION_OPEN_QUOTES:
+            continue
+        if ch == "'":
+            before = prefix[idx - 1] if idx > 0 else ""
+            after = text[prefix_start + idx + 1] if prefix_start + idx + 1 < len(text) else ""
+            if (
+                before.isascii() and before.isalpha()
+                and after.isascii() and after.isalpha()
+            ):
+                continue  # 撇号（如 I'm），非引号
+        return True
+    return False
+
+
+def _match_in_pure_clause(
+    text: str, pattern: re.Pattern[str], match: re.Match[str]
+) -> bool:
+    """整句独立判定：命中所在子句去除拒识短语后仅剩标点/空白/语气软化词。"""
+    clause_start = 0
+    clause_end = len(text)
+    for sep in _VISION_REJECTION_CLAUSE_SPLIT_RE.finditer(text):
+        if sep.end() <= match.start():
+            clause_start = sep.end()
+        elif sep.start() >= match.end():
+            clause_end = sep.start()
+            break
+    clause = text[clause_start:clause_end]
+    residual = pattern.sub("", clause)
+    residual = _VISION_REJECTION_CLAUSE_SPLIT_RE.sub("", residual)
+    residual = re.sub(r"[\s\W_]+", "", residual)  # 去空白/标点（\w 含中文）
+    for softener in _VISION_REJECTION_SOFTENERS:
+        residual = residual.replace(softener, "")
+    return not residual
 
 
 def _resolve_local_page_roots() -> tuple[Path, ...]:
@@ -493,6 +618,14 @@ class BrowserLLMPlugin(Star):
         # 本地页面预览允许访问的根目录白名单（initialize 时解析真实路径）。
         self._local_page_allowed_roots: tuple[Path, ...] = _resolve_local_page_roots()
 
+        # 识图短时缓存（v1.3.0）：(umo, 规范化URL) -> (写入时间戳, 描述文本)。
+        # 并发安全说明：插件运行在 asyncio 单线程事件循环内，dict 读/写天然
+        # 原子，无需额外锁；同一 URL 并发首次识图可能重复调用 LLM（无害，
+        # 结果一致，仅多一次 token 消耗），不引入锁以保持实现简单。条目按
+        # TTL 惰性过期，超过 _VISION_CACHE_MAX_ENTRIES 时清理过期项防膨胀，
+        # terminate 时整体清空（防重载残留）。
+        self._vision_cache: dict[tuple[str, str], tuple[float, str]] = {}
+
         # 搜索引擎模板：{keyword} 会被 URL 编码后替换。
         self._search_engines = {
             "必应搜索": "https://cn.bing.com/search?q={keyword}&FORM=BESBTB&ensearch=1",
@@ -544,8 +677,14 @@ class BrowserLLMPlugin(Star):
         )
         # 静默模式：开启后截图仅内部识图，不发到群聊。
         self.silent_mode: bool = bool(cfg.get("silent_mode", True))
-        # 页面感知方式：text / text_image / image。
+        # 页面感知方式：text / text_image / image（全局默认）。
         self.page_perception: str = str(cfg.get("page_perception", "text_image"))
+        # 会话规则级感知模式（v1.3.0）：list[dict]，按 UMO 子串匹配（不区分
+        # 大小写）命中第一条；优先级：browse_web 显式参数 > 规则 > 全局。
+        self.perception_rules: list = list(cfg.get("perception_rules", []) or [])
+        # 识图短时缓存 TTL（秒，v1.3.0）：同 URL 截图在 TTL 内复用上次识图
+        # 结果；0 表示关闭缓存。
+        self.vision_cache_ttl: int = int(cfg.get("vision_cache_ttl", 60) or 0)
         # 媒体缓存保留天数：超过自动清理，节省磁盘。
         self.cache_days: int = int(cfg.get("cache_days", 3))
 
@@ -565,7 +704,9 @@ class BrowserLLMPlugin(Star):
         值刷入实例属性，本方法再同步进 SessionManager / SafetyFilter /
         BrowserCore 的运行期参数（max_pages、idle_timeout、default_url、
         禁词、内网拦截），使黑名单、内网拦截、截图开关等配置修改无需
-        重启即生效。仅浏览工具入口调用，开销为若干次 dict 读取。
+        重启即生效。v1.3.0 新增的 perception_rules / vision_cache_ttl 由
+        _load_config 一并重读，天然热更新（下次 browse_web 解析规则、
+        下次识图用新 TTL）。仅浏览工具入口调用，开销为若干次 dict 读取。
 
         说明：既有 context 的 SSRF 兜底路由安装与否按创建时的开关决定，
         此处同步 BrowserCore.block_internal_ip 仅影响之后新建的 context；
@@ -585,7 +726,8 @@ class BrowserLLMPlugin(Star):
             )
         if self.browser is not None:
             self.browser.block_internal_ip = bool(self.block_internal_ip)
-        # 页面感知方式变化后重建子代理指令（下次 browse_web 生效）。
+        # 页面感知方式变化后重建全局默认子代理指令（browse_web 每次按
+        # 解析出的感知模式动态构造，此预构建值仅作全局默认兜底/日志口径）。
         if getattr(self, "_browser_instruction", None) is not None:
             self._browser_instruction = self._build_subagent_instruction()
 
@@ -650,12 +792,20 @@ class BrowserLLMPlugin(Star):
 
         return ToolSet(tools=tools)
 
-    def _build_subagent_instruction(self) -> str:
+    def _build_subagent_instruction(self, perception: str | None = None) -> str:
         """动态生成浏览器子代理指令（基础模板 + 页面感知方式段）。
 
         基础模板为模块级常量 _BROWSER_AGENT_INSTRUCTION（工具清单 +
-        操作原则 + 验证码红线 + 等待结果策略）；按 page_perception
-        配置追加『页面感知方式』说明，指导子代理用文字还是截图感知页面。
+        操作原则 + 验证码红线 + 等待结果策略）；再按感知方式追加
+        『页面感知方式』说明，指导子代理用文字还是截图感知页面。
+
+        Args:
+            perception: 本次任务的感知模式（text/text_image/image）。
+                None 或非法值时回退全局 page_perception（再回退
+                text_image），保证任何输入都能产出可用指令。
+
+        Returns:
+            str: 完整子代理 system_prompt。
         """
         perception_map = {
             "text": (
@@ -673,7 +823,10 @@ class BrowserLLMPlugin(Star):
                 "理解页面，辅以 browse_get_text。"
             ),
         }
-        mode = (self.page_perception or "").strip()
+        mode = (perception or "").strip().lower()
+        if mode not in _PERCEPTION_MODES:
+            # 非法/空显式值：回退全局 page_perception（再回退 text_image）。
+            mode = (self.page_perception or "").strip().lower()
         perception_note = perception_map.get(mode, perception_map["text_image"])
         return f"{_BROWSER_AGENT_INSTRUCTION}\n\n{perception_note}"
 
@@ -974,6 +1127,8 @@ class BrowserLLMPlugin(Star):
         finally:
             # 本地页面预览锁表清空（弱引用字典常规会自动清理，此处显式兜底）。
             self._local_page_locks.clear()
+            # 识图短时缓存清空（防插件重载/禁用后内存残留）。
+            self._vision_cache.clear()
         logger.info(f"{tag} 已终止")
 
     # ================================================================
@@ -985,7 +1140,11 @@ class BrowserLLMPlugin(Star):
         """委托浏览器子代理完成网页浏览任务（打开网页、页面交互、提取内容或截图）。
 
         Args:
-            input(string): 给浏览器子代理的任务描述，说明要打开什么网址、查找什么内容、是否需要点击/滚动/填表等交互。
+            input(string): 给浏览器子代理的任务描述，说明要打开什么网址、查找什么内容、是否需要点击/滚动/填表等交互。可选：input 开头可加感知模式前缀 `perception=text|text_image|image`（大小写不敏感，后跟空格或换行再接任务描述），本次任务按此前缀覆盖全局/规则配置。
+
+        感知模式优先级（v1.3.0）：input 前缀显式指定 > perception_rules
+        会话规则命中（UMO 子串匹配）> page_perception 全局配置；解析结果
+        以 debug 日志记录（可观测）。
 
         注意：本入口不持 per-umo 锁（asyncio.Lock 不可重入——若在此持锁，
         子 Agent 工具 browse_* 内部再 acquire 同一锁会死锁）。串行化由
@@ -1002,6 +1161,17 @@ class BrowserLLMPlugin(Star):
             allowed, deny_reason = self._is_session_allowed(event)
             if not allowed:
                 return f"【拒绝】{deny_reason}"
+            # 感知模式精细化（v1.3.0）：解析 input 前缀（显式参数）并按下述
+            # 优先级取本次模式：显式参数 > perception_rules 会话规则命中 >
+            # 全局 page_perception；按本次模式动态构造子代理指令，不依赖
+            # 预构建的 self._browser_instruction（仅作全局默认兜底）。
+            explicit_mode, task_input = self._parse_perception_prefix(input)
+            perception_mode = self._resolve_perception_mode(event, explicit_mode)
+            logger.debug(
+                f"[{self.metadata_name}] browse_web 感知模式={perception_mode}"
+                f"（显式={explicit_mode or '无'}）"
+            )
+            instruction = self._build_subagent_instruction(perception_mode)
             try:
                 provider_id = await self.context.get_current_chat_provider_id(
                     umo=self._umo_of(event)
@@ -1017,8 +1187,8 @@ class BrowserLLMPlugin(Star):
             resp = await self.context.tool_loop_agent(
                 event=event,
                 chat_provider_id=provider_id,
-                prompt=input or "请根据用户请求浏览网页并返回结果",
-                system_prompt=self._browser_instruction,
+                prompt=task_input or "请根据用户请求浏览网页并返回结果",
+                system_prompt=instruction,
                 tools=self._browser_toolset,
                 max_steps=self.agent_max_steps,
                 tool_call_timeout=self.agent_tool_timeout,
@@ -1043,6 +1213,7 @@ class BrowserLLMPlugin(Star):
         path: str = "",
         full_page: bool = False,
         wait_ms: int = 0,
+        perception: str = "",
     ) -> str:
         """渲染本地 HTML 页面并返回渲染结果的视觉描述（本地页面预览工具，面向子代理）。
 
@@ -1052,11 +1223,22 @@ class BrowserLLMPlugin(Star):
         保证工具不空转。本工具不经过浏览会话管理器，每次渲染使用独立页面用完即关，
         不影响既有 browse_* 浏览会话状态。
 
+        感知模式（v1.3.0 补强）：可选 perception 参数控制本次感知方式，覆盖全局
+        page_perception——text 仅页面文本提取（跳过截图与识图调用，全文本子代理读
+        文档/报错场景零识图开销、不落盘截图）；text_image 文本 + 截图识图（默认
+        行为）；image 以截图识图为主、页面文本为辅。缺省或非法值回落全局
+        page_perception（再回落 text_image），与 browse_web 非法前缀行为一致。
+        子代理无独立 UMO（继承调用方会话），perception_rules 按 UMO 子串无法区分，
+        故本工具不套用会话规则，感知控制依赖此显式参数。
+
         Args:
             path(string): 本地 HTML 文件的绝对路径。仅允许 AstrBot 工作区目录
                 与插件 data 目录下的 .html/.htm 文件，其余路径一律拒绝。
             full_page(boolean): 是否截取整页长截图（默认 false，仅截首屏视口）。可省略
             wait_ms(number): 页面加载后等待 JS 渲染的毫秒数（默认 500）。可省略
+            perception(string): 本次感知模式：text / text_image / image（大小写
+                不敏感）。可省略：缺省或非法值回落全局 page_perception（再回落
+                text_image）。text 模式跳过截图与识图调用，仅返回页面文本提取结果。
         """
         try:
             # 轻量热更新配置：黑名单/截图/内网拦截等修改无需重启即生效。
@@ -1065,6 +1247,16 @@ class BrowserLLMPlugin(Star):
             allowed, deny_reason = self._is_session_allowed(event)
             if not allowed:
                 return f"【拒绝】{deny_reason}"
+
+            # 0. 感知模式解析（v1.3.0 补强）：显式 perception 参数 > 全局
+            # page_perception；非法显式值记录警告并回落全局。子代理无独立
+            # UMO（继承调用方会话），不套用 perception_rules 会话规则，
+            # 感知控制靠工具显式参数（见 _resolve_local_page_perception）。
+            perception_mode = self._resolve_local_page_perception(perception)
+            logger.debug(
+                f"[{self.metadata_name}] browse_local_page 感知模式={perception_mode}"
+                f"（显式={str(perception or '').strip() or '无'}）"
+            )
 
             # 1. 参数与路径安全校验（白名单 + 防路径穿越，越权路径直接拒绝）。
             raw = str(path or "").strip()
@@ -1103,10 +1295,35 @@ class BrowserLLMPlugin(Star):
                         wait = 0
                     if wait <= 0:
                         wait = _LOCAL_PAGE_DEFAULT_WAIT_MS
-                    # 等待 JS 执行完成，保证动态渲染内容进入截图/文本。
-                    await page.wait_for_timeout(wait)
+                    # 信息提取（text / text_image / image 模式都需要；
+                    # image 模式中页面文本作为识图描述的辅助内容）。
+                    info = await self.extractor.extract_page_info(page)
+                    text = await self.extractor.extract_text(
+                        page, max_chars=int(self.max_chars)
+                    )
 
-                    # 4. 截图（保存到插件 data/screenshots/，可作交付附件路径）。
+                    # 4. 感知模式 text：仅文本提取，跳过截图与识图调用
+                    # （全文本子代理读文档/报错场景零识图开销、不落盘截图）。
+                    if perception_mode == "text":
+                        if not text:
+                            return (
+                                f"【错误】页面渲染成功但未提取到文本内容：{target}"
+                            )
+                        banned = self._check_banned(text)
+                        if banned:
+                            return (
+                                f"【拒绝】页面内容包含违禁内容：{banned}，"
+                                "已拒绝输出。"
+                            )
+                        return self._format_local_page_text_result(
+                            target,
+                            info,
+                            text,
+                            note="感知模式 text：仅文本提取，未截图识图",
+                        )
+
+                    # 5. 截图（text_image / image 模式；保存到插件
+                    # data/screenshots/，可作交付附件路径）。
                     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
                     umo_hash = hashlib.md5(
                         self._umo_of(event).encode("utf-8")
@@ -1130,15 +1347,13 @@ class BrowserLLMPlugin(Star):
                             await self.browser.screenshot(page, save_path)
                         )
 
-                    info = await self.extractor.extract_page_info(page)
-                    text = await self.extractor.extract_text(
-                        page, max_chars=int(self.max_chars)
-                    )
-
-                    # 5. 视觉描述（mimo-v2.5 等）：成功返回描述；失败降级文本。
+                    # 6. 视觉描述（mimo-v2.5 等，识图缓存正常生效）：成功返回
+                    # 描述；失败降级文本，保证不空转。
                     desc = ""
                     if screenshot_ok:
-                        desc = await self._describe_screenshot(save_path, event)
+                        desc = await self._describe_screenshot(
+                            save_path, event, page_url=target.as_uri()
+                        )
                     if desc:
                         banned = self._check_banned(desc)
                         if banned:
@@ -1146,6 +1361,17 @@ class BrowserLLMPlugin(Star):
                                 f"【拒绝】页面识图结果包含违禁内容：{banned}，"
                                 "已拒绝输出。"
                             )
+                        if perception_mode == "image" and text:
+                            # image 模式：以截图识图为主，页面文本为辅（辅助
+                            # 文本同样过禁词，命中则不附带，避免泄露违禁内容）。
+                            if not self._check_banned(text):
+                                return (
+                                    f"【本地页面预览·识图模式】{target}\n"
+                                    f"标题: {info['title']}\n"
+                                    f"截图: {save_path}\n"
+                                    f"渲染视觉描述：\n{desc}\n"
+                                    f"页面文本（辅助）：\n{text}"
+                                )
                         return (
                             f"【本地页面预览】{target}\n"
                             f"标题: {info['title']}\n"
@@ -1153,7 +1379,7 @@ class BrowserLLMPlugin(Star):
                             f"渲染视觉描述：\n{desc}"
                         )
 
-                    # 6. 降级路径：视觉模型不可用/截图失败 → 文本提取，保证不空转。
+                    # 7. 降级路径：视觉模型不可用/截图失败 → 文本提取，保证不空转。
                     if text:
                         banned = self._check_banned(text)
                         if banned:
@@ -1161,11 +1387,11 @@ class BrowserLLMPlugin(Star):
                                 f"【拒绝】页面内容包含违禁内容：{banned}，"
                                 "已拒绝输出。"
                             )
-                        return (
-                            f"【本地页面预览·文本模式】{target}\n"
-                            f"标题: {info['title']}\n"
-                            f"（视觉模型不可用或截图失败，已降级为文本提取）\n"
-                            f"页面文本：\n{text}"
+                        return self._format_local_page_text_result(
+                            target,
+                            info,
+                            text,
+                            note="视觉模型不可用或截图失败，已降级为文本提取",
                         )
                     if screenshot_ok:
                         return (
@@ -1192,6 +1418,32 @@ class BrowserLLMPlugin(Star):
             lock = asyncio.Lock()
             self._local_page_locks[umo] = lock
         return lock
+
+    @staticmethod
+    def _format_local_page_text_result(
+        target: Path, info: dict, text: str, note: str
+    ) -> str:
+        """格式化本地页面文本提取结果（text 感知模式与降级路径共用）。
+
+        text 感知模式（跳过截图识图）与视觉不可用/截图失败的降级路径都
+        复用本方法，保证两种场景输出结构一致、不重复实现。
+
+        Args:
+            target: 渲染的本地 HTML 文件路径。
+            info: extract_page_info 返回的页面信息（含 title）。
+            text: 提取到的页面文本。
+            note: 模式说明（如「感知模式 text：仅文本提取，未截图识图」
+                或「视觉模型不可用或截图失败，已降级为文本提取」）。
+
+        Returns:
+            str: 【本地页面预览·文本模式】输出文本。
+        """
+        return (
+            f"【本地页面预览·文本模式】{target}\n"
+            f"标题: {info['title']}\n"
+            f"（{note}）\n"
+            f"页面文本：\n{text}"
+        )
 
     def _check_local_page_path(self, target: Path) -> tuple[bool, str]:
         """本地页面白名单校验：仅允许工作区与插件 data 目录下的路径。
@@ -1229,6 +1481,108 @@ class BrowserLLMPlugin(Star):
         if umo:
             return umo
         return f"{event.get_group_id() or ''}|{event.get_sender_id() or 'unknown'}"
+
+    def _parse_perception_prefix(
+        self, raw_input: str
+    ) -> tuple[str | None, str]:
+        """解析 browse_web input 开头的可选感知模式前缀（v1.3.0）。
+
+        格式：`perception=text|text_image|image`（大小写不敏感），后跟
+        空格或换行再接任务描述。返回值：
+        - 合法前缀 → (显式模式, 剔除前缀后的任务描述)；
+        - 非法值（如 perception=foo）→ 记录警告、剔除该前缀、返回
+          (None, 剩余描述)——回落「规则 > 全局」默认链路，不把前缀当
+          任务内容；
+        - 无前缀 → (None, 原输入)。
+
+        Args:
+            raw_input: browse_web 的 input 参数原文。
+
+        Returns:
+            tuple[str | None, str]: (显式感知模式或 None, 任务描述)。
+        """
+        raw = raw_input or ""
+        m = _PERCEPTION_PREFIX_RE.match(raw)
+        if m:
+            return m.group(1).lower(), raw[m.end():].lstrip()
+        m = _INVALID_PERCEPTION_PREFIX_RE.match(raw)
+        if m:
+            logger.warning(
+                f"[{self.metadata_name}] browse_web 感知模式前缀非法，已忽略"
+                f"并回落默认链路: {raw[:m.end()]!r}"
+                f"（支持 perception=text / text_image / image）"
+            )
+            return None, raw[m.end():].lstrip()
+        return None, raw
+
+    def _resolve_perception_mode(
+        self, event: AstrMessageEvent, explicit: str | None = None
+    ) -> str:
+        """按优先级解析本次浏览任务的页面感知模式（v1.3.0）。
+
+        优先级：显式参数 > perception_rules 会话规则命中（第一条，按
+        UMO 子串匹配、不区分大小写）> 全局 page_perception。非法规则
+        条目（缺 match / perception 不在可选集）记录警告并跳过。
+
+        Args:
+            event: 消息事件（取会话 UMO 匹配规则）。
+            explicit: browse_web 前缀解析出的显式模式，非 None 时直接返回。
+
+        Returns:
+            str: 规范化感知模式（text / text_image / image），保证
+            返回值一定在 _PERCEPTION_MODES 内。
+        """
+        if explicit:
+            return explicit
+        umo_lower = (self._umo_of(event) or "").lower()
+        for rule in self.perception_rules or []:
+            if not isinstance(rule, dict):
+                logger.warning(
+                    f"[{self.metadata_name}] perception_rules 条目非法，已跳过: {rule!r}"
+                )
+                continue
+            match = str(rule.get("match") or "").strip()
+            perception = str(rule.get("perception") or "").strip().lower()
+            if not match or perception not in _PERCEPTION_MODES:
+                logger.warning(
+                    f"[{self.metadata_name}] perception_rules 条目非法，已跳过: {rule!r}"
+                )
+                continue
+            if match.lower() in umo_lower:
+                return perception
+        mode = (self.page_perception or "").strip().lower()
+        return mode if mode in _PERCEPTION_MODES else "text_image"
+
+    def _resolve_local_page_perception(self, explicit: str | None = None) -> str:
+        """解析 browse_local_page 本次感知模式（v1.3.0 补强）。
+
+        优先级：显式 perception 参数 > 全局 page_perception（再回落
+        text_image）。非法显式值（不在 text/text_image/image 可选集）
+        记录警告并回落全局——与 browse_web 非法前缀行为一致。子代理无
+        独立 UMO（继承调用方会话），perception_rules 按 UMO 子串无法
+        区分，故本地页面预览不套用会话规则，感知控制仅靠工具显式参数
+        （persona 指令驱动）。
+
+        Args:
+            explicit: browse_local_page 的 perception 参数原文，
+                空串/None 表示未显式指定。
+
+        Returns:
+            str: 规范化感知模式（text / text_image / image），保证
+                返回值一定在 _PERCEPTION_MODES 内。
+        """
+        raw = (explicit or "").strip().lower()
+        if raw and raw not in _PERCEPTION_MODES:
+            logger.warning(
+                f"[{self.metadata_name}] browse_local_page 感知模式非法，"
+                f"已回落全局 page_perception: {raw!r}"
+                f"（支持 perception=text / text_image / image）"
+            )
+            raw = ""
+        if not raw:
+            mode = (self.page_perception or "").strip().lower()
+            return mode if mode in _PERCEPTION_MODES else "text_image"
+        return raw
 
     def _is_session_allowed(self, event: AstrMessageEvent) -> tuple[bool, str]:
         """会话白/黑名单检查（参考 AtTool 实现）。
@@ -1681,7 +2035,9 @@ class BrowserLLMPlugin(Star):
                     except Exception as e:  # noqa: BLE001 — 发图失败不阻塞识图
                         logger.warning(f"[{METADATA_NAME}] 发送截图失败: {e}")
                 # 识图（可选）：配置了 vision_provider_id 才尝试。
-                desc = await self._describe_screenshot(result, event)
+                desc = await self._describe_screenshot(
+                    result, event, page_url=getattr(page, "url", None)
+                )
                 if desc:
                     prefix = "截图已识图（静默模式，未发送）" if self.silent_mode else "截图已发送给用户"
                     return f"{prefix}。识图结果：\n{desc}"
@@ -1914,7 +2270,9 @@ class BrowserLLMPlugin(Star):
                     f"[{METADATA_NAME}] 已裁剪截图 ({cx},{cy},{cw}x{ch}) -> {save_path}"
                 )
                 # 识图该区域（配置了 vision_provider_id 才执行）。
-                desc = await self._describe_screenshot(save_path, event)
+                desc = await self._describe_screenshot(
+                    save_path, event, page_url=getattr(page, "url", None)
+                )
                 if desc:
                     return f"裁剪区域识图结果：\n{desc}"
                 return f"已裁剪区域截图并保存：{save_path}（如需识图请配置 vision_provider_id 多模态模型）。"
@@ -2154,8 +2512,66 @@ class BrowserLLMPlugin(Star):
             logger.warning(f"[{METADATA_NAME}] 媒体下载失败 {url}: {e}")
             return ""
 
+    @staticmethod
+    def _normalize_vision_cache_url(url: str) -> str:
+        """规范化识图缓存 URL：去 fragment、去尾斜杠（保留根路径 '/'）。
+
+        仅按需求规格处理这两类差异；大小写/默认端口等不做归一（实现
+        简单优先，避免误合并不同内容页面）。
+        """
+        url = (url or "").strip()
+        if not url:
+            return ""
+        if "#" in url:
+            url = url.split("#", 1)[0]
+        while len(url) > 1 and url.endswith("/"):
+            url = url[:-1]
+        return url
+
+    def _vision_cache_key(
+        self, page_url: str | None, event: AstrMessageEvent | None
+    ) -> tuple[str, str] | None:
+        """构造识图缓存键：(umo, 规范化URL)；缺 URL 或会话时返回 None。
+
+        None 表示本次调用不参与缓存（不读不写），例如调用方未提供页面
+        URL、或事件无法确定会话（单测/非会话场景）。
+        """
+        url = self._normalize_vision_cache_url(page_url or "")
+        if not url:
+            return None
+        umo = self._umo_of(event) if event is not None else ""
+        if not umo:
+            return None
+        return (umo, url)
+
+    def _vision_cache_put(
+        self, key: tuple[str, str] | None, text: str
+    ) -> None:
+        """写入识图缓存（附带过期项清理，防长期运行内存膨胀）。
+
+        超过 _VISION_CACHE_MAX_ENTRIES 条时惰性清理全部过期项；条目
+        数量仍超限则保留（下次写入继续清理），不引入定时任务。
+        """
+        if key is None or not text:
+            return
+        self._vision_cache[key] = (time.time(), text)
+        if len(self._vision_cache) <= _VISION_CACHE_MAX_ENTRIES:
+            return
+        now = time.time()
+        ttl = int(getattr(self, "vision_cache_ttl", 0) or 0)
+        if ttl <= 0:
+            return
+        expired = [
+            k for k, (ts, _) in self._vision_cache.items() if now - ts > ttl
+        ]
+        for k in expired:
+            del self._vision_cache[k]
+
     async def _describe_screenshot(
-        self, image_path: str, event: AstrMessageEvent | None = None
+        self,
+        image_path: str,
+        event: AstrMessageEvent | None = None,
+        page_url: str | None = None,
     ) -> str:
         """用多模态模型描述截图（配置了 vision_provider_id 才执行）。
 
@@ -2164,15 +2580,35 @@ class BrowserLLMPlugin(Star):
         模型返回拒识文案（纯文本模型不支持图片，如 "[Unsupported Image]"）
         时记警告日志并返回明确提示文案，不把拒识文本误当视觉描述。
         双通道降级：contexts（ImageURLPart）失败后回退 image_urls。
+        识图短时缓存（v1.3.0）：提供 page_url 且 vision_cache_ttl>0 时，
+        同 URL（去 fragment/尾斜杠规范化）+ 同会话在 TTL 内重复识图直接
+        复用上次结果（返回文本带 [缓存] 前缀，另记 debug 日志）；缓存按
+        URL+会话隔离，terminate 时整体清空。
 
         Args:
             image_path: 截图本地路径。
             event: 消息事件（失效回退时确定会话），可为 None。
+            page_url: 截图对应页面的 URL（缓存键来源），可为 None 表示
+                不参与缓存。
 
         Returns:
             str: 识图描述文本；未配置或调用失败返回空串；拒识时返回提示
             文案（均不抛异常）。
         """
+        # 识图短时缓存命中检查（TTL=0 或缺少 URL/会话键时不启用）。
+        ttl = int(getattr(self, "vision_cache_ttl", 0) or 0)
+        cache_key = self._vision_cache_key(page_url, event) if ttl > 0 else None
+        if cache_key is not None:
+            hit = self._vision_cache.get(cache_key)
+            if hit is not None:
+                ts, cached_text = hit
+                if time.time() - ts <= ttl:
+                    logger.debug(
+                        f"[{self.metadata_name}] 识图缓存命中（TTL={ttl}s）: "
+                        f"{page_url}"
+                    )
+                    return f"[缓存] {cached_text}"
+                del self._vision_cache[cache_key]
         provider_id = await self._resolve_vision_provider_id(event)
         if not provider_id:
             return ""
@@ -2207,6 +2643,7 @@ class BrowserLLMPlugin(Star):
                         f"（provider={provider_id}, text={text.strip()[:60]!r}）"
                     )
                     return _VISION_REJECTION_HINT
+                self._vision_cache_put(cache_key, text.strip())
                 return text.strip()
         except Exception as e:  # noqa: BLE001 — contexts 方式失败，降级 image_urls
             logger.debug(f"[{self.metadata_name}] 识图 contexts 方式失败，降级 image_urls: {e}")
@@ -2226,6 +2663,7 @@ class BrowserLLMPlugin(Star):
                     f"（provider={provider_id}, text={text[:60]!r}）"
                 )
                 return _VISION_REJECTION_HINT
+            self._vision_cache_put(cache_key, text)
             return text
         except Exception as e:  # noqa: BLE001 — 识图失败必须降级不抛异常
             logger.warning(f"[{self.metadata_name}] 识图失败: {e}")
