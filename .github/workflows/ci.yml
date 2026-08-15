@@ -21,5 +21,5 @@ jobs:
         run: pip install pytest docstring_parser aiohttp
       - name: Run tests
         run: |
-          python -m pytest tests/test_fixes_v131.py::test_browse_get_text_allows_normal tests/test_fixes_v131.py::test_browse_current_page_blocks_banned_body tests/test_fixes_v131.py::test_browse_current_page_allows_normal tests/test_fixes_v131.py::test_browse_new_tab_blocks_banned_body tests/test_fixes_v131.py::test_browse_click_link_summary_blocks_banned_body -q
+          python -m pytest tests/test_fixes_v131.py::test_browse_open_blocks_banned_body tests/test_fixes_v131.py::test_browse_open_blocks_banned_title tests/test_fixes_v131.py::test_browse_open_allows_normal_page tests/test_fixes_v131.py::test_browse_get_text_blocks_banned_body tests/test_fixes_v131.py::test_browse_get_text_allows_normal tests/test_fixes_v131.py::test_browse_current_page_blocks_banned_body tests/test_fixes_v131.py::test_browse_current_page_allows_normal tests/test_fixes_v131.py::test_browse_new_tab_blocks_banned_body tests/test_fixes_v131.py::test_browse_click_link_summary_blocks_banned_body -q
           exit 0
