@@ -4,6 +4,77 @@
 `data/` 目录（主仓库 .gitignore 忽略）迁移初始化而来。仅跟踪插件源码与测试，运行时
 数据（`data/`：截图、运行时配置、临时文件）一律不入库。
 
+## [v1.3.1] - 2026-08-16
+
+### 修复（QA 查缺补漏：1×P1 + 6×P2 + 低风险 P3）
+
+- **P1 内容禁词覆盖网页正文链路**：`banned_words` 过滤此前仅作用于 URL / 搜索
+  query / 本地页面，`browse_open` / `browse_current_page` / `browse_click_link` /
+  `browse_new_tab` / `browse_scroll` 等经 `_page_summary()` 返回的页面正文与标题
+  原样透传（实测含「赌博/色情」正文完整返回）。修复：`_page_summary()` 对标题与
+  正文统一过 `_check_banned`，命中返回「【拒绝】页面标题/正文包含违禁内容：词」；
+  `browse_get_text()` 返回前同样检查；`browse_web` 任务描述（剔除感知前缀后）入口
+  检查（P3-9 纵深防御）。与 `_conf_schema.json` banned_words 描述「网页内容会被
+  安全过滤拦截」一致。
+- **P2-1 非法数值配置不再阻断加载**：`_load_config` 全部数值/布尔配置改经
+  `_as_int` / `_as_float` / `_as_bool` 归一解析——非法字符串 / None / 类型错误
+  回退 schema 默认值并记 warning，手动编辑 config.json 不再导致插件 `__init__`
+  崩溃；`BrowserCore` 的 timeout / enable_screenshot / block_internal_ip 同步容错。
+- **P2-2 字符串布尔归一**：`silent_mode` / `enable_screenshot` /
+  `block_internal_ip` 对字符串 `"false"` / `"0"` / `"off"` / `"no"` / `""` 按
+  False 解析（原实现 `bool("false")` 强转 True，语义反转）。
+- **P2-3 browse_local_page 白名单纳入平台工作区**：`_resolve_local_page_roots()`
+  恒加入运行时工作区（`get_astrbot_workspaces_path()`，目录存在时），并追加平台
+  工作区候选 `/root/workspace`（存在即加入）与环境变量
+  `BROWSER_LLM_EXTRA_LOCAL_ROOTS`（冒号分隔，可配置额外根目录）；去重保序，
+  标准 AstrBot 部署行为不变。
+- **P2-4 多行链接文本可点击**：`extract_links` 对链接可见文本做空白清洗
+  （innerText 保留换行会把编号行拆散）；`browse_click_link` 改为按
+  「换行 + 编号行开头」切分条目再解析 target，不再依赖 splitlines 行结构。
+- **P2-5 cache_days=0 语义修正**：`cache_days <= 0` 表示「不清理」（与
+  vision_cache_ttl=0 关闭缓存的语义一致），不再误删全部媒体/截图缓存；
+  README 配置表同步注明。
+- **P2-6 无会话 switch/close 不再隐式建会话**：`browse_switch_tab` /
+  `browse_close_tab` 在取页前先检查会话白名单与 `tab_count()==0`，无会话直接
+  返回「当前会话没有任何标签页」，不触发 `ensure_page` 创建默认页。
+
+### 低风险清理（P3）
+
+- **P3-1** `extract_text(max_chars<=0)` 按默认值 4000 处理，消除 1 字符 +
+  截断标记的怪异输出；
+- **P3-2** 日志 URL 脱敏：新增 `_redact_url()`（query 参数值 / fragment 打码），
+  应用于 browse_open 调试日志、媒体嗅探拦截/失败日志、媒体下载全链路失败日志；
+- **P3-3/P3-4** 文档同步：README「25 个工具」→ 24、main.py 注释「15 个」→ 24、
+  「22 个配置项」→ 24，README 配置表补齐 default_url / default_search_engine /
+  max_chars / max_links / timeout / max_pages / idle_timeout / session_whitelist /
+  session_blacklist / enable_screenshot / proxy / viewport 共 12 项；
+- **P3-5** 删除插件根目录旧测试副本（`test_browser_core.py` 与 tests/ 完全重复、
+  `test_main_contract.py` 为 v1.2.0 旧版），仅保留 `tests/`；
+- **P3-7** `browse_press_key` 按键大小写不敏感（`enter` → `Enter`，按大写归一
+  后映射回 Playwright 规范按键名）；
+- **P3-8** 非法 `browser_type` 启动前校验：给出「可选：chromium/firefox/webkit」
+  提示（原为 `None.launch()` 无提示报错），`chrome` 自动映射为 chromium；
+- **P3-9** `browse_web` 任务描述入口过禁词（见 P1 条目）。
+
+### 遗留（有意不修，见交付说明）
+
+- P3-6 默认禁词含「政治/暴力」等宽泛词可能误伤正常页面：属默认值设计取舍，
+  保留现默认值，用户可按需收敛 `banned_words` 配置；
+- P3-10 SSRF DNS rebinding TOCTOU 窗口、P3-11 白名单目录内硬链接风险：均为
+  高级对抗/本地写权限前提下的残余风险，文档化提示，不做代码加固。
+
+### 测试
+
+- `tests/test_qa_complement.py` 原缺陷证明用例更新为修复后行为断言
+  （非法 int 配置回退 / bool 字符串归一 / 换行链接可点击 / 无会话 switch/close
+  报错且不建会话 / extract_text(0) 默认值 / cache_days=0 不清理），并新增
+  switch/close 有会话对照用例；
+- 新增 `tests/test_fixes_v131.py`（26 例）：P1 正文/标题禁词端到端
+  （browse_open / get_text / current_page / new_tab / click_link 拒绝与透传）、
+  P2-3 白名单（平台工作区 / env 扩展 / 去重 / 越权拒绝）、P2-4 链接文本清洗、
+  P3-2 URL 脱敏、P3-7 按键归一、P3-8 内核校验、P3-9 任务描述禁词；
+- 全量回归：`python3 -m pytest tests/ -q` → **370 passed**（原 342 + 28 新增）。
+
 ## [v1.3.0] - 2026-08-15
 
 ### 特性：感知模式精细化（工具参数级 + 会话规则级 + 识图缓存）
@@ -74,6 +145,14 @@
 - 测试：`tests/test_vision_provider.py` 新增 12 例（8 个叙述/引用反例含
   tester 复现样例、前缀窗口长响应、英文礼貌长前缀、整句独立兜底、引号包裹
   纯拒识短句）；全量测试 306 全绿。
+
+## [v1.2.1] - 2026-08-14
+
+### 修复
+
+- **release 打包**：zip 排除 `dist/*`，修复发布包内含空 dist/ 目录瑕疵；
+- **浏览器资源清理加固**：BrowserCore shutdown/close_page 增加单步超时保护（5s）与 warning 日志提级（带实例标识）；terminate 增加总超时兜底（20s）并重构清理顺序（先停 sweeper → browser.shutdown → sessions.shutdown），修复 WebUI 重载场景下旧实例 chromium 残留进程问题；
+- 测试：新增 shutdown 清理路径与 terminate 契约用例 13 个（249 passed）。
 
 ## [v1.2.0] - 2026-08-14
 

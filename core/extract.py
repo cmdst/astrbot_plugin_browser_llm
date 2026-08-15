@@ -78,6 +78,10 @@ class ContentExtractor:
         text = re.sub(r"\s+", " ", raw).strip()
         if not text:
             return ""
+        # 参数护栏（v1.3.1）：max_chars<=0（含 None）按默认值 4000 处理，
+        # 避免 max_chars=0 时输出 1 字符 + 截断标记的怪异结果。
+        if max_chars is None or max_chars <= 0:
+            max_chars = 4000
         if len(text) <= max_chars:
             return text
         head_len = max(1, (max_chars - len(_TRUNCATE_MARKER)) // 2)
@@ -117,7 +121,9 @@ class ContentExtractor:
                 continue
             href = item.get("href") or ""
             raw = item.get("raw") or ""
-            text = item.get("text") or ""
+            # 文本换行清洗（v1.3.1）：innerText 保留换行，多行链接文本会把
+            # 编号行拆散导致 browse_click_link 无法解析，统一压缩为单空格。
+            text = re.sub(r"\s+", " ", (item.get("text") or "")).strip()
             if not href or not raw.strip():
                 continue
             if raw.lstrip().startswith("#"):

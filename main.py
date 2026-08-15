@@ -1,33 +1,34 @@
 """
 astrbot_plugin_browser_llm — LLM 浏览器插件（Agent 驱动的网页浏览）
 
-架构：工具化子代理（tool-based subagent）。15 个 browse_* 浏览工具不
+架构：工具化子代理（tool-based subagent）。24 个 browse_* 浏览工具不
 直接暴露给主 LLM，而是作为「浏览器子代理」的工具集；主 LLM 只看到
 一个入口工具 browse_web，需要真实网页交互时调用它，由子代理（
-tool_loop_agent + 15 个 FunctionTool）自主完成浏览。
+tool_loop_agent + 24 个 FunctionTool）自主完成浏览。
 
 核心组件在 initialize() 中组装：BrowserCore（浏览器驱动）、
 SessionManager（会话隔离与回收）、ContentExtractor（内容提取）、
-SafetyFilter（禁词过滤与 SSRF 防护），以及 15 个 FunctionTool 构建
+SafetyFilter（禁词过滤与 SSRF 防护），以及 24 个 FunctionTool 构建
 的 ToolSet（子代理工具集）。
 """
 
 import asyncio
 import hashlib
+import os
 import re
 import time
 import weakref
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlsplit
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 
-from .core.browser import BrowserCore
+from .core.browser import BrowserCore, validate_browser_type
 from .core.extract import ContentExtractor
 from .core.safety import SafetyFilter
 from .core.session import SessionManager
@@ -40,7 +41,7 @@ METADATA_NAME = "astrbot_plugin_browser_llm"
 
 # 插件版本，与 metadata.yaml 的 version 保持一致（发布版本变更时两处同步修改；
 # 真实运行时 Star 实例无 self.metadata 属性，无法动态读取，故集中为单一常量）。
-PLUGIN_VERSION = "v1.3.0"
+PLUGIN_VERSION = "v1.3.1"
 
 # terminate 资源清理总超时（秒）：超过则放弃等待并强制收尾，防止插件重载
 # 被悬挂的 close 阻塞（曾实测 browser.close 悬挂数小时，旧实例 chromium 进程
@@ -239,14 +240,56 @@ def _match_in_pure_clause(
     return not residual
 
 
+# 平台工作区候选（子代理产物默认落盘目录，存在即加入白名单）：
+# 本平台约定工作区为 /root/workspace（root 部署的 agent 沙箱惯例，与 AstrBot
+# 自身 data/workspaces 不同）；非本平台部署时该目录不存在，自然不生效。
+# 额外根目录可通过环境变量 BROWSER_LLM_EXTRA_LOCAL_ROOTS（冒号分隔）追加，
+# 无需改代码。
+_PLATFORM_WORKSPACE_CANDIDATES = (Path("/root/workspace"),)
+_EXTRA_LOCAL_ROOTS_ENV = "BROWSER_LLM_EXTRA_LOCAL_ROOTS"
+
+
+def _redact_url(url: str) -> str:
+    """日志脱敏（v1.3.1）：隐藏 URL query/fragment 参数值，防 token/签名泄漏。
+
+    保留 scheme://host/path 与 query 参数名，参数值统一打码为 ***；
+    fragment 整体打码。无 query/fragment 时原样返回（host/path 视为
+    不敏感）。仅用于日志输出，不影响实际请求。
+    """
+    url = str(url or "")
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return url
+    redacted_query = ""
+    if parsed.query:
+        segs = []
+        for seg in parsed.query.split("&"):
+            if not seg:
+                continue
+            if "=" in seg:
+                key, _value = seg.split("=", 1)
+                segs.append(f"{key}=***")
+            else:
+                segs.append(f"{seg}=***")
+        redacted_query = "?" + "&".join(segs)
+    fragment = "#***" if parsed.fragment else ""
+    prefix = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme else ""
+    return f"{prefix}{parsed.path}{redacted_query}{fragment}"
+
+
 def _resolve_local_page_roots() -> tuple[Path, ...]:
     """解析 browse_local_page 允许访问的根目录白名单（去重保序）。
 
-    默认以任务约定的工作区绝对路径为准（由插件安装位置推导的 AstrBot
-    工作区目录，标准部署下与服务实际工作区一致）；仅当该路径不存在
-    （如 AstrBot 重定位到其他根目录）时，才用运行时解析值兜底——避免
-    进程 CWD 不确定导致白名单根漂移（get_astrbot_root() 默认取 CWD）。
-    插件 data 目录始终在列（路径由插件自身位置推导，天然稳定）。
+    白名单构成：
+    1. 默认工作区绝对路径（由插件安装位置推导的 AstrBot 工作区目录，标准
+       部署下与服务实际工作区一致）；
+    2. 运行时解析的工作区（get_astrbot_workspaces_path() 实时值，恒加入，
+       仅要求目录存在——AstrBot 重定位时以此兜底，防进程 CWD 不确定导致
+       白名单根漂移；标准部署下与 1 相同，去重后只保留一份）；
+    3. 平台工作区候选（_PLATFORM_WORKSPACE_CANDIDATES，存在即加入）；
+    4. 环境变量 BROWSER_LLM_EXTRA_LOCAL_ROOTS 指定的额外根目录（冒号分隔）；
+    5. 插件 data 目录（路径由插件自身位置推导，天然稳定）。
     """
     roots: list[Path] = [_LOCAL_PAGE_WORKSPACE_FALLBACK]
     try:
@@ -257,13 +300,24 @@ def _resolve_local_page_roots() -> tuple[Path, ...]:
         live = Path(get_astrbot_workspaces_path()).resolve()
     except Exception:  # noqa: BLE001 — 解析失败忽略，仅用默认值
         live = None
-    if (
-        live is not None
-        and live != _LOCAL_PAGE_WORKSPACE_FALLBACK
-        and not _LOCAL_PAGE_WORKSPACE_FALLBACK.is_dir()
-        and live.is_dir()
-    ):
+    if live is not None and live.is_dir():
         roots.append(live)
+    for cand in _PLATFORM_WORKSPACE_CANDIDATES:
+        try:
+            if cand.is_dir():
+                roots.append(cand.resolve())
+        except OSError:  # noqa: BLE001 — 无法访问的候选忽略
+            continue
+    for part in os.environ.get(_EXTRA_LOCAL_ROOTS_ENV, "").split(":"):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            p = Path(part).resolve()
+            if p.is_dir():
+                roots.append(p)
+        except OSError:  # noqa: BLE001 — 非法路径忽略
+            continue
     roots.append(_DATA_DIR.resolve())
     # dict.fromkeys 去重且保序（工作区与插件 data 目录重叠时只保留一份）。
     return tuple(dict.fromkeys(roots))
@@ -292,7 +346,7 @@ def _params(
     }
 
 
-# 15 个浏览工具配置：name / description（展示给子 Agent LLM）/
+# 24 个浏览工具配置：name / description（展示给子 Agent LLM）/
 # parameters（JSON Schema）/ method（插件实例方法名）。
 _BROWSER_TOOLS = [
     {
@@ -594,7 +648,7 @@ class BrowserLLMPlugin(Star):
         Args:
             context: AstrBot 插件上下文，提供事件注册与消息发送能力。
             config: 插件配置对象，对应 _conf_schema.json 中定义的
-                22 个配置项（含默认值）；未传入时使用空字典兜底。
+                24 个配置项（含默认值）；未传入时使用空字典兜底。
         """
         super().__init__(context)
         self.config = config or {}
@@ -637,38 +691,44 @@ class BrowserLLMPlugin(Star):
     def _load_config(self) -> None:
         """将 _conf_schema.json 中的配置项读取为实例属性。
 
-        全部 22 个配置项：浏览器引擎 / 默认页 / 搜索引擎 / 禁词 /
+        全部 24 个配置项：浏览器引擎 / 默认页 / 搜索引擎 / 禁词 /
         内网拦截 / 提取与链接上限 / 超时 / 页数上限 / 空闲回收 /
-        会话黑白名单 / 截图与识图 / 代理 / 视口。
+        会话黑白名单 / 截图与识图 / 代理 / 视口 / 子代理控制。
+
+        类型健壮性（v1.3.1）：数值/布尔配置经 _as_int / _as_float /
+        _as_bool 归一解析，非法值（字符串、None、类型错误）回退默认值并
+        记录 warning——手动编辑 config.json 或第三方写入非法类型时插件
+        仍可正常加载，不再抛异常阻断初始化。Dashboard 路径本身有 AstrBot
+        类型校验保护，此处理为纵深防御。
         """
         cfg = self.config
 
         # 浏览器基础
-        self.browser_type: str = cfg.get("browser_type", "chromium")
-        self.default_url: str = cfg.get("default_url", "https://www.baidu.com")
-        self.default_search_engine: str = cfg.get("default_search_engine", "必应搜索")
+        self.browser_type: str = str(cfg.get("browser_type", "chromium"))
+        self.default_url: str = str(cfg.get("default_url", "https://www.baidu.com"))
+        self.default_search_engine: str = str(cfg.get("default_search_engine", "必应搜索"))
 
         # 安全与过滤
         self.banned_words: list = cfg.get(
             "banned_words",
             ["pornhub", "色情", "成人", "赌博", "暴力", "政治", "反动", "恐怖", "谣言", "诈骗", "病毒"],
         )
-        self.block_internal_ip: bool = cfg.get("block_internal_ip", True)
+        self.block_internal_ip: bool = self._as_bool(cfg.get("block_internal_ip", True), True)
 
         # 提取与资源控制
-        self.max_chars: float = cfg.get("max_chars", 4000)
-        self.max_links: float = cfg.get("max_links", 20)
-        self.timeout: float = cfg.get("timeout", 30)
-        self.max_pages: float = cfg.get("max_pages", 5)
-        self.idle_timeout: float = cfg.get("idle_timeout", 1800)
+        self.max_chars: float = self._as_float(cfg.get("max_chars", 4000), 4000)
+        self.max_links: float = self._as_float(cfg.get("max_links", 20), 20)
+        self.timeout: float = self._as_float(cfg.get("timeout", 30), 30)
+        self.max_pages: float = self._as_float(cfg.get("max_pages", 5), 5)
+        self.idle_timeout: float = self._as_float(cfg.get("idle_timeout", 1800), 1800)
 
         # 会话权限控制
         self.session_whitelist: list = cfg.get("session_whitelist", [])
         self.session_blacklist: list = cfg.get("session_blacklist", [])
 
         # 截图与识图
-        self.enable_screenshot: bool = cfg.get("enable_screenshot", True)
-        self.vision_provider_id: str = cfg.get("vision_provider_id", "")
+        self.enable_screenshot: bool = self._as_bool(cfg.get("enable_screenshot", True), True)
+        self.vision_provider_id: str = str(cfg.get("vision_provider_id", "") or "")
         self.vision_prompt: str = str(
             cfg.get(
                 "vision_prompt",
@@ -676,25 +736,70 @@ class BrowserLLMPlugin(Star):
             )
         )
         # 静默模式：开启后截图仅内部识图，不发到群聊。
-        self.silent_mode: bool = bool(cfg.get("silent_mode", True))
+        self.silent_mode: bool = self._as_bool(cfg.get("silent_mode", True), True)
         # 页面感知方式：text / text_image / image（全局默认）。
         self.page_perception: str = str(cfg.get("page_perception", "text_image"))
         # 会话规则级感知模式（v1.3.0）：list[dict]，按 UMO 子串匹配（不区分
         # 大小写）命中第一条；优先级：browse_web 显式参数 > 规则 > 全局。
         self.perception_rules: list = list(cfg.get("perception_rules", []) or [])
         # 识图短时缓存 TTL（秒，v1.3.0）：同 URL 截图在 TTL 内复用上次识图
-        # 结果；0 表示关闭缓存。
-        self.vision_cache_ttl: int = int(cfg.get("vision_cache_ttl", 60) or 0)
-        # 媒体缓存保留天数：超过自动清理，节省磁盘。
-        self.cache_days: int = int(cfg.get("cache_days", 3))
+        # 结果；0 表示关闭缓存（空值/None 同样按 0 处理，与旧行为一致）。
+        self.vision_cache_ttl: int = self._as_int(
+            cfg.get("vision_cache_ttl", 60) or 0, 60
+        )
+        # 媒体缓存保留天数：超过自动清理，节省磁盘；0/负值 = 不清理（v1.3.1）。
+        self.cache_days: int = self._as_int(cfg.get("cache_days", 3), 3)
 
         # 网络与视口
-        self.proxy: str = cfg.get("proxy", "")
+        self.proxy: str = str(cfg.get("proxy", "") or "")
         self.viewport: dict = cfg.get("viewport", {"width": 1280, "height": 800})
 
         # 浏览器子 Agent 控制（agent-as-tool）
-        self.agent_max_steps: int = int(cfg.get("agent_max_steps", 70))
-        self.agent_tool_timeout: int = int(cfg.get("agent_tool_timeout", 1200))
+        self.agent_max_steps: int = self._as_int(cfg.get("agent_max_steps", 70), 70)
+        self.agent_tool_timeout: int = self._as_int(cfg.get("agent_tool_timeout", 1200), 1200)
+
+    def _as_int(self, value, default: int) -> int:
+        """int 配置解析：非法值回退默认并记 warning，不阻断插件加载。
+
+        None/空串按默认处理（vision_cache_ttl 的「空=0」语义由调用方
+        先行 `or 0` 归一，此处只管类型转换容错）。
+        """
+        if value is None or value == "":
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            logger.warning(
+                f"[{self.metadata_name}] 配置项数值非法（{value!r}），"
+                f"已回退默认值 {default}"
+            )
+            return default
+
+    def _as_float(self, value, default: float) -> float:
+        """float 配置解析：非法值回退默认并记 warning，不阻断插件加载。"""
+        if value is None or value == "":
+            return default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            logger.warning(
+                f"[{self.metadata_name}] 配置项数值非法（{value!r}），"
+                f"已回退默认值 {default}"
+            )
+            return default
+
+    def _as_bool(self, value, default: bool) -> bool:
+        """bool 配置解析：字符串 "false"/"0"/"off"/"no"/"" → False。
+
+        JSON 允许 "false" 作为字符串，直接 bool("false") 会得到 True 造成
+        语义反转；此处归一化字符串布尔值，其余值按 Python 真值语义。
+        None 回退默认。
+        """
+        if isinstance(value, str):
+            return value.strip().lower() not in ("", "false", "0", "off", "no")
+        if value is None:
+            return default
+        return bool(value)
 
     def _refresh_config(self) -> None:
         """轻量热更新配置：工具入口重读共享 config dict 并同步固化组件。
@@ -766,7 +871,7 @@ class BrowserLLMPlugin(Star):
         self._start_cache_cleanup_task()
         # 后台空闲回收任务（每 60s 关闭超时未活动的会话）。
         await self.sessions.start_sweeper()
-        # 构建 15 个浏览工具（FunctionTool）与子 Agent 工具集。
+        # 构建 24 个浏览工具（FunctionTool）与子 Agent 工具集。
         self._browser_tools = [_make_browser_tool(self, s) for s in _BROWSER_TOOLS]
         self._browser_toolset = self._build_toolset(self._browser_tools)
         # 按页面感知方式动态生成子代理指令（基础模板 + 感知方式段）。
@@ -835,7 +940,11 @@ class BrowserLLMPlugin(Star):
 
         遍历 data/media/ 与 data/screenshots/ 下的文件，删除 mtime
         早于 (now - cache_days) 的旧文件；目录本身保留。
+        cache_days <= 0 表示「不清理」（与 vision_cache_ttl=0 关闭缓存
+        的语义一致），直接返回 0——避免 0 被误当作「立即清理全部」。
         """
+        if self.cache_days <= 0:
+            return 0
         cutoff = time.time() - self.cache_days * 86400
         removed = 0
         for base in (getattr(self, "_media_dir", None), getattr(self, "_screenshot_dir", None)):
@@ -1166,6 +1275,12 @@ class BrowserLLMPlugin(Star):
             # 全局 page_perception；按本次模式动态构造子代理指令，不依赖
             # 预构建的 self._browser_instruction（仅作全局默认兜底）。
             explicit_mode, task_input = self._parse_perception_prefix(input)
+            # 内容安全（v1.3.1）：任务描述命中禁词直接拒绝——任务文本本身
+            # 可携带违禁词（纵深防御，下游 browse_open/search 的 URL/query
+            # 检查为兜底，入口先拦一道）。
+            banned = self._check_banned(task_input)
+            if banned:
+                return f"【拒绝】任务描述包含违禁内容：{banned}"
             perception_mode = self._resolve_perception_mode(event, explicit_mode)
             logger.debug(
                 f"[{self.metadata_name}] browse_web 感知模式={perception_mode}"
@@ -1650,6 +1765,14 @@ class BrowserLLMPlugin(Star):
             return None, deny_reason
         if self.sessions is None:
             return None, "插件尚未初始化，请稍后再试"
+        # 浏览器内核配置校验（v1.3.1）：非法 browser_type 在创建页面前
+        # 给出可选值提示（browse_* 工具会把它透传给用户），避免
+        # None.launch() 的无提示报错。
+        if getattr(self, "browser", None) is not None:
+            try:
+                validate_browser_type(self.browser.browser_type)
+            except ValueError as e:
+                return None, str(e)
         page = await self.sessions.ensure_page(self._umo_of(event))
         if page is None:
             return None, "会话数已达上限或页面创建失败，请稍后再试"
@@ -1663,10 +1786,20 @@ class BrowserLLMPlugin(Star):
         return None if ok else word
 
     async def _page_summary(self, page) -> str:
-        """提取页面基本信息与正文，生成紧凑摘要文本。"""
+        """提取页面基本信息与正文，生成紧凑摘要文本。
+
+        内容安全（v1.3.1）：标题/正文命中 banned_words 时拒绝返回——
+        browse_open / browse_current_page / browse_click_link / scroll 等
+        全部经由此方法返回页面文本的工具统一受过滤保护，与 URL/query/
+        本地页面链路的禁词检查保持一致。
+        """
         info = await self.extractor.extract_page_info(page)
         text = await self.extractor.extract_text(page, max_chars=int(self.max_chars))
         text = text or "（页面无文本内容）"
+        for field, value in (("标题", info.get("title") or ""), ("正文", text)):
+            banned = self._check_banned(value)
+            if banned:
+                return f"【拒绝】页面{field}包含违禁内容：{banned}"
         return f"URL: {info['url']}\n标题: {info['title']}\n\n正文摘要: {text}"
 
     def _lock_for(self, event: AstrMessageEvent) -> asyncio.Lock:
@@ -1713,7 +1846,7 @@ class BrowserLLMPlugin(Star):
             url(string): 目标网页完整地址，须以 http:// 或 https:// 开头，如 https://example.com。
         """
         try:
-            logger.debug(f"[{self.metadata_name}] browse_open 进入 url={url!r}")
+            logger.debug(f"[{self.metadata_name}] browse_open 进入 url={_redact_url(url)!r}")
             async with self._lock_for(event):
                 page, err = await self._get_page(event)
                 if page is None:
@@ -1759,6 +1892,10 @@ class BrowserLLMPlugin(Star):
                 text = await self.extractor.extract_text(page, max_chars=limit)
                 if not text:
                     return "当前页面没有可提取的文本内容。"
+                # 内容安全（v1.3.1）：正文命中禁词拒绝返回，与 _page_summary 一致。
+                banned = self._check_banned(text)
+                if banned:
+                    return f"【拒绝】页面内容包含违禁内容：{banned}"
                 return text
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{METADATA_NAME}] browse_get_text 失败: {e}")
@@ -1800,13 +1937,20 @@ class BrowserLLMPlugin(Star):
                 links = await self.extractor.extract_links(
                     page, max_links=int(self.max_links)
                 )
+                # 健壮解析（v1.3.1）：链接可见文本可能含换行（innerText 保留
+                # 换行），若按 splitlines 整段解析，编号行会被换行拆散导致
+                # 无法还原 target。改为按「换行 + 编号行开头」切分条目——
+                # 条目内部换行不会破坏边界（URL 不含空白，rsplit 取末段安全）。
                 target = None
-                for line in links.splitlines():
-                    if line.startswith(f"[{index}]"):
-                        parts = line.rsplit(" → ", 1)
-                        if len(parts) == 2:
-                            target = parts[1].strip()
-                        break
+                for entry in re.split(r"\n(?=\[\d+\])", links or ""):
+                    entry = entry.strip()
+                    m = re.match(r"^\[(\d+)\]", entry)
+                    if not m or int(m.group(1)) != index:
+                        continue
+                    parts = entry[m.end():].rsplit(" → ", 1)
+                    if len(parts) == 2:
+                        target = parts[1].strip()
+                    break
                 if not target:
                     return (
                         f"【错误】找不到编号为 {index} 的链接，"
@@ -1920,13 +2064,18 @@ class BrowserLLMPlugin(Star):
         """
         try:
             async with self._lock_for(event):
-                page, err = await self._get_page(event)
-                if page is None:
-                    return f"【错误】{err}"
+                # 无会话时直接报错，不隐式创建会话（v1.3.1）：切换针对已有
+                # 标签，ensure_page 的「无会话建首标签」副作用在此不适用。
+                allowed, deny_reason = self._is_session_allowed(event)
+                if not allowed:
+                    return f"【拒绝】{deny_reason}"
                 umo = self._umo_of(event)
                 total = self.sessions.tab_count(umo)
                 if total == 0:
                     return "【错误】当前会话没有任何标签页。"
+                page, err = await self._get_page(event)
+                if page is None:
+                    return f"【错误】{err}"
                 target = await self.sessions.switch_tab(umo, index)
                 if target is None:
                     return f"【错误】标签页编号 {index} 不存在（当前共 {total} 个，编号从 1 开始）。"
@@ -1944,13 +2093,18 @@ class BrowserLLMPlugin(Star):
         """
         try:
             async with self._lock_for(event):
-                page, err = await self._get_page(event)
-                if page is None:
-                    return f"【错误】{err}"
+                # 无会话时直接报错，不隐式创建会话（v1.3.1）：关闭针对已有
+                # 标签，ensure_page 的「无会话建首标签」副作用在此不适用。
+                allowed, deny_reason = self._is_session_allowed(event)
+                if not allowed:
+                    return f"【拒绝】{deny_reason}"
                 umo = self._umo_of(event)
                 total = self.sessions.tab_count(umo)
                 if total == 0:
                     return "【错误】当前会话没有任何标签页。"
+                page, err = await self._get_page(event)
+                if page is None:
+                    return f"【错误】{err}"
                 closed = await self.sessions.close_tab(umo, index)
                 if not closed:
                     return f"【错误】标签页编号 {index} 不存在（当前共 {total} 个，编号从 1 开始）。"
@@ -1994,19 +2148,23 @@ class BrowserLLMPlugin(Star):
             "Enter", "Escape", "ArrowDown", "ArrowUp", "ArrowLeft",
             "ArrowRight", "Tab", "Backspace", "Home", "End",
         }
+        # 大小写不敏感（v1.3.1）：LLM 可能传小写 "enter"，统一按大写
+        # 归一后映射回 Playwright 要求的规范按键名。
+        key_aliases = {name.upper(): name for name in allowed_keys}
         try:
             async with self._lock_for(event):
                 page, err = await self._get_page(event)
                 if page is None:
                     return f"【错误】{err}"
-                key = str(key).strip()
-                if key not in allowed_keys:
+                raw_key = str(key).strip()
+                canonical = key_aliases.get(raw_key.upper())
+                if canonical is None:
                     return (
-                        f"【错误】不支持的按键：{key}。"
+                        f"【错误】不支持的按键：{raw_key}。"
                         f"支持：{'/'.join(sorted(allowed_keys))}"
                     )
-                await page.keyboard.press(key)
-                return f"已按下按键 {key}。"
+                await page.keyboard.press(canonical)
+                return f"已按下按键 {canonical}。"
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{METADATA_NAME}] browse_press_key 失败: {e}")
             return f"【错误】按键操作失败：{e}"
@@ -2373,7 +2531,7 @@ class BrowserLLMPlugin(Star):
                     if not ok:
                         blocked += 1
                         logger.warning(
-                            f"[{METADATA_NAME}] 媒体 URL 未通过安全校验，跳过: {u} ({reason})"
+                            f"[{METADATA_NAME}] 媒体 URL 未通过安全校验，跳过: {_redact_url(u)} ({reason})"
                         )
                         continue
                     try:
@@ -2387,7 +2545,7 @@ class BrowserLLMPlugin(Star):
                             from astrbot.api.message_components import Video  # noqa: PLC0415
                             await event.send(event.chain_result([Video.fromFileSystem(path)]))
                     except Exception as e:  # noqa: BLE001 — 单个失败继续
-                        logger.warning(f"[{METADATA_NAME}] 下载/发送媒体失败 {u}: {e}")
+                        logger.warning(f"[{METADATA_NAME}] 下载/发送媒体失败 {_redact_url(u)}: {e}")
                 if blocked:
                     logger.info(f"[{METADATA_NAME}] 媒体嗅探跳过 {blocked} 个未通过安全校验的 URL")
                 if not downloaded:
@@ -2452,7 +2610,7 @@ class BrowserLLMPlugin(Star):
                             location = resp.headers.get("Location")
                             if not location:
                                 logger.warning(
-                                    f"[{METADATA_NAME}] 媒体重定向缺少 Location，终止: {current_url}"
+                                    f"[{METADATA_NAME}] 媒体重定向缺少 Location，终止: {_redact_url(current_url)}"
                                 )
                                 return ""
                             next_url = urljoin(current_url, location)
@@ -2460,21 +2618,21 @@ class BrowserLLMPlugin(Star):
                             if not ok:
                                 logger.warning(
                                     f"[{METADATA_NAME}] 媒体重定向目标未通过安全校验，"
-                                    f"终止下载: {next_url} ({reason})"
+                                    f"终止下载: {_redact_url(next_url)} ({reason})"
                                 )
                                 return ""
                             current_url = next_url
                             continue
                         if resp.status != 200:
                             logger.warning(
-                                f"[{METADATA_NAME}] 媒体下载非 200: {current_url} -> {resp.status}"
+                                f"[{METADATA_NAME}] 媒体下载非 200: {_redact_url(current_url)} -> {resp.status}"
                             )
                             return ""
                         # Content-Length 预检：超限直接跳过。
                         length = resp.content_length
                         if length is not None and length > max_bytes:
                             logger.warning(
-                                f"[{METADATA_NAME}] 媒体超 {max_bytes // 1024 // 1024}MB 上限，跳过: {current_url} ({length} bytes)"
+                                f"[{METADATA_NAME}] 媒体超 {max_bytes // 1024 // 1024}MB 上限，跳过: {_redact_url(current_url)} ({length} bytes)"
                             )
                             return ""
                         # 流式写入并累计大小，超过上限中止并删除半成品。
@@ -2485,7 +2643,7 @@ class BrowserLLMPlugin(Star):
                                     total += len(chunk)
                                     if total > max_bytes:
                                         logger.warning(
-                                            f"[{METADATA_NAME}] 媒体流式累计超 {max_bytes // 1024 // 1024}MB 上限，中止: {current_url}"
+                                            f"[{METADATA_NAME}] 媒体流式累计超 {max_bytes // 1024 // 1024}MB 上限，中止: {_redact_url(current_url)}"
                                         )
                                         _cleanup_tmp()
                                         return ""
@@ -2502,14 +2660,14 @@ class BrowserLLMPlugin(Star):
                     # 重定向跳数超限：未拿到最终 200 响应。
                     _cleanup_tmp()
                     logger.warning(
-                        f"[{METADATA_NAME}] 媒体重定向超过 {max_redirects} 跳，终止: {url}"
+                        f"[{METADATA_NAME}] 媒体重定向超过 {max_redirects} 跳，终止: {_redact_url(url)}"
                     )
                     return ""
             # 流式写入成功：临时文件改名成正式路径。
             Path(tmp_path).rename(save_path)
             return save_path
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"[{METADATA_NAME}] 媒体下载失败 {url}: {e}")
+            logger.warning(f"[{METADATA_NAME}] 媒体下载失败 {_redact_url(url)}: {e}")
             return ""
 
     @staticmethod

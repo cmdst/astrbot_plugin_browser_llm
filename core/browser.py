@@ -42,6 +42,47 @@ _SSRF_GUARD_CACHE_TTL = 300.0
 # DNS 无法判定（失败）时的短缓存 TTL（秒）。
 _SSRF_GUARD_DNS_FAIL_TTL = 30.0
 
+# 支持的浏览器内核（Playwright 规范名）。
+_SUPPORTED_BROWSER_TYPES = ("chromium", "firefox", "webkit")
+
+
+def _safe_float(value, default: float) -> float:
+    """float 配置解析：非法值回退默认（不阻断浏览器初始化）。"""
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        logger.warning("配置项数值非法（%r），已回退默认值 %s", value, default)
+        return default
+
+
+def _safe_bool(value, default: bool) -> bool:
+    """bool 配置解析：字符串 "false"/"0"/"off"/"no"/"" → False（语义归一）。"""
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "false", "0", "off", "no")
+    if value is None:
+        return default
+    return bool(value)
+
+
+def validate_browser_type(browser_type: str) -> str:
+    """校验浏览器内核配置并返回规范化值；非法值抛 ValueError（含可选值提示）。
+
+    大小写不敏感；"chrome" 归一为 "chromium"（Chrome 与 Chromium 同内核，
+    属最常见笔误）。启动前调用，避免 getattr 取到 None 后出现
+    "None.launch()" 这类无提示报错（v1.3.1）。
+    """
+    bt = str(browser_type or "").strip().lower()
+    if bt == "chrome":
+        bt = "chromium"
+    if bt not in _SUPPORTED_BROWSER_TYPES:
+        raise ValueError(
+            f"不支持的浏览器内核 browser_type={browser_type!r}，"
+            f"可选：{'/'.join(_SUPPORTED_BROWSER_TYPES)}"
+        )
+    return bt
+
 
 class BrowserCore:
     """Playwright 浏览器驱动。
@@ -63,14 +104,14 @@ class BrowserCore:
                 viewport / timeout / enable_screenshot / data_dir。
         """
         cfg = config or {}
-        self.browser_type: str = cfg.get("browser_type", "chromium")
-        self.proxy: str = cfg.get("proxy", "") or ""
+        self.browser_type: str = str(cfg.get("browser_type", "chromium"))
+        self.proxy: str = str(cfg.get("proxy", "") or "")
         self.viewport: dict = cfg.get("viewport") or {"width": 1280, "height": 800}
-        self.timeout: float = float(cfg.get("timeout", 30))
-        self.enable_screenshot: bool = bool(cfg.get("enable_screenshot", True))
+        self.timeout: float = _safe_float(cfg.get("timeout", 30), 30)
+        self.enable_screenshot: bool = _safe_bool(cfg.get("enable_screenshot", True), True)
         # 是否启用页面级 SSRF 兜底拦截（与 SafetyFilter.block_internal_ip 联动；
         # 关闭内网拦截时也不安装路由拦截，保持行为一致）。
-        self.block_internal_ip: bool = bool(cfg.get("block_internal_ip", True))
+        self.block_internal_ip: bool = _safe_bool(cfg.get("block_internal_ip", True), True)
         data_dir = cfg.get("data_dir") or str(Path(__file__).resolve().parent.parent / "data")
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -133,6 +174,9 @@ class BrowserCore:
             }
             if self.proxy:
                 launch_kwargs["proxy"] = {"server": self.proxy}
+            # 启动前校验内核配置：非法值给出可选值提示，避免
+            # getattr 返回 None 后 None.launch() 的无提示报错（v1.3.1）。
+            self.browser_type = validate_browser_type(self.browser_type)
             engine = getattr(self._playwright, self.browser_type)
             self._browser = await engine.launch(**launch_kwargs)
         except Exception:
