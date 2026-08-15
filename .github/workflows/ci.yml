@@ -21,4 +21,5 @@ jobs:
         run: pip install pytest docstring_parser aiohttp
       - name: Run tests
         run: |
-          python3 -c "import os; from pathlib import Path; ws=Path('/root/workspace'); print('uid:', os.getuid(), 'home:', os.path.expanduser('~')); print('ws is_dir:', ws.is_dir()); raise SystemExit(0 if ws.is_dir() else 9)" 
+          python -m pytest tests/test_fixes_v131.py::test_resolve_local_page_roots_env_extra -q --tb=long
+          exit $?
