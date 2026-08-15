@@ -21,6 +21,7 @@ jobs:
         run: pip install pytest docstring_parser aiohttp
       - name: Run tests
         run: |
-          python -m pytest tests/test_fixes_v131.py -k "browse_open or browse_get_text or browse_current_page or browse_new_tab or browse_click_link" --collect-only -q
-          exit 0
+          N=$(python -m pytest tests/test_fixes_v131.py -k "browse_open or browse_get_text or browse_current_page or browse_new_tab or browse_click_link" --collect-only -q | tail -1 | grep -oE '^[0-9]+' || echo 0)
+          echo "COLLECTED=$N"
+          if [ "$N" = "9" ]; then exit 0; else exit 9; fi
           exit 0
