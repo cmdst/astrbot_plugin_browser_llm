@@ -17,4 +17,8 @@ jobs:
       - name: Install test deps
         run: pip install pytest docstring_parser aiohttp
       - name: Run tests
-        run: python -m pytest tests/ -q
+        run: |
+          python -m pytest tests/ -q --tb=short -ra > /tmp/pt.txt 2>&1; RC=$?
+          echo "## Pytest Output" >> $GITHUB_STEP_SUMMARY
+          tail -120 /tmp/pt.txt >> $GITHUB_STEP_SUMMARY
+          exit $RC
