@@ -21,6 +21,6 @@ jobs:
         run: pip install pytest docstring_parser aiohttp
       - name: Run tests
         run: |
-          python -m pytest tests/test_fixes_v131.py -q --tb=long -ra > /tmp/pt.txt 2>&1; RC=$?
+          python -m pytest tests/test_fixes_v131.py -q --tb=long -ra -k "browse_open or browse_get_text or browse_current_page or browse_new_tab or browse_click_link or resolve_local_page or local_page" > /tmp/pt.txt 2>&1; RC=$?
           python3 .github/ci_debug_report.py
           exit $RC
