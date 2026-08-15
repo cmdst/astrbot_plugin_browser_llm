@@ -4,8 +4,8 @@
 - P1：browse_open / browse_get_text / browse_current_page / browse_new_tab /
   browse_click_link 对含禁词正文/标题返回【拒绝】（真实 _page_summary 与
   _check_banned，端到端链路）；
-- P2-3：browse_local_page 白名单包含平台工作区 /root/workspace 与环境变量
-  扩展根目录；
+- P2-3：browse_local_page 白名单包含平台工作区候选（tmp_path 模拟平台工作区，
+  不依赖宿主机 /root/workspace）与环境变量扩展根目录；
 - P2-4：extract_links 对链接文本做换行清洗（真实 ContentExtractor）；
 - P3-2：_redact_url 日志 URL 脱敏；
 - P3-7：browse_press_key 大小写不敏感；
@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 
+import main as plugin_main
 from core.browser import validate_browser_type
 from core.extract import ContentExtractor
 from core.safety import SafetyFilter
@@ -202,14 +203,25 @@ def test_browse_click_link_summary_blocks_banned_body():
 # P2-3：browse_local_page 白名单包含平台工作区
 # ================================================================
 
-def test_resolve_local_page_roots_includes_platform_workspace():
-    """平台工作区 /root/workspace 应加入白名单（真实环境目录存在）。"""
-    roots = _resolve_local_page_roots()
-    ws = Path("/root/workspace").resolve()
-    if ws.is_dir():
-        assert ws in roots, f"/root/workspace 应加入白名单，实际: {roots}"
-    else:
-        pytest.skip("平台工作区不存在，跳过")
+def test_resolve_local_page_roots_includes_platform_workspace(tmp_path, monkeypatch):
+    """平台工作区候选：存在即加入白名单，不存在则不加（环境解耦）。
+
+    不依赖宿主机 /root/workspace：用 tmp_path 子目录模拟平台工作区候选，
+    monkeypatch 替换 main._PLATFORM_WORKSPACE_CANDIDATES，CI 上真实执行。
+    """
+    candidate = tmp_path / "platform_workspace"
+    monkeypatch.setattr(plugin_main, "_PLATFORM_WORKSPACE_CANDIDATES", (candidate,))
+
+    # 候选目录不存在 → 「存在即加入」语义：不在白名单中
+    roots_missing = _resolve_local_page_roots()
+    assert candidate.resolve() not in roots_missing, \
+        f"不存在的候选目录不应加入白名单，实际: {roots_missing}"
+
+    # 创建目录后 → 应加入白名单（验证存在即加入语义）
+    candidate.mkdir()
+    roots_existing = _resolve_local_page_roots()
+    assert candidate.resolve() in roots_existing, \
+        f"已存在的候选目录应加入白名单，实际: {roots_existing}"
 
 
 def test_resolve_local_page_roots_env_extra(tmp_path, monkeypatch):
@@ -229,11 +241,16 @@ def test_resolve_local_page_roots_dedup():
     assert data_dir.resolve() in roots, "插件 data 目录应始终在列"
 
 
-def test_local_page_allows_platform_workspace_file():
-    """browse_local_page 白名单校验：平台工作区下的 HTML 放行（真实文件）。"""
-    ws = Path("/root/workspace")
-    if not ws.is_dir():
-        pytest.skip("平台工作区不存在，跳过")
+def test_local_page_allows_platform_workspace_file(tmp_path, monkeypatch):
+    """browse_local_page 白名单校验：平台工作区下的 HTML 放行（环境解耦）。
+
+    monkeypatch 将平台工作区候选指向 tmp_path 子目录并创建，模拟宿主机
+    /root/workspace 存在的情形，CI 上真实执行、不依赖宿主目录。
+    """
+    ws = tmp_path / "platform_workspace"
+    ws.mkdir()
+    monkeypatch.setattr(plugin_main, "_PLATFORM_WORKSPACE_CANDIDATES", (ws,))
+
     probe = ws / f".browser_llm_probe_{os.getpid()}.html"
     probe.write_text("<html><body>probe</body></html>", encoding="utf-8")
     try:
