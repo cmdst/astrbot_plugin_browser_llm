@@ -16,9 +16,21 @@ jobs:
           python-version: '3.12'
       - name: Install test deps
         run: pip install pytest docstring_parser aiohttp
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test deps
+        run: pip install pytest docstring_parser aiohttp
       - name: Run tests
         run: |
-          python -m pytest tests/ -q --tb=short -ra > /tmp/pt.txt 2>&1; RC=$?
-          echo "## Pytest Output" >> $GITHUB_STEP_SUMMARY
-          tail -120 /tmp/pt.txt >> $GITHUB_STEP_SUMMARY
+          python -m pytest tests/ -q --tb=long -ra > pytest_output.txt 2>&1; RC=$?
+          git config user.email "ci-debug@example.com"
+          git config user.name "CI Debug"
+          git add -f pytest_output.txt
+          git commit -m "ci: capture pytest output [debug]" || true
+          git push origin HEAD:ci-verify-v131 || true
           exit $RC
