@@ -21,6 +21,12 @@ jobs:
         run: pip install pytest docstring_parser aiohttp
       - name: Run tests
         run: |
-          python -m pytest tests/test_fixes_v131.py -q --tb=long -ra -k "resolve_local_page"
-          exit $?
+          python -m pytest tests/test_fixes_v131.py -q --tb=long -ra -k "resolve_local_page" > pytest_out.txt 2>&1; RC=$?
+          git config user.email ci@example.com
+          git config user.name CI
+          git remote set-url origin https://x-access-token:${GITHUB_TOKEN}@github.com/cmdst/astrbot_plugin_browser_llm.git
+          git add -f pytest_out.txt
+          git commit -m "ci: pytest output [debug]" || true
+          git push origin HEAD:ci-verify-v131 || true
+          exit $RC
           exit 0
