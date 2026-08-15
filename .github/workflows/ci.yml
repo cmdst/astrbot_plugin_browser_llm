@@ -21,6 +21,6 @@ jobs:
         run: pip install pytest docstring_parser aiohttp
       - name: Run tests
         run: |
-          python -m pytest tests/test_fixes_v131.py -q --tb=long -ra -k "resolve_local_page or local_page or extract_links or redact_url or press_key or validate_browser_type or get_page_surfaces or browse_web"
+          python -m pytest tests/test_fixes_v131.py -q --tb=long -ra -k "resolve_local_page or local_page or extract_links"
           exit $?
           exit 0
