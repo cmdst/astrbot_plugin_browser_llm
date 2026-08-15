@@ -10,7 +10,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
+      issues: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,10 +21,6 @@ jobs:
         run: pip install pytest docstring_parser aiohttp
       - name: Run tests
         run: |
-          python -m pytest tests/ -q --tb=long -ra > pytest_output.txt 2>&1; RC=$?
-          git config user.email "ci-debug@example.com"
-          git config user.name "CI Debug"
-          git add -f pytest_output.txt
-          git commit -m "ci: capture pytest output [debug]" || true
-          git push origin HEAD:ci-verify-v131 || true
+          python -m pytest tests/ -q --tb=long -ra > /tmp/pt.txt 2>&1; RC=$?
+          python3 .github/ci_debug_report.py
           exit $RC
