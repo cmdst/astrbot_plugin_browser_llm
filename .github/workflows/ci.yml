@@ -21,8 +21,6 @@ jobs:
         run: pip install pytest docstring_parser aiohttp
       - name: Run tests
         run: |
-          PY=$(python --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-          PT=$(python -m pytest --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-          echo "PY=$PY PT=$PT"
-          if [ "$PY" = "3.12.13" ] && [ "$PT" = "9.1.1" ]; then exit 0; else exit 9; fi
+          python -m pytest tests/test_fixes_v131.py -q --tb=long -ra -k "browse_open or browse_get_text or browse_current_page or browse_new_tab or browse_click_link"
+          exit $?
           exit 0
