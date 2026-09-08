@@ -109,13 +109,14 @@ text_image）。全文本子代理（前端/测试/工程等）读取本地 HTML
 
 ```bash
 cd astrbot_plugin_browser_llm
-python -m pytest tests/ -q    # 全量测试（370 passed）
+python -m pytest tests/ -q    # 全量测试（378 passed）
 ```
 
 测试覆盖：工具契约（docstring 与注册一致性）、感知模式前缀解析/规则匹配/优先级、
 识图缓存（TTL/URL 规范化/会话隔离/拒识不写缓存）、本地页面工具（感知参数/路径白名单/
 降级文本）、SSRF 与安全过滤、配置热更新、浏览器资源清理（shutdown 超时与 terminate
-顺序）。发布流程：commit → push main → 打 tag（如 `v1.3.0`）→ release.yml 自动
+顺序）、browse_checkbox 状态组合与子代理指令契约（无一次性任务残留、工具清单去重）。
+发布流程：commit → push main → 打 tag（如 `v1.3.2`）→ release.yml 自动
 打包发布（zip 已排除 `dist/`、`.github/`、`data/`、`__pycache__`）。
 
 ## 🤝 致谢

@@ -39,9 +39,24 @@ if TYPE_CHECKING:  # pragma: no cover — 仅类型检查
 # 插件注册名，与 metadata.yaml 的 name 一致；日志与管理命令判权时使用。
 METADATA_NAME = "astrbot_plugin_browser_llm"
 
-# 插件版本，与 metadata.yaml 的 version 保持一致（发布版本变更时两处同步修改；
-# 真实运行时 Star 实例无 self.metadata 属性，无法动态读取，故集中为单一常量）。
-PLUGIN_VERSION = "v1.3.1"
+# 插件版本：以 metadata.yaml 的 version 为单一事实源，模块加载时读取（真实
+# 运行时 Star 实例无 self.metadata 属性，无法动态读取；metadata.yaml 在插件
+# 目录中随发布流程维护，发布时只改这一处）。读取失败（文件缺失/无 version
+# 字段）时回退内置兜底值，保证插件在异常部署形态下仍可加载。
+_PLUGIN_VERSION_FALLBACK = "v1.3.2"
+
+try:
+    _metadata_text = (
+        Path(__file__).resolve().parent / "metadata.yaml"
+    ).read_text(encoding="utf-8")
+    _metadata_version = re.search(
+        r"^version:\s*['\"]?([^\s'\"]+)", _metadata_text, re.MULTILINE
+    )
+    PLUGIN_VERSION = (
+        _metadata_version.group(1) if _metadata_version else _PLUGIN_VERSION_FALLBACK
+    )
+except OSError:
+    PLUGIN_VERSION = _PLUGIN_VERSION_FALLBACK
 
 # terminate 资源清理总超时（秒）：超过则放弃等待并强制收尾，防止插件重载
 # 被悬挂的 close 阻塞（曾实测 browser.close 悬挂数小时，旧实例 chromium 进程
@@ -596,7 +611,6 @@ _BROWSER_AGENT_INSTRUCTION = (
     "- browse_input / browse_press_key：在页面输入文本 / 按键提交；\n"
     "- browse_scroll：滚动页面查看更多内容；\n"
     "- browse_reload：刷新页面；\n"
-    "- browse_zoom_crop：裁剪页面指定区域放大识图（读小字/图标/图表细节时用）；\n"
     "- browse_go_back / browse_go_forward：后退 / 前进；\n"
     "- browse_screenshot：截取页面截图发送给用户。\n\n"
     "操作原则：\n"
@@ -624,13 +638,12 @@ _BROWSER_AGENT_INSTRUCTION = (
     "9. 完成后用简洁中文总结浏览结果（URL、关键内容），不要暴露工具调用"
     "过程细节。\n\n"
     "提交后等待结果（重要）：\n"
-    "- 点击生成/提交按钮（如最后一题的『生成我的模型』）后，绝对不要"
-    "刷新页面、不要重开测试、不要后退，否则结果页会丢失；\n"
-    "- 用 browse_get_text / browse_current_page 反复读取当前页面，等待"
-    "结果出现。出现『模型匹配』『八维』『Human Model ID』『指纹』等"
-    "关键词即成功；每次读取间隔 5-8 秒，最多等待 60 秒；\n"
+    "- 点击生成/提交类按钮后，不要刷新页面、不要重新开始、不要后退，"
+    "避免结果页丢失；\n"
+    "- 用 browse_get_text / browse_current_page 周期性重读当前页面等待"
+    "结果出现，每次读取间隔 5-8 秒，最多等待 60 秒；\n"
     "- 若页面仍在生成中（进度指示/空白），继续等待重读，不要中途放弃；\n"
-    "- 拿到结果后，原样返回结果页文字（包含 Human Model ID 等关键信息）。"
+    "- 拿到结果后，原样返回结果页的关键文字。"
 )
 
 
@@ -2384,8 +2397,11 @@ class BrowserLLMPlugin(Star):
                 if page is None:
                     return f"【错误】{err}"
                 loc = page.locator(selector)
-                is_checked = loc.is_checked()
-                if bool(is_checked) != bool(checked):
+                # Playwright async API：is_checked() 是协程，必须 await；
+                # 漏 await 时 bool(coroutine) 恒为 True，会把「目标状态与
+                # 当前状态一致」误判为不一致而误点击（切换语义反转）。
+                is_checked = bool(await loc.is_checked())
+                if is_checked != bool(checked):
                     await loc.click()
                 logger.info(f"[{METADATA_NAME}] 已设置复选状态: {selector} -> {checked}")
                 return await self._page_summary(page)

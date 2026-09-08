@@ -4,6 +4,47 @@
 `data/` 目录（主仓库 .gitignore 忽略）迁移初始化而来。仅跟踪插件源码与测试，运行时
 数据（`data/`：截图、运行时配置、临时文件）一律不入库。
 
+## [v1.3.2] - 2026-09-06
+
+### 修复（工程缺陷清理）
+
+- **P1 browse_checkbox 漏 await**：`loc.is_checked()` 在 Playwright async API 中
+  返回协程，原实现未 await，`bool(coroutine)` 恒为 True——「目标状态与当前状态
+  一致」时误点击导致切换语义反转（如目标未勾选且当前已未勾选时被误选上）。
+  修复为 `await loc.is_checked()`；新增四种状态组合回归测试（fake locator 的
+  is_checked 返回真实协程，与 Playwright async API 行为一致）。
+- **子代理指令去重**：工具清单中 `browse_zoom_crop` 重复列出两次，删除一处
+  （「操作原则」中的用法提及保留）。
+- **一次性任务残留泛化**：子代理指令「提交后等待结果」段的站点专属关键词
+  （『生成我的模型』『模型匹配』『八维』『Human Model ID』『指纹』）移除，
+  保留通用等待策略（提交后不刷新/不后退，周期性重读页面，间隔 5-8 秒、最多
+  60 秒）；`_conf_schema.json` 中 agent_max_steps / agent_tool_timeout 的
+  「逐题作答15题」「完整做题」示例同步泛化为「多步表单、连续翻页」。
+- **版本单一事实源**：`PLUGIN_VERSION` 改为模块加载时从 `metadata.yaml` 的
+  `version` 推导（读取失败回退内置兜底值 `_PLUGIN_VERSION_FALLBACK`），发布
+  时只改 metadata.yaml 一处，消除双处手工同步（原注释自认的维护负担）。
+- **仓库卫生**：删除插件根目录 `browser.py`（`core/browser.py` 的旧版死副本，
+  缺 `_safe_float` 等修复且无任何引用）；清理 `data/cmd_config.json`（宿主
+  AstrBot 配置快照）与 `data/t2i_templates/`（宿主 t2i 模板）部署迁移残留及
+  `__pycache__` 编译残留（.gitignore 均已覆盖，仅工作区清理）。
+
+### 测试
+
+- 新增 `tests/test_fixes_v132.py`（8 例）：browse_checkbox 四种状态组合
+  （状态一致不点击 / 不一致才点击）、指令无一次性任务残留、通用等待策略
+  保留、zoom_crop 工具清单去重、PLUGIN_VERSION 与 metadata.yaml 一致；
+- 全量回归：`python -m pytest tests/ -q` → **378 passed**（原 370 + 8 新增）。
+
+## [运维] - 2026-08-18 空闲回收参数调整（非源码变更）
+
+- `data/config/astrbot_plugin_browser_llm_config.json` 的 `idle_timeout`：1200 -> 900
+  （SRE 2026-08-17 内存优化建议 B1，加快 chromium 空闲会话回收）。改前备份
+  （backup.sh）：astrbot_plugin_browser_llm_config_idle_timeout_20260818_064945.json
+- 生效链路：插件加载时 `_load_config()`（main.py:723）-> `SessionManager(idle_timeout=...)`
+  （main.py:849-852）；热同步 `_refresh_config()`（main.py:825）由 handler 触发。
+  直接改配置文件需插件重载或 astrbot 重启后读入内存；运行期 Dashboard 重新保存
+  配置亦可触发热同步。源码与 schema 默认值（1800）未动。
+
 ## [v1.3.1] - 2026-08-16
 
 ### 修复（QA 查缺补漏：1×P1 + 6×P2 + 低风险 P3）
