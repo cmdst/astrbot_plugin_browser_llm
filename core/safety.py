@@ -25,15 +25,15 @@ _ALLOWED_SCHEMES = ("http", "https")
 
 # 内网 / 保留地址网段（SSRF 黑名单）。
 _INTERNAL_NETWORKS = (
-    ipaddress.ip_network("127.0.0.0/8"),      # IPv4 环回
-    ipaddress.ip_network("10.0.0.0/8"),       # 私网 A 段
-    ipaddress.ip_network("172.16.0.0/12"),    # 私网 B 段
-    ipaddress.ip_network("192.168.0.0/16"),   # 私网 C 段
-    ipaddress.ip_network("169.254.0.0/16"),   # 链路本地（APIPA）
-    ipaddress.ip_network("0.0.0.0/32"),       # 未指定地址
-    ipaddress.ip_network("::1/128"),          # IPv6 环回
-    ipaddress.ip_network("fe80::/10"),        # IPv6 链路本地
-    ipaddress.ip_network("fc00::/7"),         # IPv6 唯一本地（ULA）
+    ipaddress.ip_network("127.0.0.0/8"),  # IPv4 环回
+    ipaddress.ip_network("10.0.0.0/8"),  # 私网 A 段
+    ipaddress.ip_network("172.16.0.0/12"),  # 私网 B 段
+    ipaddress.ip_network("192.168.0.0/16"),  # 私网 C 段
+    ipaddress.ip_network("169.254.0.0/16"),  # 链路本地（APIPA）
+    ipaddress.ip_network("0.0.0.0/32"),  # 未指定地址
+    ipaddress.ip_network("::1/128"),  # IPv6 环回
+    ipaddress.ip_network("fe80::/10"),  # IPv6 链路本地
+    ipaddress.ip_network("fc00::/7"),  # IPv6 唯一本地（ULA）
 )
 
 
@@ -179,7 +179,11 @@ class SafetyFilter:
             return False, f"URL 解析失败: {url}", None
         scheme = (parsed.scheme or "").lower()
         if scheme not in _ALLOWED_SCHEMES:
-            return False, f"仅允许 http/https 协议，收到: {scheme or '（无协议）'}", None
+            return (
+                False,
+                f"仅允许 http/https 协议，收到: {scheme or '（无协议）'}",
+                None,
+            )
         hostname = parsed.hostname  # urlparse 已剥离 IPv6 字面量的方括号
         if not hostname:
             return False, "URL 缺少主机名", None

@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 if TYPE_CHECKING:  # pragma: no cover — 仅类型检查，运行时永不导入
     from playwright.async_api import Browser, Page, Playwright
 
+from . import as_bool, as_float
 from .safety import acheck_hostname_internal
 
 logger = logging.getLogger(__name__)
@@ -44,26 +45,6 @@ _SSRF_GUARD_DNS_FAIL_TTL = 30.0
 
 # 支持的浏览器内核（Playwright 规范名）。
 _SUPPORTED_BROWSER_TYPES = ("chromium", "firefox", "webkit")
-
-
-def _safe_float(value, default: float) -> float:
-    """float 配置解析：非法值回退默认（不阻断浏览器初始化）。"""
-    if value is None or value == "":
-        return default
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        logger.warning("配置项数值非法（%r），已回退默认值 %s", value, default)
-        return default
-
-
-def _safe_bool(value, default: bool) -> bool:
-    """bool 配置解析：字符串 "false"/"0"/"off"/"no"/"" → False（语义归一）。"""
-    if isinstance(value, str):
-        return value.strip().lower() not in ("", "false", "0", "off", "no")
-    if value is None:
-        return default
-    return bool(value)
 
 
 def validate_browser_type(browser_type: str) -> str:
@@ -107,12 +88,14 @@ class BrowserCore:
         self.browser_type: str = str(cfg.get("browser_type", "chromium"))
         self.proxy: str = str(cfg.get("proxy", "") or "")
         self.viewport: dict = cfg.get("viewport") or {"width": 1280, "height": 800}
-        self.timeout: float = _safe_float(cfg.get("timeout", 30), 30)
-        self.enable_screenshot: bool = _safe_bool(cfg.get("enable_screenshot", True), True)
+        self.timeout: float = as_float(cfg.get("timeout", 30), 30)
+        self.enable_screenshot: bool = as_bool(cfg.get("enable_screenshot", True), True)
         # 是否启用页面级 SSRF 兜底拦截（与 SafetyFilter.block_internal_ip 联动；
         # 关闭内网拦截时也不安装路由拦截，保持行为一致）。
-        self.block_internal_ip: bool = _safe_bool(cfg.get("block_internal_ip", True), True)
-        data_dir = cfg.get("data_dir") or str(Path(__file__).resolve().parent.parent / "data")
+        self.block_internal_ip: bool = as_bool(cfg.get("block_internal_ip", True), True)
+        data_dir = cfg.get("data_dir") or str(
+            Path(__file__).resolve().parent.parent / "data"
+        )
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -189,8 +172,11 @@ class BrowserCore:
                     pass
                 self._playwright = None
             raise
-        logger.debug("ensure_browser 完成: type=%s proxy=%s",
-                     self.browser_type, self.proxy or "(直连)")
+        logger.debug(
+            "ensure_browser 完成: type=%s proxy=%s",
+            self.browser_type,
+            self.proxy or "(直连)",
+        )
 
     def _browser_alive(self) -> bool:
         """浏览器是否存活且已连接（崩溃/手动关闭后返回 False）。"""
@@ -223,7 +209,8 @@ class BrowserCore:
                 except asyncio.TimeoutError:
                     logger.warning(
                         "[%s] browser.close 超时（%.1fs），继续执行清理",
-                        tag, _BROWSER_CLOSE_TIMEOUT,
+                        tag,
+                        _BROWSER_CLOSE_TIMEOUT,
                     )
                 except Exception as e:  # noqa: BLE001
                     logger.warning("[%s] 关闭浏览器失败（继续执行清理）: %s", tag, e)
@@ -234,7 +221,9 @@ class BrowserCore:
                     )
                 except asyncio.TimeoutError:
                     logger.warning(
-                        "[%s] playwright.stop 超时（%.1fs）", tag, _BROWSER_CLOSE_TIMEOUT
+                        "[%s] playwright.stop 超时（%.1fs）",
+                        tag,
+                        _BROWSER_CLOSE_TIMEOUT,
                     )
                 except Exception as e:  # noqa: BLE001
                     logger.warning("[%s] 停止 playwright 失败（忽略）: %s", tag, e)
@@ -263,8 +252,10 @@ class BrowserCore:
         page = None
         try:
             context = await self._browser.new_context(
-                viewport={"width": int(self.viewport.get("width", 1280)),
-                          "height": int(self.viewport.get("height", 800))}
+                viewport={
+                    "width": int(self.viewport.get("width", 1280)),
+                    "height": int(self.viewport.get("height", 800)),
+                }
             )
             page = await context.new_page()
             page.set_default_timeout(self.timeout * 1000)
@@ -319,9 +310,7 @@ class BrowserCore:
                     await route.continue_()
                     return
                 if await self._ssrf_host_is_internal(hostname):
-                    logger.warning(
-                        "SSRF 兜底拦截内网请求: %s -> %s", url, hostname
-                    )
+                    logger.warning("SSRF 兜底拦截内网请求: %s -> %s", url, hostname)
                     await route.abort("blockedbyclient")
                 else:
                     await route.continue_()
@@ -347,11 +336,7 @@ class BrowserCore:
         if cached is not None and cached[0] > now:
             return cached[1]
         verdict = await acheck_hostname_internal(hostname)
-        ttl = (
-            _SSRF_GUARD_CACHE_TTL
-            if verdict is not None
-            else _SSRF_GUARD_DNS_FAIL_TTL
-        )
+        ttl = _SSRF_GUARD_CACHE_TTL if verdict is not None else _SSRF_GUARD_DNS_FAIL_TTL
         self._ssrf_host_cache[hostname] = (now + ttl, bool(verdict))
         return bool(verdict)
 
@@ -375,7 +360,9 @@ class BrowserCore:
             try:
                 await asyncio.wait_for(ctx.close(), timeout=_PAGE_CLOSE_TIMEOUT)
             except asyncio.TimeoutError:
-                logger.warning("[%s] 关闭 context 超时（%.1fs，忽略）", tag, _PAGE_CLOSE_TIMEOUT)
+                logger.warning(
+                    "[%s] 关闭 context 超时（%.1fs，忽略）", tag, _PAGE_CLOSE_TIMEOUT
+                )
             except Exception as e:  # noqa: BLE001
                 logger.warning("[%s] 关闭 context 失败（忽略）: %s", tag, e)
 

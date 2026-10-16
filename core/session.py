@@ -150,7 +150,7 @@ class SessionManager:
         page = None
         try:
             page = await self.browser.new_page()
-            await page.goto(url, wait_until='domcontentloaded')
+            await page.goto(url, wait_until="domcontentloaded")
             return page
         except Exception as e:  # noqa: BLE001 — 创建失败不抛出
             logger.warning("创建标签页失败: %s", e)
@@ -202,7 +202,9 @@ class SessionManager:
 
             # 总标签数达上限 → 拒绝新标签。
             if self._total_tabs() >= self.max_pages:
-                logger.warning("标签总数达上限 %d，拒绝新建（umo=%s）", self.max_pages, umo)
+                logger.warning(
+                    "标签总数达上限 %d，拒绝新建（umo=%s）", self.max_pages, umo
+                )
                 capacity_ok = False
 
         # 锁外：失效页无论能否新建都必须关闭（防 context 泄漏）。
@@ -234,14 +236,18 @@ class SessionManager:
             if self._total_tabs() >= self.max_pages:
                 # 锁外等待期间额度被其他会话占满：关闭刚建的页，拒绝。
                 await self._close_page(umo, page)
-                logger.warning("标签总数达上限 %d，拒绝新建（umo=%s）", self.max_pages, umo)
+                logger.warning(
+                    "标签总数达上限 %d，拒绝新建（umo=%s）", self.max_pages, umo
+                )
                 return None
             self._pages.setdefault(umo, []).append(page)
             self._active[umo] = len(self._pages[umo]) - 1
             self._touch(umo)
             logger.info(
                 "新建浏览会话标签 umo=%s（标签 %d/%d）",
-                umo, self._total_tabs(), self.max_pages,
+                umo,
+                self._total_tabs(),
+                self.max_pages,
             )
             logger.debug("ensure_page 返回")
             return page
@@ -280,7 +286,9 @@ class SessionManager:
             if self._total_tabs() >= self.max_pages:
                 # 锁外等待期间额度被其他会话占满：关闭刚建的页，拒绝。
                 await self._close_page(umo, page)
-                logger.warning("标签总数达上限 %d，拒绝新标签（umo=%s）", self.max_pages, umo)
+                logger.warning(
+                    "标签总数达上限 %d，拒绝新标签（umo=%s）", self.max_pages, umo
+                )
                 return None
             pages = self._pages.setdefault(umo, [])
             pages.append(page)
@@ -378,8 +386,7 @@ class SessionManager:
             return 0
         now = time.monotonic()
         expired = [
-            umo for umo, ts in self._last_active.items()
-            if now - ts > self.idle_timeout
+            umo for umo, ts in self._last_active.items() if now - ts > self.idle_timeout
         ]
         reclaimed_umos = []
         for umo in expired:
@@ -413,7 +420,9 @@ class SessionManager:
                 except Exception as e:  # noqa: BLE001 — 单轮失败不退出循环
                     logger.warning("空闲回收任务异常（继续下一轮）: %s", e)
 
-        self._sweeper_task = asyncio.create_task(_loop(), name="browser-session-sweeper")
+        self._sweeper_task = asyncio.create_task(
+            _loop(), name="browser-session-sweeper"
+        )
         logger.info("会话空闲回收任务已启动（周期 %.0fs）", _SWEEP_INTERVAL)
 
     async def stop_sweeper(self) -> None:

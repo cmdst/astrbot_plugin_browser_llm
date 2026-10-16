@@ -46,6 +46,12 @@
       "病毒"
     ]
   },
+  "enable_banned_filter": {
+    "type": "bool",
+    "description": "启用内容审核（禁词过滤）",
+    "hint": "内容审核总开关。开启时命中 banned_words 的网页正文/标题/搜索词/URL/识图结果会被拦截；关闭后不再因禁词拦截内容，适合论坛等敏感词密集站点（避免整页被拒）。不影响内网拦截、本地页路径白名单等安全边界。",
+    "default": true
+  },
   "block_internal_ip": {
     "type": "bool",
     "description": "拦截内网地址",

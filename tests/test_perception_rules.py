@@ -2,7 +2,8 @@
 
 覆盖：
 - A. 工具参数级感知模式：browse_web input 前缀解析（大小写不敏感、
-  空格/换行分隔、非法值忽略并告警、未带前缀回落）、本次任务覆盖全局；
+  空格/换行分隔、非法值忽略并告警——v1.3.3 起含等号后空值、未带前缀
+  回落）、本次任务覆盖全局；
 - B. 会话规则级默认：perception_rules 按 UMO 子串匹配（不区分大小写）、
   第一条命中、优先级 显式参数 > 规则 > 全局、非法规则跳过并告警；
 - 端到端：browse_web 传 perception=text 时传给 tool_loop_agent 的
@@ -131,6 +132,35 @@ def test_parse_prefix_invalid_textimage_value_warned(monkeypatch):
     assert mode is None
     assert rest == "打开页面"
     assert warns
+
+
+def test_parse_prefix_empty_value_stripped_with_warning(monkeypatch):
+    """v1.3.3：perception=（等号后空值）同样按非法前缀剔除并告警。"""
+    plugin = _make_plugin()
+    warns = _capture_logger(monkeypatch, "warning")
+    mode, rest = plugin._parse_perception_prefix("perception= 打开页面")
+    assert mode is None
+    assert rest == "打开页面"
+    assert warns
+    assert "非法" in warns[0]
+
+
+def test_parse_prefix_empty_value_newline_task_kept(monkeypatch):
+    """perception= 后换行再接任务：前缀剔除，任务描述保留。"""
+    plugin = _make_plugin()
+    warns = _capture_logger(monkeypatch, "warning")
+    mode, rest = plugin._parse_perception_prefix("perception=\n打开页面")
+    assert mode is None
+    assert rest == "打开页面"
+    assert warns
+
+
+def test_parse_prefix_bare_word_not_prefix():
+    """裸 perception（无 =）不是前缀：原样作为任务文本，不受影响。"""
+    plugin = _make_plugin()
+    mode, rest = plugin._parse_perception_prefix("perception 这个词出现在任务里")
+    assert mode is None
+    assert rest == "perception 这个词出现在任务里"
 
 
 # ------------------------------------------------------------

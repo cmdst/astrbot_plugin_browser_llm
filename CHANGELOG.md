@@ -4,6 +4,57 @@
 `data/` 目录（主仓库 .gitignore 忽略）迁移初始化而来。仅跟踪插件源码与测试，运行时
 数据（`data/`：截图、运行时配置、临时文件）一律不入库。
 
+## [v1.3.3] - 2026-09-06
+
+### 特性：内容审核总开关（enable_banned_filter）
+
+- 新增配置 `enable_banned_filter`（bool，默认 true）：内容审核总开关。
+  关闭后 `_check_banned` 统一放行，所有禁词拦截点（网页正文/标题/搜索
+  关键词/URL/browse_web 任务描述/本地页面/截图与裁剪识图结果）不再因
+  banned_words 拦截内容——论坛等敏感词密集站点可关闭，避免整页被拒；
+  Dashboard 保存配置热生效（经 `_refresh_config` → `_load_config`）。
+- **不影响安全边界**：SSRF 内网拦截（`acheck_url`/页面级兜底路由）、
+  本地页路径白名单、会话黑白名单均不受此开关影响。
+- 激活日志新增开关状态输出（开启/关闭）。
+
+### 修复
+
+- **P1 识图结果禁词旁路**：`browse_screenshot` / `browse_zoom_crop` 的
+  识图结果此前直接返回、未过禁词——违禁正文可经截图识图透传给 LLM/
+  用户，与 `_conf_schema.json` 承诺（禁词内容禁止返回）不一致。修复：
+  识图描述返回前过 `_check_banned`（命中返回【拒绝】文案），对齐
+  `browse_local_page` 既有做法；受 `enable_banned_filter` 总开关控制。
+- **感知前缀空值边界**：`perception=`（等号后空值）此前既不匹配合法
+  前缀也不匹配非法前缀正则 `\S+`，整段被当任务文本且无告警。修复：
+  `_INVALID_PERCEPTION_PREFIX_RE` 改为 `^perception\s*=(?:\S+\s*|\s*)`
+  分支剔除——非法值非空时连同值一并剔除（既有语义不变），空值时仅
+  剔除前缀形态与空白、保留任务文本；均记录 warning 并回落默认链路。
+
+### 优化
+
+- **配置解析双实现收敛**：main.py 的 `_as_int/_as_float/_as_bool` 与
+  core/browser.py 的 `_safe_float/_safe_bool` 为同构双实现（双命名漂移
+  风险），统一收敛至 `core/__init__.py` 的 `as_int/as_float/as_bool`；
+  main.py 三个方法改为委托，BrowserCore 改用共享实现。
+- **Windows 兼容**：`BROWSER_LLM_EXTRA_LOCAL_ROOTS` 由硬编码冒号分隔
+  改为 `os.pathsep`（Linux/macOS 行为不变，Windows 支持分号与盘符路径）。
+- **类型收紧**：`max_chars` / `max_links` 配置解析由 `_as_float` 改为
+  `_as_int`（与 schema 声明的 int 一致）。
+- **日志风格**：terminate 超时日志由 f-string 内嵌 `%.1fs` 位置参数改为
+  纯 f-string 格式化。
+
+### 测试
+
+- 新增 `tests/test_banned_switch.py`（12 例）：开关默认开启且命中返回
+  禁词、关闭后 `_check_banned` 恒 None、`_page_summary` 关闭后透传 /
+  开启后拒绝、browse_screenshot / browse_zoom_crop 识图含禁词时默认
+  拒绝且关闭后放行、非法配置值回退默认、`_refresh_config` 热更新开关、
+  关闭开关不影响 SSRF（`acheck_url` 仍拦截内网）；
+- `tests/test_perception_rules.py` 新增 3 例：`perception=` 空值剔除 +
+  告警 + 任务保留、空值后换行接任务、裸 perception（无 =）不受影响；
+- 全量回归：`python -m pytest tests/ -q` → **393 passed**（378 基线
+  + 15 新增）。
+
 ## [v1.3.2] - 2026-09-06
 
 ### 修复（工程缺陷清理）

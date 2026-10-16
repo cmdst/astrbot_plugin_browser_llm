@@ -66,7 +66,9 @@ class ContentExtractor:
         try:
             raw = await page.inner_text("body")
         except Exception as e:  # noqa: BLE001 — playwright 异常需全部兜底
-            logger.debug("inner_text('body') 失败，降级取 document.body.innerText: %s", e)
+            logger.debug(
+                "inner_text('body') 失败，降级取 document.body.innerText: %s", e
+            )
             try:
                 raw = await page.evaluate(_FALLBACK_INNERTEXT_JS)
             except Exception as e2:  # noqa: BLE001

@@ -8,13 +8,13 @@ Agent 驱动的网页浏览插件 —— 让 LLM 通过 function-calling 自主�
 - **完整网页交互**：打开网页、提取正文/链接、按文本/坐标点击、填表、按键、滚动、滑块、下拉框、复选框、标签页管理
 - **识图辅助**：接入多模态模型（如 opencode-go/mimo-v2.5）对截图做视觉理解，支持区域裁剪放大识图（`browse_zoom_crop`）
 - **媒体嗅探**：从页面嗅探图片/视频资源，下载并发送到群聊（`browse_sniff_media`）
-- **本地页面自检**：`browse_local_page` 渲染查看本地 HTML 供子代理/开发者自检页面（无头渲染 + 截图 + 视觉描述，视觉不可用时降级文本提取；路径白名单为工作区（AstrBot 工作区 + 平台工作区，如 `/root/workspace`）+ 插件 data 目录，可用环境变量 `BROWSER_LLM_EXTRA_LOCAL_ROOTS`（冒号分隔）追加额外根目录；支持 `perception` 参数按任务控制感知方式——全文本子代理读文档/报错页可传 `perception="text"` 跳过截图识图）
+- **本地页面自检**：`browse_local_page` 渲染查看本地 HTML 供子代理/开发者自检页面（无头渲染 + 截图 + 视觉描述，视觉不可用时降级文本提取；路径白名单为工作区（AstrBot 工作区 + 平台工作区，如 `/root/workspace`）+ 插件 data 目录，可用环境变量 `BROWSER_LLM_EXTRA_LOCAL_ROOTS`（按系统路径分隔符分隔，Linux/macOS 为冒号、Windows 为分号）追加额外根目录；支持 `perception` 参数按任务控制感知方式——全文本子代理读文档/报错页可传 `perception="text"` 跳过截图识图）
 - **静默模式**：浏览截图仅内部识图，不往群聊刷图（`silent_mode`）
 - **感知模式精细化**：页面感知方式可精确控制——`browse_web` 参数级前缀 `perception=text|text_image|image` 按任务覆盖、`perception_rules` 按会话（UMO 子串匹配）设定默认、全局 `page_perception` 兜底；全文本子代理（前端/测试等）不再为每次浏览付出截图识图开销
 - **识图缓存**：同一 URL（去 fragment/尾斜杠规范化）在 `vision_cache_ttl` 内重复识图直接复用结果（带 `[缓存]` 前缀），省识图耗时与 token
 - **配置热更新**：会话黑白名单、内容禁词、内网拦截开关、截图开关、识图 Provider、感知规则等修改后无需重启，下次工具调用即生效（Dashboard 保存即同步）
 - **资源清理加固**：浏览器关闭/插件重载带超时保护与总超时兜底，避免 WebUI 重载后旧实例 chromium 残留进程
-- **安全防护**：SSRF 内网拦截、内容禁词过滤、图形验证码自动停止、下载大小上限
+- **安全防护**：SSRF 内网拦截、内容禁词过滤（`enable_banned_filter` 总开关，敏感词密集站点可关闭）、图形验证码自动停止、下载大小上限
 
 ## 🏗️ 架构
 
@@ -64,7 +64,8 @@ Agent 驱动的网页浏览插件 —— 让 LLM 通过 function-calling 自主�
 | `viewport` | 1280×800 | 浏览器视口尺寸 |
 | `agent_max_steps` | 70 | 子代理单次委托最大工具步数 |
 | `agent_tool_timeout` | 1200 | 子代理单次工具超时（秒） |
-| `banned_words` | 11 词 | 内容禁词过滤：URL / 搜索关键词 / 本地页面 / 网页正文与标题 / browse_web 任务描述命中均拒绝返回 |
+| `banned_words` | 11 词 | 内容禁词过滤：URL / 搜索关键词 / 本地页面 / 网页正文与标题 / browse_web 任务描述 / 截图识图结果命中均拒绝返回（受 `enable_banned_filter` 总开关控制） |
+| `enable_banned_filter` | true | 内容审核总开关（v1.3.3）：关闭后不再因禁词拦截网页内容/搜索词/识图结果，适合论坛等敏感词密集站点（避免整页被拒）；不影响内网拦截/路径白名单等安全边界 |
 | `block_internal_ip` | true | SSRF 防护（拦截内网/环回/云元数据地址） |
 
 > 类型健壮性（v1.3.1）：数值/布尔配置遇非法值（字符串、None、类型错误）自动回退
@@ -80,7 +81,7 @@ Agent 驱动的网页浏览插件 —— 让 LLM 通过 function-calling 自主�
    仅本次任务生效。例：`perception=text 打开 https://example.com 读取正文`
    （纯文字模式，绝对不触发截图识图，适合读文档/查报错/看代码）；
    `perception=image 看看这个页面长什么样`（截图为主）。
-   非法值（如 `perception=foo`）会被忽略并记录告警，回落到规则/全局配置。
+   非法值（如 `perception=foo`、`perception=` 等号后空值）会被忽略并记录告警，回落到规则/全局配置。
 2. **会话规则级（按 UMO 默认）**：配置 `perception_rules`，按会话 UMO 子串匹配
    （不区分大小写）设定默认模式，命中第一条生效。例：
    `[{"match": "tester", "perception": "text"}]` 后，UMO 含 `tester` 的会话
@@ -109,7 +110,7 @@ text_image）。全文本子代理（前端/测试/工程等）读取本地 HTML
 
 ```bash
 cd astrbot_plugin_browser_llm
-python -m pytest tests/ -q    # 全量测试（378 passed）
+python -m pytest tests/ -q    # 全量测试（393 passed）
 ```
 
 测试覆盖：工具契约（docstring 与注册一致性）、感知模式前缀解析/规则匹配/优先级、
