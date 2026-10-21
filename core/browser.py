@@ -21,6 +21,7 @@ if TYPE_CHECKING:  # pragma: no cover — 仅类型检查，运行时永不导�
     from playwright.async_api import Browser, Page, Playwright
 
 from . import as_bool, as_float
+from .config_map import ConfigView
 from .safety import acheck_hostname_internal
 
 logger = logging.getLogger(__name__)
@@ -85,14 +86,24 @@ class BrowserCore:
                 viewport / timeout / enable_screenshot / data_dir。
         """
         cfg = config or {}
-        self.browser_type: str = str(cfg.get("browser_type", "chromium"))
-        self.proxy: str = str(cfg.get("proxy", "") or "")
-        self.viewport: dict = cfg.get("viewport") or {"width": 1280, "height": 800}
-        self.timeout: float = as_float(cfg.get("timeout", 30), 30)
-        self.enable_screenshot: bool = as_bool(cfg.get("enable_screenshot", True), True)
+        view = ConfigView(cfg)
+        self.browser_type: str = str(view.get("browser.type", "chromium"))
+        self.proxy: str = str(view.get("browser.proxy", "") or "")
+        self.viewport: dict = view.get("browser.viewport") or {
+            "width": 1280,
+            "height": 800,
+        }
+        self.timeout: float = as_float(view.get("browser.timeout", 30), 30)
+        self.enable_screenshot: bool = as_bool(
+            view.get("perception.enable_screenshot", True), True
+        )
         # 是否启用页面级 SSRF 兜底拦截（与 SafetyFilter.block_internal_ip 联动；
         # 关闭内网拦截时也不安装路由拦截，保持行为一致）。
-        self.block_internal_ip: bool = as_bool(cfg.get("block_internal_ip", True), True)
+        self.block_internal_ip: bool = as_bool(
+            view.get("security.block_internal_ip", True), True
+        )
+        # data_dir 是插件 initialize() 注入的运行时路径，不是 schema 配置键，
+        # 因此不进 KEY_MAP，也不走 ConfigView。
         data_dir = cfg.get("data_dir") or str(
             Path(__file__).resolve().parent.parent / "data"
         )

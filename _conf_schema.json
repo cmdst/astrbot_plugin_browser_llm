@@ -1,224 +1,602 @@
 {
-  "browser_type": {
-    "type": "string",
-    "description": "浏览器引擎类型",
-    "hint": "驱动网页浏览使用的 Playwright 浏览器内核。chromium 兼容性最好，firefox/webkit 视环境支持情况选择。",
-    "options": [
-      "chromium",
-      "firefox",
-      "webkit"
-    ],
-    "default": "chromium"
-  },
-  "default_url": {
-    "type": "string",
-    "description": "默认起始页",
-    "hint": "会话首次打开浏览器时加载的地址；Agent 通常会根据用户问题导航到目标页，此地址仅作兜底。",
-    "default": "https://www.baidu.com"
-  },
-  "default_search_engine": {
-    "type": "string",
-    "description": "默认搜索引擎",
-    "hint": "Agent 执行搜索时使用的搜索引擎。",
-    "options": [
-      "必应搜索",
-      "百度搜索",
-      "谷歌搜索",
-      "B站搜索"
-    ],
-    "default": "必应搜索"
-  },
-  "banned_words": {
-    "type": "list",
-    "description": "内容禁词列表",
-    "hint": "命中这些关键词的网页内容 / 搜索结果会被安全过滤拦截，禁止返回给 LLM 与用户。",
-    "default": [
-      "pornhub",
-      "色情",
-      "成人",
-      "赌博",
-      "暴力",
-      "政治",
-      "反动",
-      "恐怖",
-      "谣言",
-      "诈骗",
-      "病毒"
-    ]
-  },
-  "enable_banned_filter": {
-    "type": "bool",
-    "description": "启用内容审核（禁词过滤）",
-    "hint": "内容审核总开关。开启时命中 banned_words 的网页正文/标题/搜索词/URL/识图结果会被拦截；关闭后不再因禁词拦截内容，适合论坛等敏感词密集站点（避免整页被拒）。不影响内网拦截、本地页路径白名单等安全边界。",
-    "default": true
-  },
-  "block_internal_ip": {
-    "type": "bool",
-    "description": "拦截内网地址",
-    "hint": "开启后拒绝访问内网/本机地址（如 127.0.0.1、192.168.x.x），防止 SSRF 风险。关闭后不拦截内网地址（不推荐）。",
-    "default": true
-  },
-  "max_chars": {
-    "type": "int",
-    "description": "单页正文提取上限（字符）",
-    "hint": "每次提取网页正文时最多返回的字符数，超长内容按此截断，控制注入 token 消耗。",
-    "default": 4000
-  },
-  "max_links": {
-    "type": "int",
-    "description": "单页链接提取上限",
-    "hint": "每次提取网页时最多返回多少条链接供 Agent 选择点击。",
-    "default": 20
-  },
-  "timeout": {
-    "type": "int",
-    "description": "页面操作超时（秒）",
-    "hint": "页面加载、点击、搜索等单次浏览器操作的超时时间。",
-    "default": 30
-  },
-  "max_pages": {
-    "type": "int",
-    "description": "所有会话标签页总数上限",
-    "hint": "所有浏览会话合计最多可同时打开的标签页数量（全局上限），达到上限后新标签/新会话将被拒绝，防止 Agent 无限开标签消耗资源。",
-    "default": 5
-  },
-  "idle_timeout": {
-    "type": "int",
-    "description": "会话空闲回收时间（秒）",
-    "hint": "浏览会话闲置超过该秒数后自动关闭，释放浏览器资源。",
-    "default": 1800
-  },
-  "session_whitelist": {
-    "type": "list",
-    "description": "会话白名单",
-    "hint": "仅允许在这些会话中使用浏览能力。每个条目可以是完整 UMO（用 /sid 获取）或群号/用户 ID。匹配为精确匹配（按 : 或 | 切分后逐字段比对，或与完整 UMO 整体相等），黑名单如 '123' 不会误伤群 '1234'。留空表示允许全部会话",
-    "default": []
-  },
-  "session_blacklist": {
-    "type": "list",
-    "description": "会话黑名单",
-    "hint": "禁止在这些会话中使用浏览能力。格式同白名单（完整 UMO 或群号/用户 ID，精确匹配）。黑名单优先级高于白名单",
-    "default": []
-  },
-  "enable_screenshot": {
-    "type": "bool",
-    "description": "启用页面截图",
-    "hint": "开启后浏览网页时截取页面截图返回给用户；关闭后仅返回文字内容。",
-    "default": true
-  },
-  "vision_provider_id": {
-    "type": "string",
-    "description": "多模态识图模型 Provider ID",
-    "hint": "下拉选择多模态模型对截图做识图总结；留空则截图仅发用户不做识图。下拉选项自动同步 AstrBot 已配置的聊天模型 Provider（插件启动时与每次识图调用时刷新，无需手动编辑本文件）；若列表中没有你的识图模型，请先在 AstrBot 模型配置中添加对应 Provider。",
-    "options": [
-      ""
-    ],
-    "default": ""
-  },
-  "vision_prompt": {
-    "type": "string",
-    "description": "识图提示词模板",
-    "hint": "发给多模态模型的识图提示词，可自定义以提升识图准确性。留空使用默认提示词",
-    "editor_mode": true,
-    "editor_language": "text",
-    "editor_theme": "vs-light",
-    "default": "请用中文描述这张网页截图的重点内容，包括主要文字、按钮、链接和页面结构。"
-  },
-  "silent_mode": {
-    "type": "bool",
-    "description": "静默模式",
-    "hint": "开启后浏览截图仅内部识图，不发送到群聊（减少刷屏）；关闭后截图会发送给用户",
-    "default": true
-  },
-  "page_perception": {
-    "type": "string",
-    "description": "页面感知方式",
-    "hint": "text=仅文字读取（最快，不用截图识图）；text_image=文字为主+必要时截图识图（平衡，推荐）；image=以截图识图为主",
-    "options": [
-      "text",
-      "text_image",
-      "image"
-    ],
-    "default": "text_image"
-  },
-  "perception_rules": {
-    "type": "list",
-    "description": "会话级页面感知规则",
-    "hint": "按会话（UMO 子串匹配，不区分大小写）指定页面感知方式默认值，命中第一条生效。优先级：browse_web 参数前缀 perception= 显式指定 > 本规则 > 全局 page_perception。每条规则含 match（匹配字符串，与 UMO 做子串匹配）、perception（text/text_image/image）、note（可选备注）。示例：[{\"match\": \"tester\", \"perception\": \"text\", \"note\": \"测试子代理只需正文\"}]",
+  "browser": {
+    "type": "object",
+    "description": "浏览器基础",
+    "hint": "浏览器引擎、起始页、代理与视口等基础设置。",
     "items": {
-      "match": {
+      "type": {
         "type": "string",
-        "description": "匹配字符串（与 UMO 子串匹配，不区分大小写）",
-        "hint": "如 tester / frontend，命中该子串的会话默认使用对应感知模式",
+        "description": "浏览器引擎类型",
+        "options": [
+          "chromium",
+          "firefox",
+          "webkit"
+        ],
+        "hint": "驱动网页浏览使用的 Playwright 浏览器内核。chromium 兼容性最好，firefox/webkit 视环境支持情况选择。",
+        "default": "chromium"
+      },
+      "default_url": {
+        "type": "string",
+        "description": "默认起始页",
+        "hint": "会话首次打开浏览器时加载的地址；Agent 通常会根据用户问题导航到目标页，此地址仅作兜底。",
+        "default": "https://www.baidu.com"
+      },
+      "default_search_engine": {
+        "type": "string",
+        "description": "默认搜索引擎（浏览器 SERP 模板）",
+        "options": [
+          "必应搜索",
+          "百度搜索",
+          "谷歌搜索",
+          "B站搜索"
+        ],
+        "hint": "browse_search 子代理工具打开搜索页时使用的引擎模板；与「搜索 API」配置组无关——后者是 browser_web_search 的 HTTP provider 池。",
+        "default": "必应搜索"
+      },
+      "proxy": {
+        "type": "string",
+        "description": "浏览器代理地址",
+        "hint": "Playwright 浏览器使用的代理，如 http://127.0.0.1:7890。留空表示直连；搜索 API 的代理请用「搜索」组的 proxy（两者独立）。",
         "default": ""
       },
-      "perception": {
+      "viewport": {
+        "description": "浏览器视口尺寸",
+        "type": "object",
+        "hint": "浏览器窗口视口大小，宽高单位为像素。",
+        "items": {
+          "width": {
+            "type": "int",
+            "description": "视口宽度",
+            "hint": "影响页面渲染与截图宽度",
+            "default": 1280
+          },
+          "height": {
+            "type": "int",
+            "description": "视口高度",
+            "hint": "影响页面渲染与截图高度",
+            "default": 800
+          }
+        }
+      },
+      "timeout": {
+        "type": "int",
+        "description": "页面操作超时（秒）",
+        "hint": "页面加载、点击、搜索等单次浏览器操作的超时时间。",
+        "default": 30
+      }
+    }
+  },
+  "limits": {
+    "type": "object",
+    "description": "资源与步数限制",
+    "hint": "正文/链接提取上限、页数、空闲回收、媒体缓存与子代理步数控制。",
+    "items": {
+      "max_chars": {
+        "type": "int",
+        "description": "单页正文提取上限（字符）",
+        "hint": "每次提取网页正文时最多返回的字符数，超长内容按此截断，控制注入 token 消耗。",
+        "default": 4000
+      },
+      "max_links": {
+        "type": "int",
+        "description": "单页链接提取上限",
+        "hint": "每次提取网页时最多返回多少条链接供 Agent 选择点击。",
+        "default": 20
+      },
+      "max_pages": {
+        "type": "int",
+        "description": "所有会话标签页总数上限",
+        "hint": "所有浏览会话合计最多可同时打开的标签页数量（全局上限），达到上限后新标签/新会话将被拒绝，防止 Agent 无限开标签消耗资源。",
+        "default": 5
+      },
+      "idle_timeout": {
+        "type": "int",
+        "description": "会话空闲回收时间（秒）",
+        "hint": "浏览会话闲置超过该秒数后自动关闭，释放浏览器资源。",
+        "default": 1800
+      },
+      "cache_days": {
+        "type": "int",
+        "description": "媒体缓存保留天数",
+        "hint": "下载的图片/视频等媒体缓存超过该天数后自动清理，节省磁盘；0 或负值 = 不清理",
+        "default": 3
+      },
+      "agent_max_steps": {
+        "type": "int",
+        "description": "浏览器子代理最大工具调用步数",
+        "hint": "浏览器子代理（browser_agent）在一次委托任务中最多执行的工具调用次数，防止无限循环消耗资源。复杂长任务（多步表单、连续翻页）建议 60-80。",
+        "default": 70
+      },
+      "agent_tool_timeout": {
+        "type": "int",
+        "description": "浏览器子代理单次工具调用超时（秒）",
+        "hint": "浏览器子代理执行单个 browse_* 工具的超时上限；完成一整套长任务（多步表单、连续翻页）时此值会叠加，建议保持 300-600。若超长任务仍被中断，请同步调大 AstrBot 全局“工具调用超时”（WebUI 模型设置）。",
+        "default": 1200
+      }
+    }
+  },
+  "security": {
+    "type": "object",
+    "description": "安全与内容审核",
+    "hint": "禁词过滤、内网拦截与会话黑白名单。搜索工具复用同一套禁词/SSRF/会话规则。",
+    "items": {
+      "banned_words": {
+        "type": "list",
+        "description": "内容禁词列表",
+        "hint": "命中这些关键词的网页内容 / 搜索结果会被安全过滤拦截，禁止返回给 LLM 与用户。搜索工具的检索词命中则整单拒绝，结果标题/摘要命中则只丢弃该条。",
+        "default": [
+          "pornhub",
+          "色情",
+          "成人",
+          "赌博",
+          "暴力",
+          "政治",
+          "反动",
+          "恐怖",
+          "谣言",
+          "诈骗",
+          "病毒"
+        ]
+      },
+      "enable_banned_filter": {
+        "type": "bool",
+        "description": "启用内容审核（禁词过滤）",
+        "hint": "内容审核总开关。开启时命中 banned_words 的网页正文/标题/搜索词/URL/识图结果会被拦截；关闭后不再因禁词拦截内容，适合论坛等敏感词密集站点（避免整页被拒）。不影响内网拦截、本地页路径白名单等安全边界。",
+        "default": true
+      },
+      "block_internal_ip": {
+        "type": "bool",
+        "description": "拦截内网地址",
+        "hint": "开启后拒绝访问内网/本机地址（如 127.0.0.1、192.168.x.x），防止 SSRF 风险。搜索工具用它校验 provider 端点与结果链接。关闭后不拦截内网地址（不推荐）。",
+        "default": true
+      },
+      "session_whitelist": {
+        "type": "list",
+        "description": "会话白名单",
+        "hint": "仅允许在这些会话中使用浏览能力。每个条目可以是完整 UMO（用 /sid 获取）或群号/用户 ID。匹配为精确匹配（按 : 或 | 切分后逐字段比对，或与完整 UMO 整体相等），黑名单如 '123' 不会误伤群 '1234'。留空表示允许全部会话",
+        "default": []
+      },
+      "session_blacklist": {
+        "type": "list",
+        "description": "会话黑名单",
+        "hint": "禁止在这些会话中使用浏览能力。格式同白名单（完整 UMO 或群号/用户 ID，精确匹配）。黑名单优先级高于白名单",
+        "default": []
+      }
+    }
+  },
+  "perception": {
+    "type": "object",
+    "description": "页面感知与识图",
+    "hint": "截图、识图模型、感知方式与会话级规则。",
+    "items": {
+      "enable_screenshot": {
+        "type": "bool",
+        "description": "启用页面截图",
+        "hint": "开启后浏览网页时截取页面截图返回给用户；关闭后仅返回文字内容。",
+        "default": true
+      },
+      "silent_mode": {
+        "type": "bool",
+        "description": "静默模式",
+        "hint": "开启后浏览截图仅内部识图，不发送到群聊（减少刷屏）；关闭后截图会发送给用户",
+        "default": true
+      },
+      "page_perception": {
         "type": "string",
-        "description": "感知模式",
-        "hint": "text=仅文字；text_image=文字为主+截图辅助；image=截图为主",
+        "description": "页面感知方式",
         "options": [
           "text",
           "text_image",
           "image"
         ],
+        "hint": "text=仅文字读取（最快，不用截图识图）；text_image=文字为主+必要时截图识图（平衡，推荐）；image=以截图识图为主",
         "default": "text_image"
       },
-      "note": {
-        "type": "string",
-        "description": "备注（可选）",
-        "hint": "该规则用途说明，仅作可读性",
-        "default": ""
-      }
-    },
-    "default": []
-  },
-  "vision_cache_ttl": {
-    "type": "int",
-    "description": "识图缓存时间（秒）",
-    "hint": "同一 URL 页面在缓存时间内重复截图识图直接复用上次结果（省识图耗时与 token，返回文本带 [缓存] 前缀）；0 表示关闭缓存。缓存键 = 规范化 URL（去 fragment/尾斜杠）+ 会话 UMO，插件重载/禁用时清空",
-    "default": 60
-  },
-  "proxy": {
-    "type": "string",
-    "description": "浏览器代理地址",
-    "hint": "Playwright 浏览器使用的代理，如 http://127.0.0.1:7890。留空表示直连",
-    "default": ""
-  },
-  "viewport": {
-    "description": "浏览器视口尺寸",
-    "type": "object",
-    "hint": "浏览器窗口视口大小，宽高单位为像素。",
-    "items": {
-      "width": {
-        "description": "视口宽度",
-        "type": "int",
-        "hint": "影响页面渲染与截图宽度",
-        "default": 1280
+      "perception_rules": {
+        "type": "list",
+        "description": "会话级页面感知规则",
+        "hint": "按会话（UMO 子串匹配，不区分大小写）指定页面感知方式默认值，命中第一条生效。优先级：browse_web 参数前缀 perception= 显式指定 > 本规则 > 全局 page_perception。每条规则含 match（匹配字符串，与 UMO 做子串匹配）、perception（text/text_image/image）、note（可选备注）。示例：[{\"match\": \"tester\", \"perception\": \"text\", \"note\": \"测试子代理只需正文\"}]",
+        "items": {
+          "match": {
+            "type": "string",
+            "description": "匹配字符串（与 UMO 子串匹配，不区分大小写）",
+            "hint": "如 tester / frontend，命中该子串的会话默认使用对应感知模式",
+            "default": ""
+          },
+          "perception": {
+            "type": "string",
+            "description": "感知模式",
+            "options": [
+              "text",
+              "text_image",
+              "image"
+            ],
+            "hint": "text=仅文字；text_image=文字为主+截图辅助；image=截图为主",
+            "default": "text_image"
+          },
+          "note": {
+            "type": "string",
+            "description": "备注（可选）",
+            "hint": "该规则用途说明，仅作可读性",
+            "default": ""
+          }
+        },
+        "default": []
       },
-      "height": {
-        "description": "视口高度",
+      "vision_provider_id": {
+        "type": "string",
+        "description": "多模态识图模型 Provider ID",
+        "options": [
+          ""
+        ],
+        "hint": "下拉选择多模态模型对截图做识图总结；留空则截图仅发用户不做识图。下拉选项自动同步 AstrBot 已配置的聊天模型 Provider（插件启动时与每次识图调用时刷新，无需手动编辑本文件）；若列表中没有你的识图模型，请先在 AstrBot 模型配置中添加对应 Provider。",
+        "default": ""
+      },
+      "vision_prompt": {
+        "type": "string",
+        "description": "识图提示词模板",
+        "hint": "发给多模态模型的识图提示词，可自定义以提升识图准确性。留空使用默认提示词",
+        "editor_mode": true,
+        "editor_language": "text",
+        "editor_theme": "vs-light",
+        "default": "请用中文描述这张网页截图的重点内容，包括主要文字、按钮、链接和页面结构。"
+      },
+      "vision_cache_ttl": {
         "type": "int",
-        "hint": "影响页面渲染与截图高度",
-        "default": 800
+        "description": "识图缓存时间（秒）",
+        "hint": "同一 URL 页面在缓存时间内重复截图识图直接复用上次结果（省识图耗时与 token，返回文本带 [缓存] 前缀）；0 表示关闭缓存。缓存键 = 规范化 URL（去 fragment/尾斜杠）+ 会话 UMO，插件重载/禁用时清空",
+        "default": 60
       }
     }
   },
-  "agent_max_steps": {
-    "type": "int",
-    "description": "浏览器子代理最大工具调用步数",
-    "hint": "浏览器子代理（browser_agent）在一次委托任务中最多执行的工具调用次数，防止无限循环消耗资源。复杂长任务（多步表单、连续翻页）建议 60-80。",
-    "default": 70
-  },
-  "agent_tool_timeout": {
-    "type": "int",
-    "description": "浏览器子代理单次工具调用超时（秒）",
-    "hint": "浏览器子代理执行单个 browse_* 工具的超时上限；完成一整套长任务（多步表单、连续翻页）时此值会叠加，建议保持 300-600。若超长任务仍被中断，请同步调大 AstrBot 全局“工具调用超时”（WebUI 模型设置）。",
-    "default": 1200
-  },
-  "cache_days": {
-    "type": "int",
-    "description": "媒体缓存保留天数",
-    "hint": "下载的图片/视频等媒体缓存超过该天数后自动清理，节省磁盘；0 或负值 = 不清理",
-    "default": 3
+  "search": {
+    "type": "object",
+    "description": "搜索 API（browser_web_search）",
+    "hint": "本组配置的是 browser_web_search 工具使用的「搜索 API provider 池」：多个搜索后端并行检索、合并去重后返回结构化结果。它与 AstrBot 内置的 web_search_<provider> 工具互相独立（各自用自己的 key，不会互相降级）；也与「默认搜索引擎」（浏览器 SERP 模板，供 browse_search 用）是两条链路。默认关闭（enabled=false）⇒ 主 LLM 看不到该工具，行为与旧版一致。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用搜索工具",
+        "hint": "总开关。开启且池内至少有一个已填 api_key 的 provider 时，主 LLM 才能看到并调用 browser_web_search；关闭（默认）或池内无可用 provider 时，工具对模型不可见（自动闸门，插件会记 search tool inactive 日志）。",
+        "default": false
+      },
+      "providers": {
+        "type": "template_list",
+        "description": "搜索 API provider 池",
+        "hint": "点「添加」选模板（brave / bocha / firecrawl / tavily / exa）后填 api_key。数组顺序即默认优先级；同时并行检索的个数由 max_parallel 控制，权重（weight）只影响合并排序。api_key 属敏感信息：不要在截图、日志、工单里暴露；本插件只从本配置读取密钥，不读核心 provider_settings 的 websearch_*_key，也不读其他插件。",
+        "templates": {
+          "brave": {
+            "name": "Brave Search API",
+            "hint": "官方端点 https://api.search.brave.com/res/v1/web/search，头 X-Subscription-Token 鉴权；支持 region/safesearch。",
+            "items": {
+              "enabled": {
+                "type": "bool",
+                "description": "启用该 provider",
+                "hint": "关闭时完全不参与检索（attempts 里记 disabled），不占并发名额。",
+                "default": true
+              },
+              "name": {
+                "type": "string",
+                "description": "显示名（可选）",
+                "hint": "留空自动用 <模板名>#<序号>（如 brave#1）。显示名只用于日志与返回体 attempts，不含密钥。",
+                "default": ""
+              },
+              "api_key": {
+                "type": "string",
+                "description": "API Key（敏感）",
+                "hint": "该 provider 的密钥。留空 ⇒ 该 provider 被跳过（记 missing_key，不占并发名额、不发请求）。密钥只在请求时使用，不会出现在日志/返回体/异常里。",
+                "default": ""
+              },
+              "base_url": {
+                "type": "string",
+                "description": "端点覆盖（可选）",
+                "hint": "留空用官方端点；自建反代/镜像可填完整 URL（必须 http/https，命中内网地址会被拒绝并记 bad_config）。",
+                "default": ""
+              },
+              "weight": {
+                "type": "int",
+                "description": "权重（1-100）",
+                "hint": "越大越靠前。用于合并结果排序（权重高者优先，同源内保持搜索商原始排序），不改变并发波次的选择顺序（那由数组顺序决定）。",
+                "default": 50
+              },
+              "timeout": {
+                "type": "int",
+                "description": "单源超时（秒，0=用全局）",
+                "hint": "0 表示使用「搜索」组的 provider_timeout；1-120 覆盖本次调用的单源超时。单个 provider 超时不影响同波其他 provider。",
+                "default": 0
+              },
+              "max_results": {
+                "type": "int",
+                "description": "单源请求条数（0=用全局）",
+                "hint": "0 表示使用「搜索」组的 max_results；1-50 覆盖该 provider 的单次请求量（最终仍受全局 max_results 裁剪）。",
+                "default": 0
+              }
+            }
+          },
+          "bocha": {
+            "name": "博查 Web Search API",
+            "hint": "官方端点 https://api.bochaai.com/v1/web-search，Authorization: Bearer 鉴权，POST JSON。",
+            "items": {
+              "enabled": {
+                "type": "bool",
+                "description": "启用该 provider",
+                "hint": "关闭时完全不参与检索（attempts 里记 disabled），不占并发名额。",
+                "default": true
+              },
+              "name": {
+                "type": "string",
+                "description": "显示名（可选）",
+                "hint": "留空自动用 <模板名>#<序号>（如 bocha#1）。显示名只用于日志与返回体 attempts，不含密钥。",
+                "default": ""
+              },
+              "api_key": {
+                "type": "string",
+                "description": "API Key（敏感）",
+                "hint": "该 provider 的密钥。留空 ⇒ 该 provider 被跳过（记 missing_key，不占并发名额、不发请求）。密钥只在请求时使用，不会出现在日志/返回体/异常里。",
+                "default": ""
+              },
+              "base_url": {
+                "type": "string",
+                "description": "端点覆盖（可选）",
+                "hint": "留空用官方端点；自建反代/镜像可填完整 URL（必须 http/https，命中内网地址会被拒绝并记 bad_config）。",
+                "default": ""
+              },
+              "weight": {
+                "type": "int",
+                "description": "权重（1-100）",
+                "hint": "越大越靠前。用于合并结果排序（权重高者优先，同源内保持搜索商原始排序），不改变并发波次的选择顺序（那由数组顺序决定）。",
+                "default": 50
+              },
+              "timeout": {
+                "type": "int",
+                "description": "单源超时（秒，0=用全局）",
+                "hint": "0 表示使用「搜索」组的 provider_timeout；1-120 覆盖本次调用的单源超时。单个 provider 超时不影响同波其他 provider。",
+                "default": 0
+              },
+              "max_results": {
+                "type": "int",
+                "description": "单源请求条数（0=用全局）",
+                "hint": "0 表示使用「搜索」组的 max_results；1-50 覆盖该 provider 的单次请求量（最终仍受全局 max_results 裁剪）。",
+                "default": 0
+              }
+            }
+          },
+          "firecrawl": {
+            "name": "Firecrawl Search API",
+            "hint": "官方端点 https://api.firecrawl.dev/v1/search，Authorization: Bearer 鉴权，POST JSON。",
+            "items": {
+              "enabled": {
+                "type": "bool",
+                "description": "启用该 provider",
+                "hint": "关闭时完全不参与检索（attempts 里记 disabled），不占并发名额。",
+                "default": true
+              },
+              "name": {
+                "type": "string",
+                "description": "显示名（可选）",
+                "hint": "留空自动用 <模板名>#<序号>（如 firecrawl#1）。显示名只用于日志与返回体 attempts，不含密钥。",
+                "default": ""
+              },
+              "api_key": {
+                "type": "string",
+                "description": "API Key（敏感）",
+                "hint": "该 provider 的密钥。留空 ⇒ 该 provider 被跳过（记 missing_key，不占并发名额、不发请求）。密钥只在请求时使用，不会出现在日志/返回体/异常里。",
+                "default": ""
+              },
+              "base_url": {
+                "type": "string",
+                "description": "端点覆盖（可选）",
+                "hint": "留空用官方端点；自建反代/镜像可填完整 URL（必须 http/https，命中内网地址会被拒绝并记 bad_config）。",
+                "default": ""
+              },
+              "weight": {
+                "type": "int",
+                "description": "权重（1-100）",
+                "hint": "越大越靠前。用于合并结果排序（权重高者优先，同源内保持搜索商原始排序），不改变并发波次的选择顺序（那由数组顺序决定）。",
+                "default": 50
+              },
+              "timeout": {
+                "type": "int",
+                "description": "单源超时（秒，0=用全局）",
+                "hint": "0 表示使用「搜索」组的 provider_timeout；1-120 覆盖本次调用的单源超时。单个 provider 超时不影响同波其他 provider。",
+                "default": 0
+              },
+              "max_results": {
+                "type": "int",
+                "description": "单源请求条数（0=用全局）",
+                "hint": "0 表示使用「搜索」组的 max_results；1-50 覆盖该 provider 的单次请求量（最终仍受全局 max_results 裁剪）。",
+                "default": 0
+              }
+            }
+          },
+          "tavily": {
+            "name": "Tavily Search API",
+            "hint": "官方端点 https://api.tavily.com/search，key 放请求体，POST JSON。",
+            "items": {
+              "enabled": {
+                "type": "bool",
+                "description": "启用该 provider",
+                "hint": "关闭时完全不参与检索（attempts 里记 disabled），不占并发名额。",
+                "default": true
+              },
+              "name": {
+                "type": "string",
+                "description": "显示名（可选）",
+                "hint": "留空自动用 <模板名>#<序号>（如 tavily#1）。显示名只用于日志与返回体 attempts，不含密钥。",
+                "default": ""
+              },
+              "api_key": {
+                "type": "string",
+                "description": "API Key（敏感）",
+                "hint": "该 provider 的密钥。留空 ⇒ 该 provider 被跳过（记 missing_key，不占并发名额、不发请求）。密钥只在请求时使用，不会出现在日志/返回体/异常里。",
+                "default": ""
+              },
+              "base_url": {
+                "type": "string",
+                "description": "端点覆盖（可选）",
+                "hint": "留空用官方端点；自建反代/镜像可填完整 URL（必须 http/https，命中内网地址会被拒绝并记 bad_config）。",
+                "default": ""
+              },
+              "weight": {
+                "type": "int",
+                "description": "权重（1-100）",
+                "hint": "越大越靠前。用于合并结果排序（权重高者优先，同源内保持搜索商原始排序），不改变并发波次的选择顺序（那由数组顺序决定）。",
+                "default": 50
+              },
+              "timeout": {
+                "type": "int",
+                "description": "单源超时（秒，0=用全局）",
+                "hint": "0 表示使用「搜索」组的 provider_timeout；1-120 覆盖本次调用的单源超时。单个 provider 超时不影响同波其他 provider。",
+                "default": 0
+              },
+              "max_results": {
+                "type": "int",
+                "description": "单源请求条数（0=用全局）",
+                "hint": "0 表示使用「搜索」组的 max_results；1-50 覆盖该 provider 的单次请求量（最终仍受全局 max_results 裁剪）。",
+                "default": 0
+              }
+            }
+          },
+          "exa": {
+            "name": "Exa Search API",
+            "hint": "官方端点 https://api.exa.ai/search，头 x-api-key 鉴权，POST JSON。",
+            "items": {
+              "enabled": {
+                "type": "bool",
+                "description": "启用该 provider",
+                "hint": "关闭时完全不参与检索（attempts 里记 disabled），不占并发名额。",
+                "default": true
+              },
+              "name": {
+                "type": "string",
+                "description": "显示名（可选）",
+                "hint": "留空自动用 <模板名>#<序号>（如 exa#1）。显示名只用于日志与返回体 attempts，不含密钥。",
+                "default": ""
+              },
+              "api_key": {
+                "type": "string",
+                "description": "API Key（敏感）",
+                "hint": "该 provider 的密钥。留空 ⇒ 该 provider 被跳过（记 missing_key，不占并发名额、不发请求）。密钥只在请求时使用，不会出现在日志/返回体/异常里。",
+                "default": ""
+              },
+              "base_url": {
+                "type": "string",
+                "description": "端点覆盖（可选）",
+                "hint": "留空用官方端点；自建反代/镜像可填完整 URL（必须 http/https，命中内网地址会被拒绝并记 bad_config）。",
+                "default": ""
+              },
+              "weight": {
+                "type": "int",
+                "description": "权重（1-100）",
+                "hint": "越大越靠前。用于合并结果排序（权重高者优先，同源内保持搜索商原始排序），不改变并发波次的选择顺序（那由数组顺序决定）。",
+                "default": 50
+              },
+              "timeout": {
+                "type": "int",
+                "description": "单源超时（秒，0=用全局）",
+                "hint": "0 表示使用「搜索」组的 provider_timeout；1-120 覆盖本次调用的单源超时。单个 provider 超时不影响同波其他 provider。",
+                "default": 0
+              },
+              "max_results": {
+                "type": "int",
+                "description": "单源请求条数（0=用全局）",
+                "hint": "0 表示使用「搜索」组的 max_results；1-50 覆盖该 provider 的单次请求量（最终仍受全局 max_results 裁剪）。",
+                "default": 0
+              }
+            }
+          }
+        },
+        "default": []
+      },
+      "max_parallel": {
+        "type": "int",
+        "description": "单波并发上限",
+        "hint": "同一时刻并行发起的 provider 个数（1-10，默认 3）。波次数由 max_rounds 控制，故一次调用最多尝试 min(可用池, max_parallel × max_rounds) 个 provider。",
+        "default": 3
+      },
+      "max_results": {
+        "type": "int",
+        "description": "返回结果条数上限",
+        "hint": "合并去重后最多返回多少条（1-50，默认 8）；同时作为单源默认请求量。",
+        "default": 8
+      },
+      "max_rounds": {
+        "type": "int",
+        "description": "搜索步数（波次上限）",
+        "hint": "1-5，默认 2。一轮 = 从「尚未尝试且可用」的 provider 里按序取至多 max_parallel 个并行检索；结果够 max_results 会提前结束。注意它不是「每次对话最多调用几次工具」。",
+        "default": 2
+      },
+      "provider_timeout": {
+        "type": "int",
+        "description": "单源超时（秒）",
+        "hint": "3-60，默认 15。每个 provider 的检索超时；provider 模板里的 timeout 可覆盖它。单源超时只影响自己，同波其他源照常返回。",
+        "default": 15
+      },
+      "total_timeout": {
+        "type": "int",
+        "description": "单次调用总预算（秒）",
+        "hint": "5-300，默认 60。一次 browser_web_search 的总耗时上限（含抓正文阶段）；到点保留已有结果并记 total_timeout。",
+        "default": 60
+      },
+      "cooldown_seconds": {
+        "type": "int",
+        "description": "失败源冷却（秒）",
+        "hint": "0-3600，默认 60。provider 返回 401/403/429 后进入冷却，冷却期内直接跳过（记 cooldown）不再发请求，避免持续撞限流；0 表示不冷却。",
+        "default": 60
+      },
+      "cache_ttl": {
+        "type": "int",
+        "description": "结果缓存时间（秒）",
+        "hint": "0-3600，默认 120。相同检索词与参数在 TTL 内直接复用上次结果（返回体 cache=hit）；0 表示关闭缓存。插件重载/禁用时清空。",
+        "default": 120
+      },
+      "fetch_pages": {
+        "type": "bool",
+        "description": "抓取结果正文",
+        "hint": "默认关闭。开启后对排序靠前的 fetch_top_n 条结果抓取正文（纯 HTTP，不启浏览器、不执行 JS），正文逐条过 SSRF 校验与禁词过滤。工具参数 fetch_pages 只能在此开关开启时生效（取「与」）。",
+        "default": false
+      },
+      "fetch_top_n": {
+        "type": "int",
+        "description": "抓取条数（0-5）",
+        "hint": "默认 3。抓取排序前 N 条的正文；0 等价于不抓（即使 fetch_pages 已开启）。",
+        "default": 3
+      },
+      "fetch_timeout": {
+        "type": "int",
+        "description": "单条抓取超时（秒）",
+        "hint": "3-60，默认 12。逐条抓取的超时；超时的那条 fetched.ok=false、code=fetch_timeout，不影响其它结果。",
+        "default": 12
+      },
+      "fetch_max_chars": {
+        "type": "int",
+        "description": "抓取正文长度上限（字符）",
+        "hint": "200-20000，默认 2000。抓取到的正文按此截断（与「资源与步数限制」里的单页正文上限是两个口径）；返回体整体还有 24KB 体积上限。",
+        "default": 2000
+      },
+      "region": {
+        "type": "string",
+        "description": "地区（仅 brave）",
+        "hint": "ISO-3166-1 alpha-2 国家码（如 CN / US），留空表示不限。目前只有 brave 消费（country + search_lang）；其余 provider 忽略并在返回体 notes 里记 region_unsupported。",
+        "default": ""
+      },
+      "safesearch": {
+        "type": "string",
+        "description": "安全搜索（仅 brave）",
+        "options": [
+          "off",
+          "moderate",
+          "strict"
+        ],
+        "hint": "off / moderate / strict，默认 moderate。目前只有 brave 消费；其余 provider 使用各自默认值。",
+        "default": "moderate"
+      },
+      "proxy": {
+        "type": "string",
+        "description": "搜索与抓取代理",
+        "hint": "搜索 API 请求与结果正文抓取使用的代理，如 http://127.0.0.1:7890；留空直连。与「浏览器基础」里的浏览器代理相互独立（后者只给 Playwright）。",
+        "default": ""
+      }
+    }
   }
 }

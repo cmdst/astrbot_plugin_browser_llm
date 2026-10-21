@@ -1,10 +1,15 @@
 """
 astrbot_plugin_browser_llm — LLM 浏览器插件（Agent 驱动的网页浏览）
 
-架构：工具化子代理（tool-based subagent）。24 个 browse_* 浏览工具不
-直接暴露给主 LLM，而是作为「浏览器子代理」的工具集；主 LLM 只看到
-一个入口工具 browse_web，需要真实网页交互时调用它，由子代理（
-tool_loop_agent + 24 个 FunctionTool）自主完成浏览。
+架构：工具化子代理（tool-based subagent）+ 独立搜索池。
+
+对外暴露 **3 个 LLM 工具**：``browse_web``（网页浏览入口）、
+``browse_local_page``（本地 HTML 自检入口）、``browser_web_search``
+（v1.4.0 新增，直接调搜索 API 池，返回结构化 JSON）。24 个 ``browse_*``
+浏览工具**不**直接暴露给主 LLM，而是作为「浏览器子代理」的工具集：主 LLM
+调 ``browse_web`` 后由子代理（tool_loop_agent + 24 个 FunctionTool）自主
+完成真实网页交互。配置为 5 个分组 / 41 个叶键（含 v1.4.0 的 `search` 组
+16 键），见 ``_conf_schema.json``。
 
 核心组件在 initialize() 中组装：BrowserCore（浏览器驱动）、
 SessionManager（会话隔离与回收）、ContentExtractor（内容提取）、
@@ -13,6 +18,7 @@ SafetyFilter（禁词过滤与 SSRF 防护），以及 24 个 FunctionTool 构�
 """
 
 import asyncio
+import functools
 import hashlib
 import os
 import re
@@ -30,8 +36,23 @@ from astrbot.api.star import Context, Star
 
 from .core import as_bool, as_float, as_int
 from .core.browser import BrowserCore, validate_browser_type
+from .core.config_map import ConfigView, schema_leaf
+from .core.crawler import AiohttpFetcher, CrawlerLimits, FetchOutcome
+from .core.delivery import collect_artifact
 from .core.extract import ContentExtractor
-from .core.safety import SafetyFilter
+from .core.safety import SafetyFilter, check_url_literal
+from .core.search import (
+    SearchService,
+    redact_secrets,
+    render_payload,
+    summarize,
+)
+from .core.search_providers import (
+    PROVIDER_CLASSES,
+    build_provider_entries,
+    is_entry_usable,
+    parse_provider_configs,
+)
 from .core.session import SessionManager
 
 if TYPE_CHECKING:  # pragma: no cover — 仅类型检查
@@ -44,12 +65,14 @@ METADATA_NAME = "astrbot_plugin_browser_llm"
 # 运行时 Star 实例无 self.metadata 属性，无法动态读取；metadata.yaml 在插件
 # 目录中随发布流程维护，发布时只改这一处）。读取失败（文件缺失/无 version
 # 字段）时回退内置兜底值，保证插件在异常部署形态下仍可加载。
-_PLUGIN_VERSION_FALLBACK = "v1.3.3"
+_PLUGIN_VERSION_FALLBACK = "v1.4.0"
+
+#: 插件目录与 metadata.yaml 路径（数据目录/标识解析共用，只算一次）。
+_PLUGIN_DIR = Path(__file__).resolve().parent
+_METADATA_YAML = _PLUGIN_DIR / "metadata.yaml"
 
 try:
-    _metadata_text = (Path(__file__).resolve().parent / "metadata.yaml").read_text(
-        encoding="utf-8"
-    )
+    _metadata_text = _METADATA_YAML.read_text(encoding="utf-8")
     _metadata_version = re.search(
         r"^version:\s*['\"]?([^\s'\"]+)", _metadata_text, re.MULTILINE
     )
@@ -59,13 +82,62 @@ try:
 except OSError:
     PLUGIN_VERSION = _PLUGIN_VERSION_FALLBACK
 
+# LLM 搜索工具名（v4）。**只在 main.py 定义这一处**，测试与文档都引用它。
+#
+# 为什么不用 ``web_search`` / ``web_search_<provider>``：核心内置搜索族是
+# ``web_search_{baidu,tavily,bocha,brave,firecrawl,exa,anysearch,serpapi,
+# deepseek}``（``astrbot/core/tools/web_search_tools.py``），且在请求装配时
+# **后加入并覆盖**同名插件工具（``ToolSet.add_tool``），插件删不掉内置项；
+# 用同名会变成"两份并存、插件那份被静默挤掉"。``browser_web_search`` 与
+# 内置族、与子代理的 ``browse_search`` 都不同名 ⇒ 并存、不接管。
+_SEARCH_TOOL_NAME = "browser_web_search"
+
 # terminate 资源清理总超时（秒）：超过则放弃等待并强制收尾，防止插件重载
 # 被悬挂的 close 阻塞（曾实测 browser.close 悬挂数小时，旧实例 chromium 进程
 # 与 playwright driver 长期残留）。底层 BrowserCore 已带单步超时，此为兜底。
 _TERMINATE_TIMEOUT = 20.0
 
-# 数据目录：截图等资源保存位置。
-_DATA_DIR = Path(__file__).resolve().parent / "data"
+# 数据目录：截图/媒体等资源保存位置。
+# 与插件安装目录解耦：优先走核心 StarTools（``data/plugin_data/<metadata.name>``），
+# 兜底用同一路径显式拼接。理由有二：插件目录升级时会被**整目录覆盖**（`AGENTS.md`
+# §2 记过同类事故），把运行期产物放进去等于随升级丢失；插件目录也可能是只读挂载。
+# import 期 StarTools 尚未注册（无 star_map），故两级兜底；测试/离线环境落到
+# 插件目录下的 ``data/``（与 v1.3.x 行为一致，测试无需改动）。
+
+
+def _plugin_identity() -> str:
+    """插件标识：优先 metadata.yaml 的 name，读不到时退回目录名。"""
+    try:
+        import yaml  # 核心依赖，插件运行期可用
+
+        data = yaml.safe_load(_METADATA_YAML.read_text(encoding="utf-8")) or {}
+        name = str(data.get("name") or "").strip()
+        if name:
+            return name
+    except Exception:  # noqa: BLE001 — 缺 yaml/文件损坏时退回目录名
+        pass
+    return _PLUGIN_DIR.name
+
+
+def _resolve_data_dir() -> Path:
+    """解析插件数据目录；StarTools 在 import 期可能尚未注册，故有兜底。"""
+    try:
+        from astrbot.core.star.star_tools import StarTools  # noqa: PLC0415 — 延迟导入
+
+        return Path(StarTools.get_data_dir())
+    except Exception:  # noqa: BLE001 — import 期无 star_map，走显式拼接
+        pass
+    try:
+        from astrbot.core.utils.astrbot_path import (  # noqa: PLC0415 — 延迟导入
+            get_astrbot_data_path,
+        )
+
+        return Path(get_astrbot_data_path()) / "plugin_data" / _plugin_identity()
+    except Exception:  # noqa: BLE001 — 测试/离线环境最后的兜底
+        return _PLUGIN_DIR / "data"
+
+
+_DATA_DIR = _resolve_data_dir()
 
 # 浏览器子代理名称（tool_loop_agent 内层 LLM 的 system_prompt 标识）。
 _BROWSER_AGENT_NAME = "browser_agent"
@@ -73,14 +145,38 @@ _BROWSER_AGENT_NAME = "browser_agent"
 # ---------------------------------------------------------------
 # browse_local_page（本地页面渲染预览，面向子代理）安全白名单常量
 # ---------------------------------------------------------------
-# 允许渲染查看的根目录：AstrBot 工作区 + 插件 data 目录。
+# 允许渲染查看的根目录：AstrBot 工作区 + 插件数据目录。
 # 子代理（frontend/engineer 等）仅能预览这两处目录下的 HTML 文件，
 # 其余路径一律拒绝（防路径穿越与越权读取）。运行时会用
 # get_astrbot_workspaces_path() 解析真实工作区路径，解析失败回退此默认值。
-# 默认值由插件安装位置平台无关推导：插件位于 <astrbot_root>/data/plugins/
-# <plugin>/，其上级两级即 <astrbot_root>/data，同级即部署环境的 workspaces
-# 目录；不硬编码任何真实服务器路径。
-_LOCAL_PAGE_WORKSPACE_FALLBACK = (_DATA_DIR.parents[2] / "workspaces").resolve()
+
+
+def _resolve_workspaces_fallback() -> Path:
+    """工作区目录：优先核心 helper，兜底按 <root>/data/workspaces 推导。
+
+    不能再按数据目录上溯两级推导：数据目录已经改到 ``data/plugin_data/<name>``，
+    层级完全变了，旧写法会指到 ``<root>/data`` 而不是 ``<root>/data/workspaces``。
+    """
+    try:
+        from astrbot.core.utils.astrbot_path import (  # noqa: PLC0415 — 延迟导入
+            get_astrbot_workspaces_path,
+        )
+
+        return Path(get_astrbot_workspaces_path()).resolve()
+    except Exception:  # noqa: BLE001 — 老核心无此 helper
+        pass
+    try:
+        from astrbot.core.utils.astrbot_path import (  # noqa: PLC0415 — 延迟导入
+            get_astrbot_data_path,
+        )
+
+        return (Path(get_astrbot_data_path()) / "workspaces").resolve()
+    except Exception:  # noqa: BLE001 — 测试/离线环境
+        # 层级依赖：插件位于 <root>/data/plugins/<name>/main.py，parents[2] 即 <root>/data。
+        return (Path(__file__).resolve().parents[2] / "workspaces").resolve()
+
+
+_LOCAL_PAGE_WORKSPACE_FALLBACK = _resolve_workspaces_fallback()
 # 允许渲染的文件扩展名。
 _LOCAL_PAGE_ALLOWED_EXTS = (".html", ".htm")
 # 渲染完成后等待 JS 执行的默认时长（毫秒），保证动态内容渲染完成后再截图。
@@ -270,6 +366,11 @@ def _match_in_pure_clause(
 # 分隔：Linux/macOS 为冒号、Windows 为分号）追加，无需改代码。
 _PLATFORM_WORKSPACE_CANDIDATES = (Path("/root/workspace"),)
 _EXTRA_LOCAL_ROOTS_ENV = "BROWSER_LLM_EXTRA_LOCAL_ROOTS"
+
+
+def _clamp(value, low, high):
+    """把配置/参数值夹到闭区间 ``[low, high]``（非法值由 _as_* 先行兜底）。"""
+    return max(low, min(high, value))
 
 
 def _redact_url(url: str) -> str:
@@ -703,8 +804,9 @@ class BrowserLLMPlugin(Star):
 
         Args:
             context: AstrBot 插件上下文，提供事件注册与消息发送能力。
-            config: 插件配置对象，对应 _conf_schema.json 中定义的
-                25 个配置项（含默认值）；未传入时使用空字典兜底。
+            config: 插件配置对象，对应 _conf_schema.json 的 5 个分组 /
+                41 个叶键（browser / limits / security / perception，以及
+                v1.4.0 新增的 search 组 16 键）；未传入时用空字典兜底。
         """
         super().__init__(context)
         self.config = config or {}
@@ -728,6 +830,15 @@ class BrowserLLMPlugin(Star):
         # 本地页面预览允许访问的根目录白名单（initialize 时解析真实路径）。
         self._local_page_allowed_roots: tuple[Path, ...] = _resolve_local_page_roots()
 
+        # 搜索工具运行期状态（v4）：
+        # - ``_search_service``：ProviderEntry 池 + 冷却 + TTL 缓存；配置
+        #   provider 段变化时重建（冷却随之重置，属预期）；
+        # - ``_search_tool_active``：initialize() 对齐后的工具可见性影子值，
+        #   供提示词注入判断（不查 manager，避免热重载竞态）。
+        self._search_service: SearchService | None = None
+        self._search_service_signature: tuple | None = None
+        self._search_tool_active: bool = False
+
         # 识图短时缓存（v1.3.0）：(umo, 规范化URL) -> (写入时间戳, 描述文本)。
         # 并发安全说明：插件运行在 asyncio 单线程事件循环内，dict 读/写天然
         # 原子，无需额外锁；同一 URL 并发首次识图可能重复调用 LLM（无害，
@@ -747,9 +858,11 @@ class BrowserLLMPlugin(Star):
     def _load_config(self) -> None:
         """将 _conf_schema.json 中的配置项读取为实例属性。
 
-        全部 25 个配置项：浏览器引擎 / 默认页 / 搜索引擎 / 禁词 /
-        审核总开关 / 内网拦截 / 提取与链接上限 / 超时 / 页数上限 / 空闲回收 /
-        会话黑白名单 / 截图与识图 / 代理 / 视口 / 子代理控制。
+        全部 5 组 41 叶（``_conf_schema.json``）：``browser``（引擎/默认页/
+        搜索引擎/视口/代理/超时）、``limits``（提取与链接上限/页数/空闲回收/
+        子代理步数与超时）、``security``（禁词/审核总开关/内网拦截/会话黑白
+        名单）、``perception``（感知模式/截图/识图 provider 与缓存）、
+        ``search``（v1.4.0 搜索 API 池 16 键：开关/池/并发/步数/超时/抓取）。
 
         类型健壮性（v1.3.1）：数值/布尔配置经 _as_int / _as_float /
         _as_bool 归一解析，非法值（字符串、None、类型错误）回退默认值并
@@ -758,17 +871,22 @@ class BrowserLLMPlugin(Star):
         类型校验保护，此处理为纵深防御。
         """
         cfg = self.config
+        # S1：读取点统一切到点号路径；ConfigView 在过渡期自动回退到旧扁平键，
+        # 因此 schema 不变、配置不变时行为与旧实现完全一致。
+        view = ConfigView(cfg)
 
         # 浏览器基础
-        self.browser_type: str = str(cfg.get("browser_type", "chromium"))
-        self.default_url: str = str(cfg.get("default_url", "https://www.baidu.com"))
+        self.browser_type: str = str(view.get("browser.type", "chromium"))
+        self.default_url: str = str(
+            view.get("browser.default_url", "https://www.baidu.com")
+        )
         self.default_search_engine: str = str(
-            cfg.get("default_search_engine", "必应搜索")
+            view.get("browser.default_search_engine", "必应搜索")
         )
 
         # 安全与过滤
-        self.banned_words: list = cfg.get(
-            "banned_words",
+        self.banned_words: list = view.get(
+            "security.banned_words",
             [
                 "pornhub",
                 "色情",
@@ -784,61 +902,128 @@ class BrowserLLMPlugin(Star):
             ],
         )
         self.block_internal_ip: bool = self._as_bool(
-            cfg.get("block_internal_ip", True), True
+            view.get("security.block_internal_ip", True), True
         )
         # 内容审核总开关（v1.3.3）：关闭后 _check_banned 统一放行，不再因
         # banned_words 拦截正文/标题/搜索词/识图结果（敏感词密集站点适用，
         # 避免整页拒绝）；不影响 SSRF 内网拦截与本地页路径白名单等安全边界。
         self.enable_banned_filter: bool = self._as_bool(
-            cfg.get("enable_banned_filter", True), True
+            view.get("security.enable_banned_filter", True), True
         )
 
         # 提取与资源控制
-        self.max_chars: int = self._as_int(cfg.get("max_chars", 4000), 4000)
-        self.max_links: int = self._as_int(cfg.get("max_links", 20), 20)
-        self.timeout: float = self._as_float(cfg.get("timeout", 30), 30)
-        self.max_pages: float = self._as_float(cfg.get("max_pages", 5), 5)
-        self.idle_timeout: float = self._as_float(cfg.get("idle_timeout", 1800), 1800)
+        self.max_chars: int = self._as_int(view.get("limits.max_chars", 4000), 4000)
+        self.max_links: int = self._as_int(view.get("limits.max_links", 20), 20)
+        self.timeout: float = self._as_float(view.get("browser.timeout", 30), 30)
+        self.max_pages: float = self._as_float(view.get("limits.max_pages", 5), 5)
+        self.idle_timeout: float = self._as_float(
+            view.get("limits.idle_timeout", 1800), 1800
+        )
 
         # 会话权限控制
-        self.session_whitelist: list = cfg.get("session_whitelist", [])
-        self.session_blacklist: list = cfg.get("session_blacklist", [])
+        self.session_whitelist: list = view.get("security.session_whitelist", [])
+        self.session_blacklist: list = view.get("security.session_blacklist", [])
 
         # 截图与识图
         self.enable_screenshot: bool = self._as_bool(
-            cfg.get("enable_screenshot", True), True
+            view.get("perception.enable_screenshot", True), True
         )
-        self.vision_provider_id: str = str(cfg.get("vision_provider_id", "") or "")
+        self.vision_provider_id: str = str(
+            view.get("perception.vision_provider_id", "") or ""
+        )
         self.vision_prompt: str = str(
-            cfg.get(
-                "vision_prompt",
+            view.get(
+                "perception.vision_prompt",
                 "请用中文描述这张网页截图的重点内容，包括主要文字、按钮、链接和页面结构。",
             )
         )
         # 静默模式：开启后截图仅内部识图，不发到群聊。
-        self.silent_mode: bool = self._as_bool(cfg.get("silent_mode", True), True)
+        self.silent_mode: bool = self._as_bool(
+            view.get("perception.silent_mode", True), True
+        )
         # 页面感知方式：text / text_image / image（全局默认）。
-        self.page_perception: str = str(cfg.get("page_perception", "text_image"))
+        self.page_perception: str = str(
+            view.get("perception.page_perception", "text_image")
+        )
         # 会话规则级感知模式（v1.3.0）：list[dict]，按 UMO 子串匹配（不区分
         # 大小写）命中第一条；优先级：browse_web 显式参数 > 规则 > 全局。
-        self.perception_rules: list = list(cfg.get("perception_rules", []) or [])
+        self.perception_rules: list = list(
+            view.get("perception.perception_rules", []) or []
+        )
         # 识图短时缓存 TTL（秒，v1.3.0）：同 URL 截图在 TTL 内复用上次识图
         # 结果；0 表示关闭缓存（空值/None 同样按 0 处理，与旧行为一致）。
         self.vision_cache_ttl: int = self._as_int(
-            cfg.get("vision_cache_ttl", 60) or 0, 60
+            view.get("perception.vision_cache_ttl", 60) or 0, 60
         )
         # 媒体缓存保留天数：超过自动清理，节省磁盘；0/负值 = 不清理（v1.3.1）。
-        self.cache_days: int = self._as_int(cfg.get("cache_days", 3), 3)
+        self.cache_days: int = self._as_int(view.get("limits.cache_days", 3), 3)
 
         # 网络与视口
-        self.proxy: str = str(cfg.get("proxy", "") or "")
-        self.viewport: dict = cfg.get("viewport", {"width": 1280, "height": 800})
+        self.proxy: str = str(view.get("browser.proxy", "") or "")
+        self.viewport: dict = view.get(
+            "browser.viewport", {"width": 1280, "height": 800}
+        )
 
         # 浏览器子 Agent 控制（agent-as-tool）
-        self.agent_max_steps: int = self._as_int(cfg.get("agent_max_steps", 70), 70)
-        self.agent_tool_timeout: int = self._as_int(
-            cfg.get("agent_tool_timeout", 1200), 1200
+        self.agent_max_steps: int = self._as_int(
+            view.get("limits.agent_max_steps", 70), 70
         )
+        self.agent_tool_timeout: int = self._as_int(
+            view.get("limits.agent_tool_timeout", 1200), 1200
+        )
+
+        # ---- search 组（v4）：LLM 搜索工具 browser_web_search ----
+        # 全部默认值 = 「关 + 空池」⇒ v4 代码 + v3 配置时工具不出现，行为与
+        # 旧版完全一致（这是迁移顺序不变量的另一半：新代码必须吃得下旧配置）。
+        self.search_enabled: bool = self._as_bool(
+            view.get("search.enabled", False), False
+        )
+        raw_providers = view.get("search.providers", [])
+        self.search_providers: list = list(raw_providers or []) if isinstance(
+            raw_providers, (list, tuple)
+        ) else []
+        self.search_max_parallel: int = _clamp(
+            self._as_int(view.get("search.max_parallel", 3), 3), 1, 10
+        )
+        self.search_max_results: int = _clamp(
+            self._as_int(view.get("search.max_results", 8), 8), 1, 50
+        )
+        # 搜索步数 = 波次上限（每波 ≤ max_parallel，最多 max_rounds 波）。
+        self.search_max_rounds: int = _clamp(
+            self._as_int(view.get("search.max_rounds", 2), 2), 1, 5
+        )
+        self.search_provider_timeout: float = _clamp(
+            self._as_float(view.get("search.provider_timeout", 15), 15), 3, 60
+        )
+        self.search_total_timeout: float = _clamp(
+            self._as_float(view.get("search.total_timeout", 60), 60), 5, 300
+        )
+        self.search_cooldown_seconds: float = _clamp(
+            self._as_float(view.get("search.cooldown_seconds", 60), 60), 0, 3600
+        )
+        self.search_cache_ttl: float = _clamp(
+            self._as_float(view.get("search.cache_ttl", 120), 120), 0, 3600
+        )
+        self.search_fetch_pages: bool = self._as_bool(
+            view.get("search.fetch_pages", False), False
+        )
+        self.search_fetch_top_n: int = _clamp(
+            self._as_int(view.get("search.fetch_top_n", 3), 3), 0, 5
+        )
+        self.search_fetch_timeout: float = _clamp(
+            self._as_float(view.get("search.fetch_timeout", 12), 12), 3, 60
+        )
+        self.search_fetch_max_chars: int = _clamp(
+            self._as_int(view.get("search.fetch_max_chars", 2000), 2000), 200, 20000
+        )
+        self.search_region: str = str(view.get("search.region", "") or "").strip()
+        self.search_safesearch: str = str(
+            view.get("search.safesearch", "moderate") or "moderate"
+        ).strip().lower()
+        if self.search_safesearch not in ("off", "moderate", "strict"):
+            self.search_safesearch = "moderate"
+        # 搜索与抓取共用（与浏览器代理 browser.proxy 相互独立）。
+        self.search_proxy: str = str(view.get("search.proxy", "") or "").strip()
 
     def _as_int(self, value, default: int) -> int:
         """int 配置解析：委托 core 共享实现（v1.3.3 收敛双实现）。"""
@@ -907,12 +1092,12 @@ class BrowserLLMPlugin(Star):
         self.safety = SafetyFilter(self.banned_words, self.block_internal_ip)
         # 本地页面预览白名单：运行时解析真实工作区路径（防硬编码漂移）。
         self._local_page_allowed_roots = _resolve_local_page_roots()
-        # 截图保存目录：data/screenshots/。
-        self._screenshot_dir = Path(__file__).resolve().parent / "data" / "screenshots"
-        self._screenshot_dir.mkdir(parents=True, exist_ok=True)
-        # 媒体下载目录：data/media/。
-        self._media_dir = Path(__file__).resolve().parent / "data" / "media"
-        self._media_dir.mkdir(parents=True, exist_ok=True)
+        # 运行期产物目录：截图与媒体下载都挂到 _DATA_DIR 下（不写插件安装目录，
+        # 否则整目录覆盖升级会连产物一起丢掉）。
+        self._screenshot_dir = _DATA_DIR / "screenshots"
+        self._media_dir = _DATA_DIR / "media"
+        for _dir in (self._screenshot_dir, self._media_dir):
+            _dir.mkdir(parents=True, exist_ok=True)
         # 首次清理过期缓存 + 启动定期清理任务（每 6 小时，独立于会话 sweeper）。
         self._cache_cleanup_task: asyncio.Task | None = None
         try:
@@ -943,6 +1128,9 @@ class BrowserLLMPlugin(Star):
             f"[{self.metadata_name}] 内容审核（禁词过滤）: "
             f"{'开启' if self.enable_banned_filter else '关闭'}"
         )
+        # 搜索工具可见性对齐（v4）：配置是唯一事实源，initialize() 双向收敛
+        # "持久化 inactivated_llm_tools 名单"与配置之间的分叉。
+        await self._reconcile_search_tool()
         logger.info(f"[{self.metadata_name}] 插件 {PLUGIN_VERSION} 已激活")
         logger.info(f"[{self.metadata_name}] 浏览器引擎: {self.browser_type}")
         logger.info(
@@ -1090,7 +1278,8 @@ class BrowserLLMPlugin(Star):
         options = list(dict.fromkeys([""] + ids))
         schema = getattr(self.config, "schema", None)
         if isinstance(schema, dict):
-            item = schema.get("vision_provider_id")
+            # S2b2a：分组 schema 下叶子在 perception.items 里，不能只查顶层。
+            item = schema_leaf(schema, "perception.vision_provider_id")
             if isinstance(item, dict) and isinstance(item.get("options"), list):
                 if item["options"] != options:
                     item["options"] = options
@@ -1170,16 +1359,18 @@ class BrowserLLMPlugin(Star):
         面板改配置立即生效，不必等插件重载）；仅在 config 无此键时回退
         __init__ 快照属性（测试/手动装配场景）。
         """
-        cfg = self.config
-        if isinstance(cfg, dict) and "vision_provider_id" in cfg:
-            return str(cfg.get("vision_provider_id") or "").strip()
+        view = ConfigView(self.config)
+        value, found = view.lookup("perception.vision_provider_id")
+        if found:
+            return str(value or "").strip()
         return str(getattr(self, "vision_provider_id", "") or "").strip()
 
     def _live_vision_prompt(self) -> str:
         """实时读取识图提示词（同 _live_vision_provider_id 的时效语义）。"""
-        cfg = self.config
-        if isinstance(cfg, dict) and "vision_prompt" in cfg:
-            return str(cfg.get("vision_prompt") or "").strip()
+        view = ConfigView(self.config)
+        value, found = view.lookup("perception.vision_prompt")
+        if found:
+            return str(value or "").strip()
         return str(getattr(self, "vision_prompt", "") or "").strip()
 
     async def _resolve_vision_provider_id(
@@ -1301,6 +1492,12 @@ class BrowserLLMPlugin(Star):
             self._local_page_locks.clear()
             # 识图短时缓存清空（防插件重载/禁用后内存残留）。
             self._vision_cache.clear()
+            # 搜索服务缓存/冷却清空（密钥随服务实例一起释放）。
+            if self._search_service is not None:
+                self._search_service.clear_cache()
+            self._search_service = None
+            self._search_service_signature = None
+            self._search_tool_active = False
         logger.info(f"{tag} 已终止")
 
     # ================================================================
@@ -2248,6 +2445,23 @@ class BrowserLLMPlugin(Star):
             logger.warning(f"[{METADATA_NAME}] browse_press_key 失败: {e}")
             return f"【错误】按键操作失败：{e}"
 
+    async def _emit_media(
+        self, event: AstrMessageEvent, path: str, kind: str = "image"
+    ) -> None:
+        """媒体发送出口（T-M0）。
+
+        后台任务（artifact_sink 生效）只登记路径，由投递层统一发送；
+        前台保持原有行为：截图/媒体立即发到当前会话。
+        """
+        if collect_artifact(path):
+            return
+        if kind == "image":
+            await event.send(event.image_result(path))
+            return
+        from astrbot.api.message_components import Video  # noqa: PLC0415
+
+        await event.send(event.chain_result([Video.fromFileSystem(path)]))
+
     async def browse_screenshot(self, event: AstrMessageEvent) -> str:
         """截取当前页面截图并发送给用户，若配置识图模型则附上识图描述（无需参数）。
 
@@ -2270,7 +2484,7 @@ class BrowserLLMPlugin(Star):
                 # 静默模式：截图仅内部识图，不发到群聊（减少刷屏）。
                 if not self.silent_mode:
                     try:
-                        await event.send(event.image_result(result))
+                        await self._emit_media(event, result, "image")
                     except Exception as e:  # noqa: BLE001 — 发图失败不阻塞识图
                         logger.warning(f"[{METADATA_NAME}] 发送截图失败: {e}")
                 # 识图（可选）：配置了 vision_provider_id 才尝试。
@@ -2667,16 +2881,9 @@ class BrowserLLMPlugin(Star):
                         if not path:
                             continue
                         downloaded.append(path)
-                        if cls == "image":
-                            await event.send(event.image_result(path))
-                        else:
-                            from astrbot.api.message_components import (
-                                Video,  # noqa: PLC0415
-                            )
-
-                            await event.send(
-                                event.chain_result([Video.fromFileSystem(path)])
-                            )
+                        await self._emit_media(
+                            event, path, "image" if cls == "image" else "video"
+                        )
                     except Exception as e:  # noqa: BLE001 — 单个失败继续
                         logger.warning(
                             f"[{METADATA_NAME}] 下载/发送媒体失败 {_redact_url(u)}: {e}"
@@ -2979,6 +3186,626 @@ class BrowserLLMPlugin(Star):
             return ""
 
     # ================================================================
+    # LLM 工具：browser_web_search（v4：搜索 API provider 池）
+    # ================================================================
+
+    # ---- 配置 -> provider 池 ----
+
+    def _parse_search_providers(self) -> list:
+        """把 ``search.providers`` 解析成 ProviderEntry（不建 HTTP 实现、不发请求）。
+
+        用于"池内是否有可用 provider"这类**只读判断**（initialize 的自动闸门、
+        handler 兜底）；真正调用时才走 ``_build_search_entries()`` 实例化。
+        """
+        return parse_provider_configs(self.search_providers)
+
+    def _search_usable_entries(self) -> list:
+        """池内可用条目 = 模板已知 + 启用 + 有 key + 无配置错误。"""
+        return [entry for entry in self._parse_search_providers() if is_entry_usable(entry)]
+
+    def _search_available(self) -> bool:
+        """工具是否应当可用：总开关开 + 池内至少一个可用 provider。
+
+        两条都满足才会 ``activate`` 工具；否则自动闸门关掉（防"开着开关但没
+        填 key"时报一堆 missing_key 给模型看）。
+        """
+        return bool(self.search_enabled) and bool(self._search_usable_entries())
+
+    def _search_secret_values(self) -> list:
+        """运行期脱敏表：池内所有非空 api_key（只进内存，不落日志/返回体）。"""
+        return [
+            str(entry.api_key)
+            for entry in self._parse_search_providers()
+            if entry.api_key
+        ]
+
+    def _search_url_guard(self):
+        """结果 URL 的**字面**校验回调（不做 DNS）。
+
+        50 条结果各做一次 DNS 会吃掉整个 ``total_timeout``，因此结果链接只做
+        协议白名单 + 本机名 + IP 字面量判定；真正出网抓正文前另走
+        ``SafetyFilter.acheck_url``（含 DNS、逐跳重定向）。
+        """
+        block_internal = bool(self.block_internal_ip)
+
+        def _guard(url: str) -> bool:
+            ok, _reason = check_url_literal(url, block_internal_ip=block_internal)
+            return ok
+
+        return _guard
+
+    def _build_search_entries(self) -> list:
+        """构造 provider 池（含 HTTP 实现）。测试可 monkeypatch 本方法注入假源。"""
+        return build_provider_entries(
+            self.search_providers,
+            region=self.search_region,
+            safesearch=self.search_safesearch,
+            proxy=self.search_proxy,
+            url_guard=self._search_url_guard(),
+        )
+
+    def _search_signature(self, entries: list) -> tuple:
+        """池签名：provider 段变化才重建 SearchService（冷却/缓存随实例走）。"""
+        return tuple(
+            (
+                entry.name,
+                entry.template,
+                entry.enabled,
+                entry.weight,
+                entry.timeout_s,
+                entry.limit,
+                entry.config_error,
+                entry.api_key,
+            )
+            for entry in entries
+        )
+
+    def _get_search_service(self, entries: list) -> SearchService:
+        """取（必要时重建）搜索服务实例：并发/轮数/超时/冷却/缓存一次注入。"""
+        signature = self._search_signature(entries)
+        if (
+            self._search_service is not None
+            and self._search_service_signature == signature
+        ):
+            return self._search_service
+        service = SearchService(
+            entries=entries,
+            timeout_s=float(self.search_provider_timeout),
+            max_results=int(self.search_max_results),
+            rate_limit_cooldown_s=float(self.search_cooldown_seconds),
+            secrets=[e.api_key for e in entries if e.api_key],
+            cache_ttl_s=float(self.search_cache_ttl),
+        )
+        self._search_service = service
+        self._search_service_signature = signature
+        return service
+
+    # ---- 工具可见性（D4：装饰器常驻 + active 对齐 + handler 兜底） ----
+
+    @staticmethod
+    def _is_own_module_path(path: str) -> bool:
+        """模块路径是否属于本插件（``metadata.module_path`` 或本模块 ``__name__``）。"""
+        if not path:
+            return False
+        return path == __name__ or METADATA_NAME in path
+
+    def _is_own_search_tool(self, func) -> bool:
+        """该 FuncTool 是否属于本插件。
+
+        判定顺序（都要过，缺一不可——``handler_module_path`` 只在
+        ``star_manager`` 载入插件时（:1282-1310）才绑定，import 期为空）：
+
+        1. ``handler_module_path``（绑定后最准）；
+        2. ``handler.__module__``（import 期唯一可用）；
+        3. ``functools.partial.func.__module__``（载入后 handler 被 partial
+           绑定 ``star_cls``，partial 自身没有 ``__module__``）。
+        """
+        if self._is_own_module_path(str(getattr(func, "handler_module_path", "") or "")):
+            return True
+        handler = getattr(func, "handler", None)
+        if isinstance(handler, functools.partial):
+            handler = handler.func
+        module = str(getattr(handler, "__module__", "") or "")
+        return self._is_own_module_path(module)
+
+    def _search_tool_registry_state(self) -> tuple[bool, list]:
+        """返回 (本插件是否已注册该工具, 同名"别人家"工具列表)。"""
+        try:
+            from astrbot.core.provider.register import llm_tools  # noqa: PLC0415
+        except Exception:  # noqa: BLE001 — 桩/早期环境没有 manager 时按"未注册"处理
+            return False, []
+        funcs = list(getattr(llm_tools, "func_list", []) or [])
+        own = False
+        clash: list = []
+        for func in funcs:
+            if getattr(func, "name", None) != _SEARCH_TOOL_NAME:
+                continue
+            if self._is_own_search_tool(func):
+                own = True
+            else:
+                clash.append(func)
+        return own, clash
+
+    async def _reconcile_search_tool(self) -> None:
+        """把工具 ``active`` 态对齐到配置（配置 = 唯一事实源）。
+
+        机制（spec §6.2，captain 裁定 D4）：``@filter.llm_tool`` 在 import 期
+        就注册（平台没有"按配置注册"的口子），因此用 ``activate_llm_tool_async``
+        / ``deactivate_llm_tool_async`` 切 ``active``；请求装配期核心会剔除
+        ``active=False`` 的工具，模型**根本看不到**它（不是"调用后报错"）。
+
+        三条必须知道的副作用：
+        1. ``deactivate_llm_tool_async`` 会把工具名写进**全局持久化**的
+           ``inactivated_llm_tools``（跨重启保留）；
+        2. 因此"配置说开、名单说关"会短暂分叉 —— 本方法是双向收敛点；
+        3. 插件卸载/改名后该名字可能残留，下次装回同名工具初值是
+           ``active=False``，仍由本方法在 ``initialize()`` 时纠正。
+        """
+        own, clash = self._search_tool_registry_state()
+        if clash:
+            # 同名但属别人：**不碰 active**（fail-closed，只报错）。
+            logger.error(
+                f"[{self.metadata_name}] {_SEARCH_TOOL_NAME} 名称冲突："
+                f"{[getattr(f, 'handler_module_path', '') for f in clash]}，"
+                "已跳过可见性对齐（请检查是否有其它插件注册了同名工具）"
+            )
+            return
+
+        want = self._search_available()
+        if not own:
+            # import 期以外（桩环境/管理器不可见）：只记影子值，入口兜底负责。
+            self._search_tool_active = want
+            return
+
+        activate = getattr(self.context, "activate_llm_tool_async", None)
+        deactivate = getattr(self.context, "deactivate_llm_tool_async", None)
+        if not callable(activate) or not callable(deactivate):
+            # 兼容降级（<4.29 的 Context）：常驻可见 + handler 入口返回 disabled。
+            self._search_tool_active = want
+            logger.info(
+                f"[{self.metadata_name}] Context 不支持 activate/deactivate_llm_tool_async，"
+                f"搜索工具降级为常驻注册（入口按配置兜底，enabled={self.search_enabled}）"
+            )
+            return
+
+        try:
+            if want:
+                await activate(_SEARCH_TOOL_NAME)
+            else:
+                await deactivate(_SEARCH_TOOL_NAME)
+        except Exception as exc:  # noqa: BLE001 — 对齐失败不能阻断插件启动
+            logger.warning(
+                f"[{self.metadata_name}] 搜索工具可见性对齐失败（{type(exc).__name__}），"
+                f"保持常驻注册并由入口兜底（enabled={self.search_enabled}）"
+            )
+            self._search_tool_active = want
+            return
+
+        self._search_tool_active = want
+        if want:
+            logger.info(
+                f"[{self.metadata_name}] 搜索工具已启用：{_SEARCH_TOOL_NAME}"
+                f"（可用 provider={[e.name for e in self._search_usable_entries()]}）"
+            )
+        else:
+            reason = (
+                "search.enabled=false"
+                if not self.search_enabled
+                else "池内无可用 provider（缺 api_key / 全部禁用 / 端点非法）"
+            )
+            logger.info(
+                f"[{self.metadata_name}] search tool inactive: {_SEARCH_TOOL_NAME}"
+                f"（{reason}）"
+            )
+
+    # ---- 返回体与安全过滤 ----
+
+    def _search_payload(self, **kwargs) -> str:
+        """统一渲染工具返回体（三态同一 schema，``ok`` 由 status 推导）。"""
+        return render_payload(**kwargs)
+
+    @staticmethod
+    def _parse_providers_arg(raw: str) -> list | None:
+        """解析工具参数 ``providers``（逗号/分号分隔）；空 ⇒ None（不过滤）。"""
+        text = (raw or "").strip()
+        if not text:
+            return None
+        names = [part.strip() for part in re.split(r"[,;，；]", text) if part.strip()]
+        return names or None
+
+    def _filter_banned_results(self, results: list) -> tuple[list, int]:
+        """结果级禁词过滤：命中则**只丢该条**（不整单拒绝）。"""
+        kept: list = []
+        dropped = 0
+        for item in results:
+            banned = self._check_banned(f"{item.title}\n{item.snippet}")
+            if banned:
+                dropped += 1
+                continue
+            kept.append(item)
+        for idx, item in enumerate(kept, start=1):
+            item.rank = idx
+        return kept, dropped
+
+    def _make_search_fetcher(self) -> AiohttpFetcher:
+        """构造正文抓取器（测试可 monkeypatch 本方法注入假 transport）。"""
+        safety = self.safety
+        return AiohttpFetcher(
+            limits=CrawlerLimits(
+                timeout_s=float(self.search_fetch_timeout),
+                max_chars=int(self.search_fetch_max_chars),
+                user_agent="AstrBot-BrowserLLM/1.0",
+            ),
+            url_guard=safety.acheck_url if safety is not None else None,
+            proxy=self.search_proxy,
+        )
+
+    async def _fetch_search_results(
+        self, results: list, top_n: int, *, deadline: float | None = None
+    ) -> None:
+        """抓取排序前 ``top_n`` 条的正文（逐条隔离，失败只改该条 ``fetched``）。
+
+        Args:
+            results: 合并后的结果（就地写 ``fetched``）。
+            top_n: 抓取条数。
+            deadline: 本次调用的总预算截止时刻（``time.monotonic()`` 基准）；
+                单条超时按"剩余预算"二次收敛，防止抓取阶段吃掉全部预算。
+        """
+        target = results[: max(0, int(top_n))]
+        if not target:
+            return
+        fetcher = self._make_search_fetcher()
+        per_timeout = float(self.search_fetch_timeout)
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            per_timeout = max(0.5, min(per_timeout, remaining))
+
+        async def fetch_one(item) -> None:
+            began = time.monotonic()
+            try:
+                outcome = await asyncio.wait_for(
+                    fetcher.fetch(item.url, timeout=per_timeout),
+                    timeout=per_timeout + 0.5,
+                )
+            except asyncio.TimeoutError:
+                outcome = FetchOutcome(
+                    ok=False,
+                    code="fetch_timeout",
+                    url=item.url,
+                    elapsed_ms=int((time.monotonic() - began) * 1000),
+                )
+            except Exception as exc:  # noqa: BLE001 — 抓取失败不影响主结果
+                logger.debug(
+                    f"[{self.metadata_name}] 搜索正文抓取失败: {_redact_url(item.url)}"
+                    f" ({type(exc).__name__})"
+                )
+                outcome = FetchOutcome(
+                    ok=False,
+                    code="fetch_failed",
+                    url=item.url,
+                    elapsed_ms=int((time.monotonic() - began) * 1000),
+                )
+            if outcome.ok:
+                # 正文复用 _check_banned（受 security.enable_banned_filter 控制）：
+                # 命中则丢正文、保留 title/url/snippet，便于模型仍能引用来源。
+                banned = self._check_banned(outcome.text)
+                if banned:
+                    outcome.ok = False
+                    outcome.code = "fetch_blocked"
+                    outcome.text = ""
+            item.fetched = outcome.as_dict()
+
+        await asyncio.gather(
+            *(fetch_one(item) for item in target), return_exceptions=True
+        )
+
+    # ---- 工具本体 ----
+
+    @filter.llm_tool(name=_SEARCH_TOOL_NAME)
+    async def browser_web_search(
+        self,
+        event: AstrMessageEvent,
+        query: str = "",
+        max_results: int = 0,
+        rounds: int = 0,
+        timeout: int = 0,
+        providers: str = "",
+        fetch_pages: bool = False,
+        fetch_top_n: int = 0,
+    ) -> str:
+        """网页搜索（本插件自有搜索 API 池，返回结构化 JSON）；与内置的 web_search_<provider> 不同，同时可见时只选其一。
+
+        并行调用本插件配置的搜索 API（brave/bocha/firecrawl/tavily/exa，
+        每种可配多份、各有自己的 api_key），按 URL 去重合并后返回带来源的
+        结构化结果，可选抓取前几条的正文。**与 AstrBot 内置的
+        ``web_search_<provider>`` 工具不同**：本工具只用插件配置里的 key，
+        不读核心 ``provider_settings``，两者不会互相读取 key、也不会互相降级；
+        若主 LLM 同时看到内置搜索工具，**只选其一**（不要重复搜同一个问题）。
+
+        适合：事实问答、需要来源链接、只需摘要无需页面交互的检索。
+        不适合：需要登录/点击/翻页/表单等真实页面交互（用 browse_web 委托
+        浏览器子代理）、需要看页面外观（用 browse_web 截图）。
+
+        返回一个 JSON 字符串：``status``（ok/partial/failed/disabled）、
+        ``results[]``（rank/title/url/snippet/sources/fetched）、``attempts[]``
+        （每个 provider 的 outcome/code/耗时）、``error_codes``、``notes``。
+        回答用户时请依据 ``results[].snippet`` 或 ``fetched.text``，并给出链接。
+
+        Args:
+            query(string): 检索词。必填，空串会被拒绝。
+            max_results(number): 返回条数上限（1-50）。0 表示用插件配置值。可省略
+            rounds(number): 搜索步数 = 并行波次上限（1-5）。0 表示用插件配置值。可省略
+            timeout(number): 本次调用总预算秒数（5-300）。0 表示用插件配置值。可省略
+            providers(string): 逗号分隔的 provider 名（如 "brave#1,bocha#1"），只允许池内已启用项，用于覆盖默认顺序。可省略
+            fetch_pages(boolean): 是否抓取结果正文（需插件配置 search.fetch_pages 已开启，取「与」）。可省略
+            fetch_top_n(number): 抓取前 N 条（0-5）。0 表示用插件配置值。可省略
+        """
+        began = time.monotonic()
+        text = (query or "").strip()
+        notes: list[str] = []
+        # 搜索阶段的**增量快照**容器（t6 M-1）：search_waves 每波结束都把
+        # 已得 results/attempts/rounds_used/status 写进来；外层 wait_for 超时
+        # 会取消协程并丢掉返回值，这里保留最后一次快照用于渲染 partial。
+        progress: dict = {}
+        try:
+            # 入口兜底（captain 要求）：①面板单独停用了该工具、②外部直接改
+            # 配置文件但没触发 reload —— 两种情况都在这里返回 disabled。
+            self._refresh_config()
+            if not self.search_enabled:
+                return self._search_payload(
+                    status="disabled",
+                    code="disabled",
+                    summary="【拒绝】搜索工具已在插件配置中关闭（search.enabled=false）",
+                    query=text,
+                    hint="如需使用，请在插件配置「搜索 API（browser_web_search）」里打开 enabled 并至少填写一个 provider 的 api_key。",
+                )
+
+            allowed, deny_reason = self._is_session_allowed(event)
+            if not allowed:
+                return self._search_payload(
+                    status="failed",
+                    code="session_denied",
+                    summary=f"【拒绝】{deny_reason}",
+                    query=text,
+                )
+
+            if not text:
+                return self._search_payload(
+                    status="failed",
+                    code="empty_query",
+                    summary="【错误】检索词为空，请提供要搜索的问题或关键词",
+                    query=text,
+                )
+
+            banned = self._check_banned(text)
+            if banned:
+                return self._search_payload(
+                    status="failed",
+                    code="banned",
+                    summary=f"【拒绝】检索词包含违禁内容：{banned}",
+                    query=text,
+                )
+
+            entries = self._build_search_entries()
+            # 结果 URL 的字面校验在这里统一兜底挂上去：即使池是外部注入的
+            # （没有走 build_provider_entries），也不会漏掉 SSRF 过滤。
+            guard = self._search_url_guard()
+            for entry in entries:
+                if entry.url_guard is None:
+                    entry.url_guard = guard
+            usable = [entry for entry in entries if is_entry_usable(entry)]
+            if not usable:
+                return self._search_payload(
+                    status="failed",
+                    code="no_provider",
+                    summary="【错误】没有可用的搜索后端（池内无已填写 api_key 的 provider）",
+                    query=text,
+                    hint="请在插件配置「搜索 API（browser_web_search）」→ provider 池中添加模板并填写 api_key。",
+                    attempts=self._pool_attempts(entries),
+                )
+
+            limit = _clamp(max_results or self.search_max_results, 1, 50)
+            rounds_cap = _clamp(rounds or self.search_max_rounds, 1, 5)
+            budget = float(_clamp(timeout or self.search_total_timeout, 5, 300))
+            top_n = _clamp(fetch_top_n or self.search_fetch_top_n, 0, 5)
+            want_fetch = bool(fetch_pages) and bool(self.search_fetch_pages) and top_n > 0
+            provider_filter = self._parse_providers_arg(providers)
+
+            # 抓取阶段留 40% 预算（spec §7.3），搜索阶段不超 60%。
+            search_budget = budget * 0.6 if want_fetch else max(1.0, budget - 1.0)
+            service = self._get_search_service(entries)
+            wave = await asyncio.wait_for(
+                service.search_waves(
+                    text,
+                    max_results=limit,
+                    max_rounds=rounds_cap,
+                    max_parallel=int(self.search_max_parallel),
+                    provider_timeout=float(self.search_provider_timeout),
+                    time_budget_s=search_budget,
+                    provider_filter=provider_filter,
+                    progress=progress,
+                ),
+                timeout=budget + 1.0,
+            )
+            notes.extend(wave.notes)
+
+            # 非 brave 的 provider 忽略 region：给运营方一个可观测提示。
+            if self.search_region:
+                for entry in usable:
+                    if entry.template != "brave":
+                        tag = f"region_unsupported:{entry.template}"
+                        if tag not in notes:
+                            notes.append(tag)
+
+            results, banned_dropped = self._filter_banned_results(list(wave.results))
+            if banned_dropped:
+                notes.append(f"banned_results:{banned_dropped}")
+
+            if want_fetch and results:
+                await self._fetch_search_results(
+                    results, top_n, deadline=began + budget
+                )
+
+            status = wave.status
+            code = wave.code
+            fetch_failed = any(
+                isinstance(item.fetched, dict) and not item.fetched.get("ok", False)
+                for item in results
+            )
+            if results:
+                degraded = status == "partial" or fetch_failed or bool(banned_dropped)
+                status = "partial" if degraded else "ok"
+                code = "ok"
+            else:
+                status = "failed"
+                if banned_dropped:
+                    code = "banned"
+
+            summary = summarize(
+                status=status,
+                code=code,
+                results=results,
+                attempts=wave.attempts,
+                query=text,
+            )
+            if status == "failed" and code == "banned":
+                summary = "【拒绝】搜索结果全部命中禁词，已丢弃（可调整 security.banned_words）"
+            hint = ""
+            if status == "failed":
+                hint = self._search_failure_hint(code)
+            return self._search_payload(
+                status=status,
+                code=code,
+                summary=summary,
+                query=text,
+                rounds_used=wave.rounds_used,
+                max_rounds=wave.max_rounds,
+                providers_effective=wave.providers_effective,
+                cache=wave.cache,
+                elapsed_ms=int((time.monotonic() - began) * 1000),
+                results=results,
+                attempts=wave.attempts,
+                error_codes=wave.error_codes,
+                notes=notes,
+                hint=hint,
+            )
+        except asyncio.TimeoutError:
+            # 外层兜底触发（搜索阶段被预算切断）：**已有结果必须保留**，
+            # 渲染成 partial 而不是把整批结果丢掉（t6 M-1）。
+            partial = list(progress.get("results") or [])
+            partial, dropped = self._filter_banned_results(partial)
+            attempts = list(progress.get("attempts") or [])
+            timeout_notes = notes + ["total_timeout"]
+            if dropped:
+                timeout_notes.append(f"banned_results:{dropped}")
+            if partial:
+                return self._search_payload(
+                    status="partial",
+                    code="ok",
+                    summary=summarize(
+                        status="partial",
+                        code="ok",
+                        results=partial,
+                        attempts=attempts,
+                        query=text,
+                    ),
+                    query=text,
+                    rounds_used=int(progress.get("rounds_used") or 0),
+                    max_rounds=int(progress.get("max_rounds") or 0),
+                    providers_effective=list(progress.get("providers_effective") or []),
+                    elapsed_ms=int((time.monotonic() - began) * 1000),
+                    results=partial,
+                    attempts=attempts,
+                    notes=timeout_notes,
+                )
+            return self._search_payload(
+                status="failed",
+                code="total_timeout",
+                summary=f"【错误】搜索超过总预算（{self.search_total_timeout:.0f}s）被中断",
+                query=text,
+                rounds_used=int(progress.get("rounds_used") or 0),
+                max_rounds=int(progress.get("max_rounds") or 0),
+                elapsed_ms=int((time.monotonic() - began) * 1000),
+                attempts=attempts,
+                notes=timeout_notes,
+                hint="可调大插件配置 search.total_timeout，或减小 max_parallel/max_rounds。",
+            )
+        except Exception as exc:  # noqa: BLE001 — 工具契约：绝不把异常抛给模型
+            message = redact_secrets(
+                f"{type(exc).__name__}: {exc}", self._search_secret_values()
+            )
+            logger.warning(
+                f"[{self.metadata_name}] browser_web_search 执行异常: {message}"
+            )
+            return self._search_payload(
+                status="failed",
+                code="internal_error",
+                summary="【错误】搜索工具内部异常，请稍后重试或改用 browse_web",
+                query=text,
+                elapsed_ms=int((time.monotonic() - began) * 1000),
+                notes=notes,
+            )
+
+    def _pool_attempts(self, entries: list) -> list:
+        """把"池内无可用 provider"的原因展开成 attempts（供模型/运营方判断）。"""
+        from .core.search import SearchAttempt  # noqa: PLC0415 — 避免顶层多导一个符号
+
+        out = []
+        for entry in entries:
+            code = "ok"
+            if entry.config_error:
+                code = entry.config_error
+            elif entry.template not in PROVIDER_CLASSES:
+                code = "unknown_template"
+            elif not entry.enabled:
+                code = "disabled"
+            elif not entry.api_key:
+                code = "missing_key"
+            if code == "ok":
+                continue
+            out.append(
+                SearchAttempt(
+                    provider=entry.name,
+                    template=entry.template,
+                    round=0,
+                    outcome="skipped",
+                    code=code,
+                )
+            )
+        return out
+
+    @staticmethod
+    def _search_failure_hint(code: str) -> str:
+        """失败时给运营方的处置建议（只提配置位置，不提任何值）。"""
+        hints = {
+            "auth": "某个 provider 鉴权失败（401/403）：请检查该 provider 的 api_key 是否正确/过期。",
+            "rate_limited": "某个 provider 触发限流（429）：已进入冷却，请稍后再试或调大 search.cooldown_seconds。",
+            "http_5xx": "某个 provider 上游异常（5xx）：稍后重试即可。",
+            "timeout": "某个 provider 响应超时：可调大 search.provider_timeout 或检查网络/代理。",
+            "network": "网络不可达：请检查 search.proxy 与服务器出网情况。",
+            "bad_response": "某个 provider 返回结构不符：可能是端点改动或反代返回了错误页，请检查 base_url。",
+            "empty": "provider 返回 0 条结果：换个检索词或换 provider。",
+            "no_provider": "请在插件配置「搜索 API（browser_web_search）」里添加 provider 并填写 api_key。",
+            "banned": "结果命中 security.banned_words：请调整禁词表后再试。",
+        }
+        return hints.get(code, "请检查插件配置「搜索 API（browser_web_search）」的 provider 池与超时设置。")
+
+    def _build_search_instruction(self) -> str:
+        """搜索工具的使用指引（仅在工具 active 时注入，避免让模型去调不存在的工具）。"""
+        return (
+            "\n\n## 搜索工具指引（browser_web_search）\n"
+            "你可以用 browser_web_search 直接做联网检索：它并行调用本插件配置的"
+            "搜索 API 池，返回 JSON（results 里带 url/snippet，可选抓正文）。\n\n"
+            "【要用】事实问答、需要来源链接、只需摘要的检索；"
+            "回答时依据 results[].snippet 或 results[].fetched.text，并给出链接。\n\n"
+            "【不要用】需要登录、点击、翻页、填表或看页面外观的任务 —— 那些用"
+            "browse_web 委托浏览器子代理。\n\n"
+            "【与内置搜索并存】browser_web_search 与 AstrBot 内置的"
+            " web_search_<provider> 是两套独立实现（各自的 key、不互相降级）；"
+            "同时可见时**只选其一**，不要对同一个问题重复搜两遍。"
+        )
+
+    # ================================================================
     # LLM 请求注入：浏览指引
     # ================================================================
 
@@ -3005,7 +3832,7 @@ class BrowserLLMPlugin(Star):
         定位：浏览器子代理（browser_agent）是重操作，主 LLM 仅在需要
         真实网页交互时调用 browse_web 委托；纯搜索/问答不要调用。
         """
-        return (
+        text = (
             "\n\n## 网页浏览委托指引（浏览器子代理）\n"
             "你可以用 browse_web 工具把网页浏览任务委托给浏览器子代理"
             "（参数 input 为给子代理的任务描述）。\n\n"
@@ -3024,3 +3851,8 @@ class BrowserLLMPlugin(Star):
             "是否要交互），子代理会自主调用 browse_* 工具完成浏览并"
             "返回结果；你消化结果后再回复用户，不要暴露工具调用过程细节。"
         )
+        # 搜索工具仅在 active 时注入指引（active=False 时模型根本看不到该
+        # 工具，再写指引只会诱导幻觉调用）。
+        if self._search_tool_active:
+            text += self._build_search_instruction()
+        return text

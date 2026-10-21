@@ -16,7 +16,6 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
 
 from astrbot.api.star import Context
 from core.safety import SafetyFilter

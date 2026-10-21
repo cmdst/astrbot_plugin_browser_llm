@@ -16,7 +16,6 @@ docstring_parser 保证即使在无桩环境也能跑）。
 """
 
 import ast
-import json
 from pathlib import Path
 
 from docstring_parser import parse as dp_parse
@@ -159,13 +158,15 @@ def _eval_params_call(node: ast.Call) -> dict:
 # ------------------------------------------------------------
 
 def test_no_llm_tool_decorators():
-    """browse_* 方法不应有 @filter.llm_tool 装饰器（仅两个对外入口例外）。
+    """browse_* 方法不应有 @filter.llm_tool 装饰器（仅三个对外入口例外）。
 
     例外入口：
     - browse_web：浏览器子代理委托入口（主 LLM / 子代理均可调用）；
-    - browse_local_page：本地页面渲染预览入口（面向 frontend/engineer 子代理）。
+    - browse_local_page：本地页面渲染预览入口（面向 frontend/engineer 子代理）；
+    - browser_web_search：v4 搜索 API 池入口（受 search.enabled 控制可见性，
+      且与核心内置 ``web_search_<provider>`` 不同名、并存不接管）。
     """
-    allowed_entries = {"browse_web", "browse_local_page"}
+    allowed_entries = {"browse_web", "browse_local_page", "browser_web_search"}
     for node in ast.walk(_TREE):
         if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
             for dec in node.decorator_list:
@@ -394,36 +395,64 @@ def test_screenshot_filename_has_milli_and_session():
 # ------------------------------------------------------------
 
 def test_new_configs_in_schema():
-    """_conf_schema.json 含 silent_mode / page_perception / cache_days 及 v1.3.0 新配置。"""
+    """_conf_schema.json：分组形态 + 既有键 + v4 search 组结构。
+
+    v4 起 schema 是 5 个 object 组（browser/limits/security/perception/search），
+    组内 ``items`` 才是叶子；本用例同时钉住"分组没有漏组/多组"这层形状。
+    """
     import json
     schema = json.loads((_ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
-    assert "silent_mode" in schema and schema["silent_mode"]["type"] == "bool"
-    assert schema["silent_mode"]["default"] is True
-    assert "page_perception" in schema
-    assert schema["page_perception"]["type"] == "string"
-    assert schema["page_perception"]["default"] == "text_image"
-    assert set(schema["page_perception"]["options"]) == {"text", "text_image", "image"}
-    assert "cache_days" in schema and schema["cache_days"]["type"] == "int"
-    assert schema["cache_days"]["default"] == 3
+    assert set(schema) == {"browser", "limits", "security", "perception", "search"}
+    for group in schema.values():
+        assert group["type"] == "object"
+
+    perception = schema["perception"]["items"]
+    assert perception["silent_mode"]["type"] == "bool"
+    assert perception["silent_mode"]["default"] is True
+    assert perception["page_perception"]["type"] == "string"
+    assert perception["page_perception"]["default"] == "text_image"
+    assert set(perception["page_perception"]["options"]) == {
+        "text", "text_image", "image"}
+    # cache_days 属 limits 组
+    assert schema["limits"]["items"]["cache_days"]["type"] == "int"
+    assert schema["limits"]["items"]["cache_days"]["default"] == 3
     # v1.3.0：perception_rules / vision_cache_ttl
-    assert "perception_rules" in schema
-    assert schema["perception_rules"]["type"] == "list"
-    assert schema["perception_rules"]["default"] == []
-    items = schema["perception_rules"]["items"]
+    assert perception["perception_rules"]["type"] == "list"
+    assert perception["perception_rules"]["default"] == []
+    items = perception["perception_rules"]["items"]
     assert set(items) == {"match", "perception", "note"}, items.keys()
     assert items["perception"]["options"] == ["text", "text_image", "image"]
-    assert "vision_cache_ttl" in schema
-    assert schema["vision_cache_ttl"]["type"] == "int"
-    assert schema["vision_cache_ttl"]["default"] == 60
+    assert perception["vision_cache_ttl"]["type"] == "int"
+    assert perception["vision_cache_ttl"]["default"] == 60
+
+    # ---- v4：search 组（16 键 + 5 provider 模板） ----
+    search = schema["search"]
+    assert search["type"] == "object"
+    assert len(search["items"]) == 16, sorted(search["items"])
+    providers = search["items"]["providers"]
+    assert providers["type"] == "template_list"
+    assert providers["default"] == []
+    assert set(providers["templates"]) == {
+        "brave", "bocha", "firecrawl", "tavily", "exa"}
+    for tname, tmeta in providers["templates"].items():
+        assert set(tmeta["items"]) == {
+            "enabled", "name", "api_key", "base_url", "weight", "timeout",
+            "max_results"}, tname
+        assert tmeta["items"]["api_key"]["type"] == "string"
+        assert tmeta["items"]["weight"]["default"] == 50
+    assert search["items"]["enabled"]["default"] is False
+    assert search["items"]["max_rounds"]["default"] == 2
+    assert set(search["items"]["safesearch"]["options"]) == {
+        "off", "moderate", "strict"}
 
 
 def test_load_config_reads_new_configs():
     """_load_config 读取 silent_mode / page_perception / perception_rules / vision_cache_ttl。"""
     src = _SRC
-    assert "self.silent_mode" in src and 'cfg.get("silent_mode", True)' in src
-    assert "self.page_perception" in src and 'cfg.get("page_perception", "text_image")' in src
-    assert "self.perception_rules" in src and 'cfg.get("perception_rules", [])' in src
-    assert "self.vision_cache_ttl" in src and 'cfg.get("vision_cache_ttl", 60)' in src
+    assert "self.silent_mode" in src and 'view.get("perception.silent_mode", True)' in src
+    assert "self.page_perception" in src and 'view.get("perception.page_perception", "text_image")' in src
+    assert "self.perception_rules" in src and 'view.get("perception.perception_rules", [])' in src
+    assert "self.vision_cache_ttl" in src and 'view.get("perception.vision_cache_ttl", 60)' in src
 
 
 def test_build_browser_instruction_dynamic():

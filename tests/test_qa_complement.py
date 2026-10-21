@@ -221,67 +221,114 @@ def test_max_chars_invalid_str_breaks_tool():
 
 
 def test_conf_schema_keys_match_load_config():
-    """_conf_schema.json 顶层键与 _load_config 读取键双向一致。"""
+    """_conf_schema.json 的**顶层组名**与 _load_config 读取的组双向一致。
+
+    v4 起 schema 是 5 个 object 组（browser/limits/security/perception/search），
+    代码读取点是点号路径（``view.get("search.enabled")``），所以这里比的是
+    "组名集合"。**叶子级**一致性由两个更细的守卫覆盖，删除本守卫前先确认
+    它们仍在：
+    - ``tests/test_core_config_readpoints.py::test_main_covers_every_mapped_path``
+      （KEY_MAP 每条路径都被 main.py 读到）；
+    - ``tests/test_search_config_schema.py::test_schema_leaves_match_key_map``
+      （schema 每组叶子 == KEY_MAP 的路径集合）。
+    """
     schema_path = Path(__file__).resolve().parent.parent / "_conf_schema.json"
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
     schema_keys = set(schema.keys())
 
-    # 从 _load_config 源码提取 cfg.get 的键名
     main_src = (Path(__file__).resolve().parent.parent / "main.py").read_text(encoding="utf-8")
     load_section = main_src.split("def _load_config")[1].split("def _refresh_config")[0]
-    code_keys = set(re.findall(r'cfg\.get\(\s*"([^"]+)"', load_section))
+    dotted = set(re.findall(r'view\.get\(\s*"([^"]+)"', load_section))
+    dotted |= set(re.findall(r'view\.lookup\(\s*"([^"]+)"', load_section))
+    code_groups = {path.split(".", 1)[0] for path in dotted if "." in path}
 
-    assert schema_keys == code_keys, (
-        f"schema 与代码不一致。仅 schema 有: {schema_keys - code_keys}；"
-        f"仅代码读: {code_keys - schema_keys}"
+    assert schema_keys == code_groups, (
+        f"schema 顶层组与代码读取组不一致。仅 schema 有: {schema_keys - code_groups}；"
+        f"仅代码读: {code_groups - schema_keys}"
     )
 
 
 def test_conf_schema_defaults_match_code():
-    """关键配置项 schema 默认值与代码默认值一致。"""
+    """关键配置项 schema 默认值与代码默认值一致（v4：按组内下标读取）。"""
     schema_path = Path(__file__).resolve().parent.parent / "_conf_schema.json"
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
     p = BrowserLLMPlugin(None, {})
+    # (组, 叶) -> (代码属性名, 期望默认值)
     checks = {
-        "browser_type": "chromium",
-        "default_url": "https://www.baidu.com",
-        "default_search_engine": "必应搜索",
-        "block_internal_ip": True,
-        "max_chars": 4000,
-        "max_links": 20,
-        "timeout": 30,
-        "max_pages": 5,
-        "idle_timeout": 1800,
-        "enable_screenshot": True,
-        "silent_mode": True,
-        "page_perception": "text_image",
-        "vision_cache_ttl": 60,
-        "cache_days": 3,
-        "agent_max_steps": 70,
-        "agent_tool_timeout": 1200,
-        "proxy": "",
+        ("browser", "type"): ("browser_type", "chromium"),
+        ("browser", "default_url"): ("default_url", "https://www.baidu.com"),
+        ("browser", "default_search_engine"): ("default_search_engine", "必应搜索"),
+        ("browser", "timeout"): ("timeout", 30),
+        ("browser", "proxy"): ("proxy", ""),
+        ("limits", "max_chars"): ("max_chars", 4000),
+        ("limits", "max_links"): ("max_links", 20),
+        ("limits", "max_pages"): ("max_pages", 5),
+        ("limits", "idle_timeout"): ("idle_timeout", 1800),
+        ("limits", "cache_days"): ("cache_days", 3),
+        ("limits", "agent_max_steps"): ("agent_max_steps", 70),
+        ("limits", "agent_tool_timeout"): ("agent_tool_timeout", 1200),
+        ("security", "block_internal_ip"): ("block_internal_ip", True),
+        ("perception", "enable_screenshot"): ("enable_screenshot", True),
+        ("perception", "silent_mode"): ("silent_mode", True),
+        ("perception", "page_perception"): ("page_perception", "text_image"),
+        ("perception", "vision_cache_ttl"): ("vision_cache_ttl", 60),
+        # ---- v4：search 组 16 键（代码属性名前缀 search_） ----
+        ("search", "enabled"): ("search_enabled", False),
+        ("search", "max_parallel"): ("search_max_parallel", 3),
+        ("search", "max_results"): ("search_max_results", 8),
+        ("search", "max_rounds"): ("search_max_rounds", 2),
+        ("search", "provider_timeout"): ("search_provider_timeout", 15),
+        ("search", "total_timeout"): ("search_total_timeout", 60),
+        ("search", "cooldown_seconds"): ("search_cooldown_seconds", 60),
+        ("search", "cache_ttl"): ("search_cache_ttl", 120),
+        ("search", "fetch_pages"): ("search_fetch_pages", False),
+        ("search", "fetch_top_n"): ("search_fetch_top_n", 3),
+        ("search", "fetch_timeout"): ("search_fetch_timeout", 12),
+        ("search", "fetch_max_chars"): ("search_fetch_max_chars", 2000),
+        ("search", "region"): ("search_region", ""),
+        ("search", "safesearch"): ("search_safesearch", "moderate"),
+        ("search", "proxy"): ("search_proxy", ""),
     }
-    for key, expect in checks.items():
-        assert schema[key]["default"] == expect, f"schema default {key} != {expect}"
-        assert getattr(p, key) == expect, f"代码默认 {key} != {expect}"
-    # banned_words 默认列表
-    assert schema["banned_words"]["default"] == p.banned_words
-    # viewport
-    assert schema["viewport"]["items"]["width"]["default"] == 1280
-    assert schema["viewport"]["items"]["height"]["default"] == 800
+    for (group, leaf), (attr, expect) in checks.items():
+        got_schema = schema[group]["items"][leaf]["default"]
+        assert got_schema == expect, f"schema default {group}.{leaf} != {expect}"
+        assert getattr(p, attr) == expect, f"代码默认 {attr} != {expect}"
+    # 列表/映射类默认值
+    assert schema["security"]["items"]["banned_words"]["default"] == p.banned_words
+    assert schema["search"]["items"]["providers"]["default"] == []
+    assert p.search_providers == []
+    assert schema["perception"]["items"]["perception_rules"]["default"] == []
+    # viewport（组内嵌 object）
+    viewport = schema["browser"]["items"]["viewport"]["items"]
+    assert viewport["width"]["default"] == 1280
+    assert viewport["height"]["default"] == 800
 
 
 def test_schema_no_select_type_astrbot_4273_compatible():
-    """AstrBot 4.27.3 不支持 type=select；schema 应全部为 string+options 形式。"""
+    """AstrBot 4.27.3 不支持 type=select；schema 应全部为 string+options 形式。
+
+    v4 起 schema 是 5 个 object 组 + 组内 template_list，改为递归遍历。
+    """
     schema_path = Path(__file__).resolve().parent.parent / "_conf_schema.json"
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
-    for key, item in schema.items():
-        assert item.get("type") != "select", f"{key} 使用了不兼容的 select 类型"
-        if "options" in item:
-            assert item["type"] == "string", f"{key} 带 options 但类型不是 string"
+
+    def walk(node: dict, path: str = "") -> None:
+        for key, item in node.items():
+            here = f"{path}{key}"
+            assert isinstance(item, dict), f"{here} 节点不是 dict"
+            assert item.get("type") != "select", f"{here} 使用了不兼容的 select 类型"
+            if "options" in item:
+                assert item["type"] == "string", f"{here} 带 options 但类型不是 string"
+            if item.get("type") == "object":
+                walk(item.get("items", {}), f"{here}.")
+            for tname, tmeta in (item.get("templates") or {}).items():
+                walk(tmeta.get("items", {}), f"{here}.{tname}.")
+
+    walk(schema)
     # 嵌套 items（perception_rules）
-    assert schema["perception_rules"]["items"]["perception"]["options"] == [
-        "text", "text_image", "image"]
+    assert schema["perception"]["items"]["perception_rules"]["items"]["perception"][
+        "options"
+    ] == ["text", "text_image", "image"]
 
 
 # ================================================================

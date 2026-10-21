@@ -523,7 +523,8 @@ def test_schema_no_hardcoded_provider():
     schema = json.loads(
         (_ROOT / "_conf_schema.json").read_text(encoding="utf-8")
     )
-    item = schema["vision_provider_id"]
+    # v4：schema 已分组，vision_provider_id 挂在 perception 组内
+    item = schema["perception"]["items"]["vision_provider_id"]
     assert item["type"] == "string"
     assert item["options"] == [""], item["options"]
     assert item["default"] == "", item["default"]

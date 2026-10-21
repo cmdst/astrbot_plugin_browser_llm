@@ -125,6 +125,52 @@ async def acheck_hostname_internal(
     return False
 
 
+#: 常见"本地"主机名（不经 DNS 即可判定为内网；搜索结果的字面校验要拦掉）。
+_LOCAL_HOSTNAMES = frozenset(
+    {"localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"}
+)
+
+
+def check_url_literal(
+    url: str, *, block_internal_ip: bool = True
+) -> tuple[bool, str]:
+    """**纯字面** URL 校验（协议白名单 + 本机名 + IP 字面量），**不做 DNS**。
+
+    用途：搜索结果/``provider.base_url`` 这类"量大、且不是真正出网动作"的
+    校验点。50 条结果各做一次 DNS 会吃掉整个 ``total_timeout``，因此这里只
+    判字面量；真正出网前（抓取正文）另走 ``SafetyFilter.acheck_url``（含 DNS）。
+
+    Args:
+        url: 待校验 URL。
+        block_internal_ip: 是否拦截内网/环回/链路本地/保留地址与本机名
+            （对应配置 ``security.block_internal_ip``）。
+
+    Returns:
+        tuple[bool, str]: (是否允许, 拒绝原因或空串)。
+    """
+    if not url or not isinstance(url, str):
+        return False, "URL 为空"
+    try:
+        parsed = urlparse(url.strip())
+    except ValueError:
+        return False, "URL 解析失败"
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in _ALLOWED_SCHEMES:
+        return False, f"仅允许 http/https 协议，收到: {scheme or '（无协议）'}"
+    hostname = parsed.hostname
+    if not hostname:
+        return False, "URL 缺少主机名"
+    if not block_internal_ip:
+        return True, ""
+    lowered = hostname.lower().rstrip(".")
+    if lowered in _LOCAL_HOSTNAMES or lowered.endswith((".localhost", ".local")):
+        return False, f"禁止访问本机/局域网主机名: {hostname}"
+    ip = _hostname_to_ip(hostname)
+    if ip is not None and _is_internal_ip(ip):
+        return False, f"禁止访问内网/保留地址: {hostname}"
+    return True, ""
+
+
 class SafetyFilter:
     """安全过滤器：内容禁词检测与 URL 内网拦截（SSRF 防护）。"""
 

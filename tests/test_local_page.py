@@ -24,7 +24,6 @@ from core.safety import SafetyFilter
 from main import (
     _LOCAL_PAGE_ALLOWED_EXTS,
     BrowserLLMPlugin,
-    _resolve_local_page_roots,
 )
 
 BANNED = ["pornhub", "色情", "成人", "赌博", "暴力", "政治", "反动", "恐怖", "谣言", "诈骗", "病毒"]

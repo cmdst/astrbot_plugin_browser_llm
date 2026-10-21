@@ -233,5 +233,18 @@ def _install_package_alias() -> None:
     main = importlib.import_module("astrbot_plugin_browser_llm.main")
     sys.modules["main"] = main
 
+    # 子模块也要注册顶层别名（v4）：否则测试里的 ``from core.search import
+    # ProviderError`` 会把同一个文件**再导入一份**，两边的异常类不同身份，
+    # ``except ProviderError`` 直接失效（表现为"错误码莫名变成 network"）。
+    # 用 setdefault：已存在的别名优先，不覆盖。
+    prefix = "astrbot_plugin_browser_llm."
+    for name, module in list(sys.modules.items()):
+        if not name.startswith(prefix) or module is None:
+            continue
+        alias = name[len(prefix):]
+        if "." in alias.split(".")[-1] or alias in ("main", "core"):
+            continue
+        sys.modules.setdefault(alias, module)
+
 
 _install_package_alias()

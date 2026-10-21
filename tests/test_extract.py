@@ -4,7 +4,6 @@
 
 import asyncio
 
-import pytest
 
 from core.extract import ContentExtractor
 

@@ -4,6 +4,132 @@
 `data/` 目录（主仓库 .gitignore 忽略）迁移初始化而来。仅跟踪插件源码与测试，运行时
 数据（`data/`：截图、运行时配置、临时文件）一律不入库。
 
+## [v1.4.0] - 2026-10-21
+
+### 特性：配置分组化（5 组 / 41 键）+ 搜索 API 池 + LLM 搜索工具
+
+- **配置结构改为 5 个分组**：`browser` / `limits` / `security` / `perception`
+  （既有 25 键，键名与语义不变，仅从扁平搬进分组）+ 新增 `search` 组（16 键）。
+  Dashboard 中按组折叠显示。
+- **新增 `browser_web_search` LLM 工具**（`@filter.llm_tool`，与核心内置
+  `web_search_<provider>` **并存、不接管**）：并行调用插件自有的搜索 API 池
+  （brave / bocha / firecrawl / tavily / exa，可配多份、每份独立 key），
+  按 URL 去重合并后返回结构化 JSON（`status/results/attempts/error_codes/notes`），
+  **任何失败都不抛异常**。
+  - 可开关：`search.enabled` + 自动闸门（池内无可用 provider 也不激活）；
+    关闭时工具对模型**不可见**（`active=False`，请求装配期被剔除），
+    另在 handler 入口做一次配置兜底。
+  - 可并行：`search.max_parallel` 单波并发上限，`asyncio.gather` 真并发；
+    单源超时/429/异常只影响自己。
+  - 可配搜索步数：`search.max_rounds` = **波次上限**（一次调用最多尝试
+    `min(可用池, max_parallel × max_rounds)` 个源，够 `max_results` 提前结束）。
+  - 可配超时：单源 `search.provider_timeout`（模板 `timeout` 可覆盖）→
+    调用级 `search.total_timeout`（含抓取阶段）→ 单条抓取 `search.fetch_timeout`。
+  - 可选抓正文：`search.fetch_pages` / `fetch_top_n` / `fetch_max_chars`
+    （纯 HTTP，逐跳 SSRF + 禁词过滤，失败不影响主结果）。
+- **新增 provider 实现**：`core/search_providers.py`（5 个后端 + 可注入 HTTP
+  传输层）、`core/http.py`（aiohttp 优先 / 标准库兜底）、`core/crawler.py`
+  新增 `AiohttpFetcher`（逐跳 SSRF + 限长 + 文本化）。
+- **`core/search.py` 扩展**：并行波次 `search_waves()`、去重合并确定性排序、
+  TTL 缓存、429/401/403 冷却、结构化失败码；`redact_secrets()` 迁入本模块
+  （唯一消费者）。
+- **新增迁移器 `tools/migrate_config_v4.py`**（v3 → v4）：同时支持**扁平 v3** 与
+  **分组 v3** 两种来源；干跑 / 落盘 / 校验 / 从备份回滚；幂等；保留 BOM 与 0600；
+  任何模式都不打印配置值；修掉 v3 迁移器的四个坑（组顺序与 KEY_MAP 脱钩、
+  `is_migrated` 对缺组不敏感、`--verify` 只比共有键、只支持 2 层）。
+  **升级顺序：先迁配置、再换代码；回滚成对进行**（详见 README）。
+
+### 修复（review t6 落项：预算与状态口径）
+
+- **预算下沉到波次内**：单源等待改为 `min(provider_timeout, 剩余总预算)`，波级
+  硬停为 `min(最慢源+1, 剩余预算 + 0.5s)`；`provider_timeout`（如 15s）大于调用
+  预算（如 5s）时，墙钟由**预算**决定，慢源不会再吃满单源超时把调用拖到外层
+  `budget+1` 切断。回归用例：`test_budget_caps_single_source_wait_not_provider_timeout`
+  / `test_tool_wall_clock_is_capped_by_budget_not_provider_timeout`（复刻 reviewer
+  的 `total=5 / provider=15 / 慢源` 组合）。
+- **外层超时不再丢结果**：`search_waves(..., progress={...})` 每波把已得结果写进
+  调用方的可变容器；`main.py` 外层 `asyncio.TimeoutError` 分支用最后一次快照
+  渲染 `status=partial` + `notes=["total_timeout"]`（此前是 `failed/0 条`）。
+  用例：`test_outer_timeout_renders_partial_with_kept_results`。
+- **池耗尽 ≠ 预算耗尽**：只有预算真的切断工作才记 `total_timeout`；池内源全部
+  试完记 `notes=["pool_exhausted"]`。deadline 检查移到组波之前。
+- **跳过码不算失败源**：`missing_key` / `disabled` / `cooldown` /
+  `unknown_template` / `bad_config` 在 `resolve_status()` / `summarize()` 里
+  不计入 failed ⇒ 池内有未配置/停用的源时，有结果的调用 `status=ok`；全跳过才
+  `failed/no_provider`。用例：`test_skipped_sources_do_not_make_partial`、
+  `test_cooldown_skip_does_not_make_partial`、`test_all_skipped_pool_reports_no_provider`。
+- **文档与规格对齐**：`main.py` 三处 docstring 改为 v1.4 口径（5 组 / 41 叶 /
+  3 个对外 LLM 工具 + 24 个子代理工具）；README 把 `--verify --baseline`（旧值
+  体检）与 `--verify --against`（键+值严格比对）分开写，runbook 增加"产物键集合
+  == schema 41 叶"的内联断言；spec 增「7.3.1 预算下沉」与「附录 C 用例名对照」；
+  `audit/20261021-disposal-t4.md` 增「AC ↔ 用例」映射表（AC-01…AC-41）。
+
+### 清理：冗余与死代码（消灭"测试全绿但生产不执行"）
+
+- **移植后删除库内重复副本** `astrbot_plugin_browser_llm_tmp/`（23 文件 / 360 KB，
+  与主树 `core/` 逐字节相同）：其 3 处独有修正先移植进 `main.py` ——
+  ① 数据目录走 `StarTools.get_data_dir()`（`_resolve_data_dir()`，兜底
+  `data/plugin_data/<name>`，不再写插件安装目录）；② 工作区回退改走核心
+  `get_astrbot_workspaces_path()`（`_resolve_workspaces_fallback()`，数据目录换层级后
+  旧 `_DATA_DIR.parents[2]` 会指错）；③ 截图/媒体目录挂到 `_DATA_DIR` 下。
+  "检测原插件仍在运行"的 WARN 块**不移植**（正式版改名后没有检测对象）。
+- **删除 4 个未接入模块（850 行，占 core 30.9%）**：`core/tasks.py`（290）、
+  `core/async_bridge.py`（84）、`core/vision.py`（100）、`core/pages.py`（92）——
+  `main.py` 零引用，只有各自测试在测。能力面（异步投递/唤醒、后台任务状态机、
+  浏览器→爬虫自动回退、独立识图缓存）列为 **v5 非目标**：识图缓存已内联、
+  会话串行化由 `SessionManager` 负责、抓正文只走 `core/crawler.py`。
+- **裁剪回胀点**：
+  - `core/delivery.py` 470 → 45 行，只留 artifact 三件套（`artifact_sink` /
+    `collect_artifact` / `current_artifacts`，`main.py` 的 `_emit_media` 唯一消费者）；
+    投递状态机 / 忙闲判定 / 信封渲染删除（`redact_secrets()` 早已迁到 `core/search.py`）。
+  - `core/search.py` 删除 v3 串行入口 `SearchService.search()` + `SearchOutcome`
+    （v4 只走 `search_waves()`，串行路径 `main.py` 零调用）、`available_providers()`
+    与 `ProviderEntry.has_credentials`（均无调用方）。
+  - `core/crawler.py` 删除 `PageContent` / `PageBackend` / `open_page` / `html_links`
+    （唯一服务已删的 `pages.py`）；`CrawlerLimits.max_redirects` 此前是**未被读取**的
+    配置项，改为真正生效（去掉重复的 `MAX_REDIRECTS` 常量）。
+- **清掉孤儿资产**：`data/cmd_config.json`（主配置拷贝，含 `dashboard.password` /
+  `jwt_secret` 键，零消费方）、`data/t2i_templates/*.html`（`t2i` 全库零引用）、
+  `__pycache__` / `.pytest_cache` / `*.pyc`。
+- **无用 import**：生产代码（`main.py` / `core/` / `tools/`）本来就零 F401；
+  测试代码清掉 6 处（`pytest` / `json` / `_resolve_local_page_roots` / `KEY_MAP` 等）。
+- **保留项都有生产接线点**：`browser` / `config_map` / `extract` / `safety` /
+  `session`（wired）、`crawler`（`AiohttpFetcher`）、`http` + `search_providers`
+  （搜索链路）、`delivery`（artifact 三件套）。`main.py` / `core/browser.py` 的
+  点号读取点由 `tests/test_core_config_readpoints.py` 静态钉住，`R3` 的"4 条读路径"
+  是 S1 过渡期的刻意设计（保留，不再新增读法）。
+
+### 兼容性 / 破坏性变更
+
+- **配置文件形态变化（扁平 25 键 → 5 组 41 键）**：直接替换插件目录而不迁移配置
+  会因核心 `check_config_integrity()` 删除未知键而**丢失全部设置**。升级必须先跑
+  `tools/migrate_config_v4.py --apply`，再替换插件目录；回滚同样成对。
+- `search.enabled` 默认 **false** ⇒ 新代码 + 旧配置（已迁移）时行为与 v1.3.x 一致，
+  搜索工具默认不出现。
+- 新增 `search` 组不改变 `browser.default_search_engine`（浏览器 SERP 模板）的语义，
+  两条链路（浏览器搜索页 vs HTTP 搜索 API）互相独立、互不自动启用。
+
+### 测试
+
+- 全套 **640 passed / 0 failed**（`PYTHONDONTWRITEBYTECODE=1 python -m pytest tests/ -q`）。
+  计数口径：692（t3 后基线）− 66（删除项）+ 14（新增）= 640。
+  - 删除 66 条：`test_core_tasks.py` 13（模块删）、`test_core_async_bridge_vision.py` 15
+    （两模块删）、`test_core_pages_crawler.py` 15 → 其中 7 条 crawler 文本用例迁入
+    `test_core_crawler_text.py`（净 −8）、`test_core_search.py` 11（串行入口删）、
+    `test_core_delivery.py` 19 → 其中 1 条 artifact 用例迁入 `test_t_m0_media.py`（净 −18）。
+  - 新增 14 条：`tests/test_repo_hygiene.py` 13（删项不复活 / 裁剪不回胀 / 接线不回退）+
+    迁入的 1 条 artifact 用例。
+  - 逐条"原守护内容 + 接替者"见本次交付说明（每条删除项都给了接替用例或"能力删除"结论）。
+- 新增：`tests/test_search_config_schema.py`（schema 叶子 ⇄ KEY_MAP ⇄ provider 模板）、
+  `tests/test_search_providers.py`（5 后端请求/响应/错误分类/密钥边界）、
+  `tests/test_search_service_parallel.py`（真并发/轮数/超时/去重排序/冷却/缓存/
+  返回体裁剪）、`tests/test_search_tool_contract.py`（工具契约/开关兜底/抓取/
+  不泄密钥/SSRF）、`tests/test_search_tool_toggle.py`（activate 对齐/降级/名称冲突/
+  模型不可见性）、`tests/test_search_migration_v4.py`（两种来源/幂等/值零变化/回滚）。
+- 更新 9 处既有守卫（config_map / readpoints / qa_complement / main_contract /
+  vision_provider）：schema 分组后改为按组内下标读取，并补反向守卫（死组、v4 路径
+  不得走扁平兜底）。
+
 ## [v1.3.3] - 2026-09-06
 
 ### 特性：内容审核总开关（enable_banned_filter）
