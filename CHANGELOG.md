@@ -17,10 +17,10 @@
   - `tools.background_max_chars`：终态消息正文截断（默认 1500 字符，钳 200-8000）。
   - **不需要手工迁移配置**：核心按 schema 自动补齐缺失组/叶，覆盖安装后配置里
     自动长出 `tools` 组（值 = 默认 `off`）。
-- **新增 `core/background.py`（283 行，纯 Python 不 `import astrbot`，可独立单测）**：
+- **新增 `core/background.py`（299 行，纯 Python 不 `import astrbot`，可独立单测）**：
   `BackgroundRegistry`（umo→job 单飞索引、`active_job` / `active_task_id` /
-  `finish` / `running` / `cancel_all`）、`BackgroundJob`（**提交时快照**预算与
-  截断长度，运行中改配置不变）、四态四前缀 `HEADERS`、`render_accepted_text` /
+  `finish` / `running` / `cancel_all` / `clear`）、`BackgroundJob`（**提交时快照**
+  预算与截断长度，运行中改配置不变）、四态四前缀 `HEADERS`、`render_accepted_text` /
   `render_rejected_text` / `render_terminal_text`、`truncate_result`、
   `_BG_MAX_CONCURRENT = 4` 与 `_BG_BUSY_TEXT`。
 - **三个入口拆成「同步前置校验 + 后台/前台分派」**：`browse_web` 的会话白/黑名单、
@@ -34,6 +34,34 @@
 - **插件重载/禁用**：`terminate()` 先取消在跑任务（等至多 5 秒）再关浏览器，
   发「【后台任务已取消】」；进程级重启没有终态消息（已知边界，见下）。
 
+### 修复（review T8 落项：搜索终态、失败口径与投递加固）
+
+- **搜索终态从「原始 JSON」改为人读摘要**：`browser_web_search` 的返回体先经
+  `_background_user_text` → `_render_search_human` 渲染成「检索词 / 命中 N 条 /
+  前 6 条 title+url+摘要片段 / 其余条数省略 / 备注 / 后端 provider·outcome·code /
+  错误码 / 提示」，再交给投递层截断 ⇒ **截断只作用于渲染后的文本**，不会把
+  「…（完整结果已省略 N 字）」拼进 JSON 中间。
+- **返回体状态映射（可预期失败不再算"完成"）**：`ok` → 成功；`partial` → 成功且
+  正文首行标注「（部分结果：有 provider 失败或结果被预算截断）」；`failed` → 失败
+  （原因 = `code: summary（hint）`）；`timeout` / `total_timeout`（含
+  `code=total_timeout`）→ 超时，并在「原因：」行点明；无法解析 / 缺 `status` /
+  未知 `status` → 失败。七类可预期失败因此都不再以"完成"出现：空检索词
+  （`empty_query`）、会话被拒（`session_denied`）、禁词（`banned`）、无可用后端
+  （`no_provider`）、内部异常（`internal_error`）、wave 全挂（`status=failed`）
+  落失败，`total_timeout` 落超时。
+- **超时且没有任何半成品时明说「本次没有可用结果。」**（不特判工具名），"工具自己
+  报的超时"额外给一行「原因：」（整任务预算超时不重复原因）。
+- **`browse_local_page` 截图进附件**：后台模式下截图成功后 `collect_artifact()`，
+  随成功终态消息一起发出；前台无 sink 时返回 `False` 且零副作用（v1.4.0 的
+  「只把截图路径写进返回文本」一字不变）。
+- **投递与生命周期加固**：`terminate()` 的 `finally` 调 `BackgroundRegistry.clear()`
+  兜底；终态日志补 `umo=<md5 前 8 位>`（与受理行三元组对齐）；删掉未使用的
+  `BackgroundRegistry.get()`；`runner` 标注为 `Callable[[dict], Awaitable[str]]`。
+- **补测试**：`all` 模式下六类同步拒绝（会话黑名单 / 含 `perception=` 前缀的禁词 /
+  路径不存在 / 扩展名错误 / 路径越权 / 搜索工具黑名单会话）、后台态直发消息为 0 +
+  `artifact_sink` 只允许在任务体内（AST 守卫）、`send_message` 抛异常后登记表清空且
+  可再次提交（R7）、D2 拒绝耗时 <1s、`clear()` 后登记表为空。
+
 ### 行为边界（写清楚，免得运营方当 bug 报）
 
 - **前缀六个字面量、互不嵌套**：拒绝 `【拒绝】`、受理 `【已受理】`、终态
@@ -46,7 +74,11 @@
 - **部分结果规则**：`browse_local_page` 与 `browser_web_search` 超时/失败时附
   「（以下是中断前已得部分结果，可能不完整）」+ 截断正文；
   **`browse_web` 超时 = 无结果** —— 子代理只在**终局**返回结果文本，中途没有可
-  交付的半成品，超时消息里没有内容属预期。
+  交付的半成品，超时消息里没有内容属预期；超时且没有任何半成品时，正文会明说
+  「本次没有可用结果。」，不会是"漏发"。
+- **搜索终态是人读摘要，不是 JSON**：后台模式下 `browser_web_search` 的终态正文
+  由返回体渲染而来（见上「修复」一节），可读性按"给人看"设计；完整的结构化
+  `results[]` / `fetched.text` 只在**前台**调用里返回给主模型。
 - **并发上限两个**：同一会话最多 **1 个**后台任务（单飞，第二个同步拒绝、不排队）；
   全进程最多 **4 个**（`_BG_MAX_CONCURRENT`，**模块常量不是配置键**），第 5 个
   同步拒绝（`【拒绝】后台任务已达并发上限（4），本次未提交。`）。
@@ -60,16 +92,21 @@
   **下一次工具调用生效，无需重载、无需重启**。代码级回滚时配置与代码**成对**回退：
   v1.4.0 不认识 `tools` 组，核心会把这三个键当未知键删掉（`Config key removed`），
   属预期行为。
-- **媒体只在成功态附**：超时/失败/取消只发文本 + 原因（半成品媒体会误导用户）。
+- **媒体只在成功态附**：超时/失败/取消只发文本 + 原因（半成品媒体会误导用户）；
+  成功态的附件包括 `browse_local_page` 的截图（前台只给路径，后台随终态消息发出）
+  与子代理产生的媒体。
 - **顺带清掉 HEAD 遗留的 7 处 F841**，让 `ruff check` 门禁真的能过（否则它是
   "有存量告警但没人看"的假绿灯）。
 
 ### 测试
 
-- 全量：`693 passed`（2026-10-25；v1.4.0 基线 650 条，本次**新增 43 条**）。
-  新增 `tests/test_background_tools.py`（1016 行）覆盖交接判据 T1–T7 +
-  三处实现纠偏 F1（模式热更新）/ F2（媒体仅成功态）/ F3（终态日志带 `status=`）
-  + D2（全局 4 并发），另有受理/拒绝/终态文案、六前缀互斥、截断、登记表纯单测。
+- 全量：`719 passed`（2026-10-25；v1.4.0 基线 650 条 ⇒ 本版累计**新增 69 条**，
+  其中评审 T8 返工新增 26 条）。
+- `tests/test_background_tools.py`（1511 行）覆盖交接判据 T1–T7 + 三处实现纠偏
+  F1（模式热更新）/ F2（媒体仅成功态）/ F3（终态日志带 `status=`）+ D2（全局 4
+  并发）+ 返工项 H1/H2（搜索终态人读化与 `status` 映射）、M1（`all` 模式六类同步
+  拒绝）、M2（后台态零直发 + `artifact_sink` AST 守卫）、M3（R7 投递异常后仍可再次
+  提交）、L1–L7，另有受理/拒绝/终态文案、六前缀互斥、截断、登记表纯单测。
 - `ruff check --no-cache .`：`All checks passed!`。
 - 仓库卫生：`git status -s` 空，无 `.pyc` / `.pytest_cache` / `.ruff_cache` 新增。
 

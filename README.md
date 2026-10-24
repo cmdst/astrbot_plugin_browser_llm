@@ -132,6 +132,9 @@ provider 模板字段（每份 7 个）：`enabled`（默认 true）、`name`（
   （每源 outcome/code/耗时/条数）、`error_codes`、`notes`；全失败也返回 JSON
   （`status=failed` + `hint`），**从不抛异常**。整体体积上限 24 KB，超出先砍
   `fetched.text` 再砍结果尾部并记 `payload_truncated`。
+  以上是**前台**（`tools.background_mode=off` / `browse_only`）的返回体：后台模式下
+  工具入口返回的是「【已受理】+ task_id」文本，终态消息则把这份 JSON 翻译成**人读
+  摘要**（见下文「后台异步执行 → 搜索工具的终态」）。
 - 安全：密钥只从本插件配置读取（不读核心 `provider_settings.websearch_*_key`、
   不读其它插件）；日志/返回体/异常全部脱敏；结果链接做字面 SSRF 校验，抓正文
   前再走 `acheck_url`（含 DNS）并逐跳校验重定向；检索词命中禁词整单拒绝，
@@ -142,7 +145,7 @@ provider 模板字段（每份 7 个）：`enabled`（默认 true）、`name`（
 | 键 | 默认 | 说明 |
 |---|---|---|
 | `tools.background_mode` | off | 三取值：`off`（三个工具都前台同步，与 v1.4.0 行为一致）/ `browse_only`（只把 `browse_web` 后台化）/ `all`（三个工具都后台化，**不推荐**）。写错的值按 `off` 处理并记一条 warning（fail-closed，不会让拼错的值变成后台） |
-| `tools.background_timeout` | 240 | 后台任务的**整任务**硬预算（秒，钳 30-900）。用满则中断并发一条「【后台任务超时】」终态消息；已在跑的任务用提交时快照，改配置不会把它中途掐断 |
+| `tools.background_timeout` | 240 | 后台任务的**整任务**硬预算（秒，钳 30-900）。用满则中断并发一条「【后台任务超时】」终态消息（没有半成品时会明说「本次没有可用结果。」）；已在跑的任务用提交时快照，改配置不会把它中途掐断 |
 | `tools.background_max_chars` | 1500 | 终态消息正文的截断长度（字符，钳 200-8000），超出部分标注「…（完整结果已省略 N 字）」；媒体附件与消息头部不计入 |
 
 > **v1.5.0 不需要跑迁移器**：核心加载插件配置时会按 schema 自动补齐缺失的组/叶
@@ -194,11 +197,42 @@ provider 模板字段（每份 7 个）：`enabled`（默认 true）、`name`（
 | `browse_local_page` | 有 | 文本提取在截图/识图之前完成，已提取到的正文会随终态消息发出 |
 | `browser_web_search` | 有 | 每波结束的增量快照会被保留，按「title — url」最多渲染 5 条 |
 
-统一形状：先一行 `（以下是中断前已得部分结果，可能不完整）`，再跟截断后的正文。
+统一形状：先一行 `（以下是中断前已得部分结果，可能不完整）`，再跟截断后的正文；
+**超时且没有任何半成品**时，正文会明说「本次没有可用结果。」（不特判工具名，所以
+`browse_web` 的超时消息必然是这句）。
 
 > **`browse_web` 超时 = 无结果**（子代理终局才返回）；只有 `browse_local_page` 与
 > `browser_web_search` 超时才附「已得部分结果」+ 截断。运营方看到 `browse_web`
 > 的超时消息里没有内容属**预期**，不要当 bug 报。
+
+### 搜索工具的终态正文（人读摘要，不是 JSON）
+
+后台模式下 `browser_web_search` 的终态消息**不是**原始 JSON，而是把返回体渲染成的
+人读摘要（截断只作用于渲染后的文本，不会把「…（完整结果已省略 N 字）」拼进 JSON
+中间）。头部之后依次是：`检索词：<query>` / `命中 N 条结果` / 前 **6** 条（每条
+title + url + 摘要片段 ≤120 字）/ 其余条数的省略提示 / `备注：<notes>` /
+`后端：<provider / outcome / code>`（最多 6 个）/ `错误码：<error_codes>` /
+`提示：<hint>`。
+
+返回体的 `status` 决定进哪种终态 —— **可预期失败不会被算成"完成"**：
+
+| 返回体 `status` / `code` | 终态前缀 | 正文要点 |
+|---|---|---|
+| `ok` | 【后台任务完成】 | 人读摘要 |
+| `partial` | 【后台任务完成】 | 首行标注「（部分结果：有 provider 失败或结果被预算截断）」+ 摘要 |
+| `failed` | 【后台任务失败】 | 失败原因 = `code: summary（hint）`，并附「本次没有可用结果。」 |
+| `timeout` / `total_timeout`（含 `code=total_timeout`） | 【后台任务超时】 | 「原因：…」点明是搜索自己的总预算被用满；有半成品则附「已得部分结果」 |
+| 无法解析 / 缺 `status` / 未知 `status` | 【后台任务失败】 | 「返回体无法解析」/「未预期的返回体 status=…」 |
+
+七类可预期失败按上表分流：空检索词（`empty_query`）、会话被拒（`session_denied`）、
+检索词或结果命中禁词（`banned`）、池内无可用后端（`no_provider`）、内部异常
+（`internal_error`）、wave 全挂（返回体 `status=failed`）都落 `failed` 分支；搜索自己
+的总预算被用满（`total_timeout`）落超时分支 —— **它们都不会计入
+`grep -c "【后台任务完成】"`**（旧行为会把它们算成"完成"，这正是返工要修的）。
+
+> 摘要只列前 6 条、每条摘要片段 ≤120 字，`attempts` 最多列 6 个后端调用。需要完整
+> 的结构化 `results[]` / `fetched.text` 时，请让搜索走**前台**（`off` 或
+> `browse_only` 下搜索本来就是前台，主模型拿到的是完整 JSON）。
 
 ### 并发上限：全局 4 个（模块常量，不是配置键）
 
@@ -236,11 +270,16 @@ provider 模板字段（每份 7 个）：`enabled`（默认 true）、`name`（
 - **后台模式下拿不到对话模型 = 异步失败**：`browse_web` 的 provider 解析在执行体里，
   后台模式下失败会变成一条「【后台任务失败】…无法确定当前对话模型…」的终态消息，
   而不是同步错误。
-- **搜索结果在后台消息里是 JSON**：`browser_web_search` 的返回体本就是 JSON，后台
-  模式下该 JSON 会按 `background_max_chars` 截断后原样发出（没做人读摘要），可读性
-  一般 —— 又一条"不建议把搜索工具后台化"的理由。
+- **后台搜索消息是摘要，不是完整 JSON**：终态正文最多列前 6 条结果（摘要片段 ≤120
+  字）、最多 6 个后端调用；需要完整的结构化 `results[]` / `fetched.text` 时请让搜索走
+  **前台**（`off` / `browse_only` 下搜索保持前台）——这也是一条"不建议把搜索工具
+  后台化"的理由。
 - **媒体只在成功态附**：超时/失败/取消只发文本 + 原因，半成品截图/视频不发（否则
-  用户会以为任务完成了）。
+  用户会以为任务完成了）。**成功态会带上任务期间产生的附件**：`browse_local_page`
+  前台只把截图路径写进返回文本（`截图: <path>`，不直接发图），后台成功后该 png 会作为
+  附件随「【后台任务完成】」消息一起发出；`browse_web` 的附件取决于子代理有没有调
+  `browse_screenshot`（受 `perception.silent_mode` 管：静默开启时它不产出媒体，自然
+  也不会成为附件）/ `browse_sniff_media`。
 
 ### 生产判据（部署后照抄；日志口径与用户口径分开数）
 
@@ -255,7 +294,9 @@ grep -c "【后台任务失败】\|【后台任务超时】\|【后台任务已�
 
 "受理"与"终态"条数不相等 = 还有任务在跑（正常）或投递前进程被杀（异常）；
 用户侧 `【后台任务…】` 条数与终态日志条数不相等 = 有终态消息没投递出去
-（`send_message` 返回 False，按 `task_id` 查日志）。
+（`send_message` 返回 False，按 `task_id` 查日志）。返工后搜索的**可预期失败**
+（空检索词 / 会话被拒 / 禁词 / 无可用后端 / 内部异常）都计 `status=failed`，
+不会再出现在 `【后台任务完成】`/`status=ok` 里 —— 拿这两个数算成功率才是真的。
 
 ## 🔁 配置迁移与成对回滚（v3 → v4）
 
@@ -419,10 +460,10 @@ text_image）。全文本子代理（前端/测试/工程等）读取本地 HTML
 
 ```bash
 cd astrbot_plugin_browser_llm
-PYTHONDONTWRITEBYTECODE=1 python -m pytest tests/ -q -p no:cacheprovider   # 693 passed（2026-10-25）
+PYTHONDONTWRITEBYTECODE=1 python -m pytest tests/ -q -p no:cacheprovider   # 719 passed（2026-10-25）
 ```
 
-测试覆盖（32 个文件 / 693 条）：
+测试覆盖（32 个文件 / 719 条）：
 
 - **工具契约**：`browse_web` / `browse_local_page` / `browser_web_search` 的 docstring
   与注册一致性、参数类型、入口装饰器白名单（`test_main_contract.py`、
@@ -434,11 +475,14 @@ PYTHONDONTWRITEBYTECODE=1 python -m pytest tests/ -q -p no:cacheprovider   # 693
   （`test_search_migration_v4.py`）。
 - **配置**：schema ⇄ `KEY_MAP` ⇄ `main.py` 读取点三方一致（`test_core_config_map.py`、
   `test_core_config_readpoints.py`、`test_qa_complement.py`）。
-- **后台执行链路**（v1.5.0 新增 `test_background_tools.py`，1016 行）：T1–T7 判据
+- **后台执行链路**（v1.5.0 新增 `test_background_tools.py`，1511 行）：T1–T7 判据
   （`off` 逐字节一致 / 立即返回 / 四态终态各一条消息 / 同会话单飞 <1s 拒绝 /
   `terminate()` 不悬挂 / schema⇄KEY_MAP⇄读取点三方一致）+ F1 模式热更新、F2 媒体
-  仅成功态、F3 终态日志带 `status=`、D2 全局 4 并发；另有受理/拒绝/终态文案、
-  六前缀互斥、截断、登记表纯单测。
+  仅成功态、F3 终态日志带 `status=`、D2 全局 4 并发；`all` 模式下的六类**同步拒绝**
+  （会话黑名单 / 含 `perception=` 前缀的禁词 / 路径不存在 / 扩展名错误 / 路径越权 /
+  搜索工具黑名单会话）、搜索终态的人读化与 `status` 映射（H1/H2）、`artifact_sink`
+  只允许出现在任务体内的 AST 守卫、投递异常后仍能再次提交（R7）；另有受理/拒绝/终态
+  文案、六前缀互斥、截断、登记表纯单测。
 - **安全**：SSRF（含 DNS 与重定向）、禁词三处链路、点击/新标签/媒体嗅探行为级拦截。
 - **浏览**：感知模式前缀/规则/优先级、识图缓存与 provider 降级链、本地页面工具
   （白名单/路径穿越/降级文本）、会话与标签页、浏览器资源清理。
