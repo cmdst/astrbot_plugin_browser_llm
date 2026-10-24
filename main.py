@@ -20,10 +20,12 @@ SafetyFilter（禁词过滤与 SSRF 防护），以及 24 个 FunctionTool 构�
 import asyncio
 import functools
 import hashlib
+import json
 import os
 import re
 import time
 import weakref
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
@@ -115,7 +117,11 @@ _LOCAL_PAGE_TOOL_NAME = "browse_local_page"
 # 后台任务（v1.5.0 路线 D）：
 # - ``tools.background_mode`` 三取值：off（默认，行为与 v1.4.0 完全一致）/
 #   browse_only（只把 browse_web 后台化）/ all（三个工具都后台化）；
-# - 终态消息统一以「后台任务完成」开头，生产判据按前缀 grep（派单 §5.3）；
+# - 终态消息**四态四前缀**（设计 §4.7 唯一口径，D3 裁决）：成功
+#   「【后台任务完成】」/ 失败「【后台任务失败】」/ 超时「【后台任务超时】」/
+#   取消「【后台任务已取消】」——**不要**回落成单前缀，否则失败会被算成成功；
+# - 生产判据两套口径各管一件事：``grep -c "后台任务受理"`` 与
+#   ``grep -c "后台任务终态 status="``（四态合计）+ 按前缀数成功数；
 # - 后台任务在 terminate() 时取消并等待一小段，绝不让插件重载悬挂。
 _BACKGROUND_MODES = ("off", "browse_only", "all")
 
@@ -1571,6 +1577,9 @@ class BrowserLLMPlugin(Star):
             self._search_service = None
             self._search_service_signature = None
             self._search_tool_active = False
+            # 后台任务登记表兜底清空（设计 §6.1）：cancel_all 已清过，这里再清
+            # 一次是防"表非空但无在跑任务"那类残留把会话永久锁在单飞里。
+            self._background.clear()
         logger.info(f"{tag} 已终止")
 
     # ================================================================
@@ -1608,7 +1617,7 @@ class BrowserLLMPlugin(Star):
         *,
         event: AstrMessageEvent,
         tool_name: str,
-        runner,
+        runner: Callable[[dict], Awaitable[str]],
         task_text: str = "",
     ) -> str:
         """把一次工具执行提交为后台任务，立刻返回「已受理 + task_id」。
@@ -1672,7 +1681,11 @@ class BrowserLLMPlugin(Star):
             task_id=task_id, tool=tool_name, budget_s=job.budget_s
         )
 
-    async def _run_background_job(self, job: BackgroundJob, runner) -> None:
+    async def _run_background_job(
+        self,
+        job: BackgroundJob,
+        runner: Callable[[dict], Awaitable[str]],
+    ) -> None:
         """后台执行体：跑任务 → 渲染终态 → 主动投递 → 登记出表。
 
         四种终态（成功/失败/超时/已取消）都要有**用户可见**的终态消息，只有
@@ -1696,7 +1709,9 @@ class BrowserLLMPlugin(Star):
                 )
         except asyncio.TimeoutError:
             status = STATUS_TIMEOUT
-            reason = f"超过整任务硬预算 {float(job.budget_s):.0f}s 被中断"
+            # 预算超时的原因已由终态文案本身说明（「已用满 N 秒硬预算」），
+            # 这里不再重复；reason 留给"工具自己报的超时"（如 total_timeout）。
+            reason = ""
             partial = self._background_partial(job.tool, progress)
         except asyncio.CancelledError:
             status = STATUS_CANCELLED
@@ -1706,11 +1721,20 @@ class BrowserLLMPlugin(Star):
             status = STATUS_FAILED
             reason = f"{type(exc).__name__}: {exc}"
             partial = self._background_partial(job.tool, progress)
-        # 工具把"可预期失败"以【错误】/【拒绝】前缀当文本返回（例如取不到当前
-        # 对话模型、页面内容命中禁词）：后台模式下必须判成失败，否则用户看到的
-        # 是「完成」里包着一条错误。
-        if status == STATUS_OK and str(text or "").startswith(("【错误】", "【拒绝】")):
-            status, reason = STATUS_FAILED, str(text)
+        if status == STATUS_OK:
+            # 返回体 → 终态（H1+H2）：搜索工具的返回体是 JSON，必须**先**翻译成
+            # 人读摘要并取真实状态，再交给投递层（截断只作用于渲染后的文本，
+            # 绝不会把「…已省略 N 字」拼进 JSON 中间）。
+            mapped_status, mapped_text, mapped_reason = self._background_user_text(
+                job.tool, text
+            )
+            if mapped_status is not None:
+                status, text, reason = mapped_status, mapped_text, mapped_reason
+            elif str(text or "").startswith(("【错误】", "【拒绝】")):
+                # 纯文本工具把"可预期失败"以【错误】/【拒绝】前缀当文本返回
+                # （例如取不到当前对话模型、页面内容命中禁词）：后台模式下必须
+                # 判成失败，否则用户看到的是「完成」里包着一条错误。
+                status, reason = STATUS_FAILED, str(text)
         elapsed_ms = int((time.monotonic() - began) * 1000)
         note = ""
         try:
@@ -1736,12 +1760,125 @@ class BrowserLLMPlugin(Star):
             # 判据 grep；不把四态混进「后台任务完成」这一个词里。
             logger.info(
                 f"{tag} 后台任务终态 status={status} task_id={job.task_id} "
-                f"tool={job.tool} elapsed_ms={elapsed_ms} chars={len(text)} "
+                f"tool={job.tool} umo={self._umo_digest(job.umo)} "
+                f"elapsed_ms={elapsed_ms} chars={len(text)} "
                 f"media={len(artifacts)} delivered={bool(delivered)}"
             )
             if note:
                 # 终态消息首行另打一条 info，便于按 `【后台任务…】` 对账。
                 logger.info(f"{tag} {note}")
+
+    def _background_user_text(self, tool_name: str, raw: str) -> tuple[str | None, str, str]:
+        """把工具返回体翻译成「发给人的终态」：``(status, text, reason)``。
+
+        为什么需要它（设计 §2.4）：工具返回体是给**模型**读的（``browser_web_search``
+        甚至是 JSON），而终态消息是发给**人**的。直接把 JSON 丢进消息里既读不懂、
+        又会在截断时被从中间砍断；更糟的是"JSON 里 ``status:"failed"``"逃过了
+        ``【错误】`` 前缀判定，会让一次"搜索全挂"在日志里看起来 100% 成功
+        （``grep -c "后台任务终态 status=ok"`` 失真）。
+
+        ``status`` 返回 ``None`` 表示"沿用调用方判定"（纯文本工具就是这种）。
+
+        搜索返回体的状态映射（队长裁决，逐条实现）：
+        - ``"ok"`` → 成功；
+        - ``"partial"`` → 成功，且正文标注「部分结果」；
+        - ``"failed"`` → 失败（原因 = ``code: summary`` + hint）；
+        - ``"timeout"`` / ``"total_timeout"``（含 ``code == "total_timeout"``）→ 超时；
+        - 无法解析 / 缺 ``status`` → 失败，原因「返回体无法解析」；
+        - 其它未知 status（含 ``disabled``）→ 失败（绝不把未知态算成成功）。
+        """
+        if tool_name != _SEARCH_TOOL_NAME:
+            return None, str(raw or ""), ""
+        payload = self._parse_search_payload(raw)
+        if payload is None:
+            return STATUS_FAILED, "", "返回体无法解析"
+        status = str(payload.get("status") or "").strip().lower()
+        code = str(payload.get("code") or "").strip()
+        summary = str(payload.get("summary") or "").strip()
+        hint = str(payload.get("hint") or "").strip()
+        detail = f"{code}: {summary}".strip(": ").strip()
+        if hint:
+            detail = f"{detail}（{hint}）" if detail else hint
+        if not status:
+            return STATUS_FAILED, "", "返回体无法解析：缺少 status 字段"
+        if status in (STATUS_TIMEOUT, "total_timeout") or code == "total_timeout":
+            return STATUS_TIMEOUT, "", detail or "搜索超过总预算被中断"
+        if status == "failed":
+            return STATUS_FAILED, "", detail or "搜索失败（返回体未给出原因）"
+        if status in ("ok", "partial"):
+            text = self._render_search_human(payload)
+            if status == "partial":
+                text = "（部分结果：有 provider 失败或结果被预算截断）\n" + text
+            return STATUS_OK, text, ""
+        return STATUS_FAILED, "", f"未预期的返回体 status={status!r}"
+
+    @staticmethod
+    def _parse_search_payload(raw: str) -> dict | None:
+        """解析搜索工具返回体；不是 JSON 对象时返回 ``None``。
+
+        ``status`` 字段是否缺失由调用方判（缺失要给出「缺少 status」这种更
+        具体的失败原因，不能与"整段不是 JSON"混成一句）。
+        """
+        try:
+            payload = json.loads(str(raw or ""))
+        except (TypeError, ValueError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    @staticmethod
+    def _render_search_human(payload: dict, limit: int = 6) -> str:
+        """把搜索返回体渲染成人读摘要（结果条目 / notes / 后端摘要 / 提示）。
+
+        Args:
+            payload: ``render_payload`` 产出的字典。
+            limit: 最多列出多少条结果（条数由调用方的展示宽度决定）。
+        """
+        lines: list[str] = []
+        query = str(payload.get("query") or "").strip()
+        if query:
+            lines.append(f"检索词：{query}")
+        results = payload.get("results") or []
+        lines.append(f"命中 {len(results)} 条结果")
+        for index, item in enumerate(list(results)[: max(1, int(limit))], start=1):
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title") or "").strip() or "（无标题）"
+            url = str(item.get("url") or "").strip()
+            snippet = " ".join(str(item.get("snippet") or "").split())
+            lines.append(f"{index}. {title}")
+            if url:
+                lines.append(f"   {url}")
+            if snippet:
+                lines.append(f"   {snippet[:120]}")
+        if len(results) > int(limit):
+            lines.append(f"…（其余 {len(results) - int(limit)} 条已省略）")
+        notes = [str(note) for note in (payload.get("notes") or []) if str(note)]
+        if notes:
+            lines.append("备注：" + "、".join(notes))
+        attempts = [a for a in (payload.get("attempts") or []) if isinstance(a, dict)]
+        if attempts:
+            brief = [
+                "/".join(
+                    str(part)
+                    for part in (
+                        attempt.get("provider"),
+                        attempt.get("outcome"),
+                        attempt.get("code"),
+                    )
+                    if part
+                )
+                for attempt in attempts[:6]
+            ]
+            lines.append("后端：" + "、".join(brief))
+            if len(attempts) > 6:
+                lines.append(f"…（另有 {len(attempts) - 6} 个后端调用未列出）")
+        error_codes = [str(code) for code in (payload.get("error_codes") or []) if code]
+        if error_codes:
+            lines.append("错误码：" + "、".join(error_codes))
+        hint = str(payload.get("hint") or "").strip()
+        if hint:
+            lines.append(f"提示：{hint}")
+        return "\n".join(lines)
 
     def _background_partial(self, tool_name: str, progress: dict) -> str:
         """中断前的半成品文本（没有就返回空串，绝不编造）。
@@ -2157,6 +2294,12 @@ class BrowserLLMPlugin(Star):
                     screenshot_ok = bool(
                         await self.browser.screenshot(page, save_path)
                     )
+                if screenshot_ok:
+                    # 后台模式下截图必须**进附件**（任务结束时随终态消息一起发），
+                    # 不能依赖前台 event.send —— event 在任务跑完时早已终结。
+                    # 前台（无 sink）时 collect_artifact 返回 False 且什么都不做，
+                    # 因此 v1.4.0 的"只把路径写进返回文本"行为一字不变。
+                    collect_artifact(save_path)
 
                 # 6. 视觉描述（mimo-v2.5 等，识图缓存正常生效）：成功返回
                 # 描述；失败降级文本，保证不空转。

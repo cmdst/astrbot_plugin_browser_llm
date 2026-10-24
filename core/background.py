@@ -157,6 +157,10 @@ def render_terminal_text(
     # 非成功态：原因 + （可选）中断前的部分结果 [+ 超时态处置建议]
     if status == STATUS_TIMEOUT:
         lines = [head, f"已用满 {float(budget_s):.0f} 秒硬预算，任务被中断。"]
+        if str(reason or "").strip():
+            # 超时原因（如 total_timeout）：不然用户只看到"被中断"，不知道
+            # 是整任务预算到了还是搜索自己的总预算到了。
+            lines.append(f"原因：{shorten(reason, _REASON_LIMIT)}")
     elif status == STATUS_CANCELLED:
         lines = [
             head,
@@ -171,6 +175,12 @@ def render_terminal_text(
     if partial.strip():
         lines.append(PARTIAL_NOTE)
         lines.append(partial.strip())
+    elif status == STATUS_TIMEOUT:
+        # 超时且没有任何半成品时必须**明说"没有可用结果"**（T3 的 O-2）：
+        # README 已写死「browse_web 超时 = 无结果」，文案不点明会让用户追问
+        # "那结果呢"。browse_web 永无 partial，local_page/search 在 progress
+        # 为空时同理，这里不特判工具名就自洽。
+        lines.append("本次没有可用结果。")
     if status == STATUS_TIMEOUT:
         lines.append("可调大 tools.background_timeout，或把任务拆小。")
     return "\n".join(lines)
@@ -240,9 +250,6 @@ class BackgroundRegistry:
         if job is not None:
             job.task = task
 
-    def get(self, task_id: str) -> BackgroundJob | None:
-        return self._jobs.get(task_id)
-
     def task_of(self, task_id: str) -> asyncio.Task | None:
         job = self._jobs.get(task_id)
         return job.task if job is not None else None
@@ -254,6 +261,15 @@ class BackgroundRegistry:
             return
         if self._by_umo.get(job.umo) == task_id:
             self._by_umo.pop(job.umo, None)
+
+    def clear(self) -> None:
+        """清空登记表（插件终止时的兜底；幂等，不取消任何任务）。
+
+        ``cancel_all()`` 已经清表，这里再清一次是防"表非空但无在跑任务"这类
+        残留（例如 attach_task 之前就失败）把会话永久锁在单飞里（设计 §6.1）。
+        """
+        self._jobs.clear()
+        self._by_umo.clear()
 
     def running(self) -> list[BackgroundJob]:
         """仍在跑的登记项（已结束但还没 ``finish()`` 的不算）。"""

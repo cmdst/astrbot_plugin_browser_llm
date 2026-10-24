@@ -87,7 +87,13 @@ class FakeContext:
 
 
 class FakeEvent:
+    """最小事件桩：``send`` 会计数（M2 要断言后台态直发次数为 0）。"""
+
     unified_msg_origin = UMO
+    send_calls = 0
+
+    def __init__(self):
+        self.send_calls = 0
 
     def get_group_id(self):
         return "123456"
@@ -102,6 +108,8 @@ class FakeEvent:
         return f"chain:{chain}"
 
     async def send(self, msg):
+        type(self).send_calls += 1
+        self.send_calls += 1
         return None
 
 
@@ -352,6 +360,8 @@ def test_t4_timeout_sends_terminal_message_without_fabricating():
     assert text.startswith(HEADERS[STATUS_TIMEOUT]), text
     assert "硬预算，任务被中断" in text
     assert "已得部分结果" not in text, "没有 progress 时不得编造部分结果"
+    # O-2：超时且无半成品必须明说「没有可用结果」（README 已写死这条口径）
+    assert "本次没有可用结果。" in text
 
 
 def test_t4_error_prefixed_text_is_reported_as_failure():
@@ -561,6 +571,7 @@ def test_t6_terminate_cancels_running_task_without_hanging():
     assert elapsed < 10.0, f"terminate 不得悬挂（实测 {elapsed:.1f}s）"
     assert task is not None and task.done(), "在跑任务必须被取消"
     assert plugin._background.running() == []
+    assert len(plugin._background) == 0, "terminate 后登记表必须清空（§6.1 兜底）"
     # 取消也是终态：中断消息 best-effort 发出去（有就断言前缀）
     if ctx.sent:
         assert message_text(ctx.sent[-1][1]).startswith(HEADERS[STATUS_CANCELLED])
@@ -812,17 +823,20 @@ def test_d2_global_concurrency_cap_rejects_fifth_task():
         fourth_umo = f"aiocqhttp:GroupMessage:{999}"
         plugin_event = _OtherEvent(999)
         plugin_event.unified_msg_origin = fourth_umo
+        began = time.monotonic()
         rejected = await plugin.browse_web(_OtherEvent(999), "第五个任务")
+        elapsed = time.monotonic() - began
         after = len(plugin._background)
         await plugin._background.cancel_all(timeout=2.0)
-        return accepted, rejected, before, after
+        return accepted, rejected, before, after, elapsed
 
-    accepted, rejected, before, after = run(flow())
+    accepted, rejected, before, after, elapsed = run(flow())
     assert len(accepted) == 4 and all(text.startswith("【已受理】") for text in accepted)
     assert rejected.startswith("【拒绝】"), rejected
     assert "并发上限（4）" in rejected and "请稍后再试" in rejected
     assert "task_id" not in rejected, "全局拒绝不占 task_id"
     assert after == before == 4, f"被拒的请求不得入表（{before} -> {after}）"
+    assert elapsed < 1.0, f"全局闸必须同步拒绝（实测 {elapsed:.3f}s）"
 
 
 def test_d2_global_cap_constant_is_not_a_config_key():
@@ -1014,3 +1028,484 @@ def test_registry_single_flight_is_a_pure_table_lookup():
         await asyncio.gather(task, return_exceptions=True)
 
     run(flow())
+
+
+# ====================================================================
+# H1 + H2：搜索终态必须人读化，且可预期失败不得算成功
+#   根因是设计 §2.4 的 per-tool 人读钩子（_background_user_text）缺失：
+#   返回体是 JSON，直接塞进终态消息既读不懂，失败态还会逃过「【错误】」前缀
+#   判定，让 grep -c "后台任务终态 status=ok" 在"搜索全挂"时照样 +1。
+# ====================================================================
+
+
+def search_payload(**kwargs) -> str:
+    """用真实的 render_payload 造返回体（字段来源与生产逐字一致）。"""
+    from core.search import MergedResult, SearchAttempt, render_payload
+
+    payload = {
+        "status": "ok",
+        "code": "ok",
+        "summary": "找到 2 条结果",
+        "query": "北京天气",
+        "results": [
+            MergedResult(rank=1, title="天气 1", url="https://a.example/1", snippet="晴 26 度"),
+            MergedResult(rank=2, title="天气 2", url="https://b.example/2", snippet="多云 24 度"),
+        ],
+        "attempts": [
+            SearchAttempt(provider="brave#1", template="brave", round=0, outcome="ok", code="ok")
+        ],
+    }
+    payload.update(kwargs)
+    return render_payload(**payload)
+
+
+def search_plugin(ctx, mode: str = "all") -> BrowserLLMPlugin:
+    plugin = make_plugin(
+        {"search": {"enabled": True, "providers": []}, "tools": {"background_mode": mode}},
+        ctx,
+    )
+    plugin._browser_toolset = SimpleNamespace(tools=[])
+    return plugin
+
+
+def run_search_with_body(body: str, ctx=None):
+    """把执行体换成"直接返回给返回体"的桩，跑完一个后台搜索任务。"""
+    ctx = ctx or FakeContext()
+    plugin = search_plugin(ctx)
+    plugin._run_browser_web_search = lambda event, **kw: _returning(body)  # type: ignore[assignment]
+
+    async def flow():
+        out = await plugin.browser_web_search(FakeEvent(), query="北京天气")
+        assert out.startswith("【已受理】"), out
+        await plugin._background.task_of(task_id_of(out))
+
+    run(flow())
+    return plugin, ctx
+
+
+async def _returning(body: str) -> str:
+    return body
+
+
+def test_h1_search_success_terminal_is_human_readable():
+    """成功态正文必须是摘要，不能是原始 JSON（H1）。"""
+    _plugin, ctx = run_search_with_body(search_payload())
+    text = message_text(ctx.sent[0][1])
+    assert text.startswith(HEADERS[STATUS_OK]), text
+    body = text.split("\n", 1)[1]
+    assert not body.lstrip().startswith("{"), "终态正文不得以 JSON 花括号开头"
+    assert '"status"' not in body and '"results"' not in body, "终态正文不得含 JSON 字段名"
+    assert "检索词：北京天气" in body
+    assert "命中 2 条结果" in body
+    assert "1. 天气 1" in body and "https://a.example/1" in body
+    assert "晴 26 度" in body
+    assert "后端：brave#1/ok/ok" in body
+
+
+def test_h1_search_truncation_applies_to_rendered_text():
+    """截断只作用于渲染后的文本；不得把提示拼进 JSON 中间（H1）。"""
+    from core.search import MergedResult
+
+    rows = [
+        MergedResult(rank=i, title=f"标题{i}", url=f"https://x.example/{i}", snippet="长" * 200)
+        for i in range(1, 9)
+    ]
+    ctx = FakeContext()
+    plugin = search_plugin(ctx)
+    plugin.config["tools"]["background_max_chars"] = 300
+    plugin._run_browser_web_search = lambda event, **kw: _returning(
+        search_payload(results=rows)
+    )  # type: ignore[assignment]
+
+    async def flow():
+        out = await plugin.browser_web_search(FakeEvent(), query="北京天气")
+        await plugin._background.task_of(task_id_of(out))
+
+    run(flow())
+    text = message_text(ctx.sent[0][1])
+    assert "完整结果已省略" in text, "超长人读摘要必须截断并说明"
+    body = text.split("\n", 1)[1]
+    assert '"status"' not in body and body.count("{") == 0, "截断后的正文里不得残留 JSON"
+
+
+def test_h2_search_partial_is_success_and_marked_partial():
+    """partial → 成功但明确标注「部分结果」（队长裁决）。"""
+    _plugin, ctx = run_search_with_body(
+        search_payload(status="partial", summary="部分结果：1/2 个 provider 失败")
+    )
+    text = message_text(ctx.sent[0][1])
+    assert text.startswith(HEADERS[STATUS_OK]), text
+    assert "部分结果" in text
+
+
+def test_h2_unparseable_search_body_is_failure():
+    _plugin, ctx = run_search_with_body("这不是 JSON")
+    text = message_text(ctx.sent[0][1])
+    assert text.startswith(HEADERS[STATUS_FAILED]), text
+    assert "返回体无法解析" in text
+
+
+def test_h2_search_missing_status_is_failure():
+    _plugin, ctx = run_search_with_body(json.dumps({"code": "whatever"}))
+    text = message_text(ctx.sent[0][1])
+    assert text.startswith(HEADERS[STATUS_FAILED]), text
+    assert "返回体无法解析" in text
+
+
+FAILURE_BODIES = {
+    "empty_query": {"status": "failed", "code": "empty_query", "summary": "【错误】检索词为空"},
+    "session_denied": {"status": "failed", "code": "session_denied", "summary": "【拒绝】黑名单"},
+    "banned": {"status": "failed", "code": "banned", "summary": "【拒绝】禁词"},
+    "no_provider": {"status": "failed", "code": "no_provider", "summary": "【错误】没有可用后端"},
+    "internal_error": {"status": "failed", "code": "internal_error", "summary": "【错误】内部异常"},
+    "wave_failed": {"status": "failed", "code": "auth", "summary": "【错误】全部 provider 鉴权失败"},
+}
+
+
+@pytest.mark.parametrize("name,fields", sorted(FAILURE_BODIES.items()))
+def test_h2_expected_search_failures_are_failures(name, fields, logger_recorder):
+    """七类可预期失败里除 total_timeout 外都必须报「失败」而不是「完成」。"""
+    _plugin, ctx = run_search_with_body(search_payload(**fields))
+    text = message_text(ctx.sent[0][1])
+    assert text.startswith(HEADERS[STATUS_FAILED]), (name, text)
+    terminal = [ln for ln in logger_recorder.lines("info") if "后台任务终态" in ln]
+    assert terminal and "status=failed" in terminal[-1], (name, terminal)
+
+
+def test_h2_search_total_timeout_is_reported_as_timeout(logger_recorder):
+    """total_timeout → 超时（不是完成、也不是普通失败）。"""
+    _plugin, ctx = run_search_with_body(
+        search_payload(
+            status="failed",
+            code="total_timeout",
+            summary="【错误】搜索超过总预算被中断",
+            hint="可调大 search.total_timeout",
+        )
+    )
+    text = message_text(ctx.sent[0][1])
+    assert text.startswith(HEADERS[STATUS_TIMEOUT]), text
+    assert "total_timeout" in text
+    terminal = [ln for ln in logger_recorder.lines("info") if "后台任务终态" in ln]
+    assert terminal and "status=timeout" in terminal[-1]
+    # O-2：超时且无半成品时明说「本次没有可用结果」
+    assert "本次没有可用结果。" in text
+
+
+def test_h2_search_failures_never_count_as_success(logger_recorder):
+    """统计型断言：失败场景下 status=ok 与「【后台任务完成】」计数都必须为 0。"""
+    ctx = FakeContext()
+    plugin = search_plugin(ctx)
+    bodies = [search_payload(**fields) for fields in FAILURE_BODIES.values()]
+
+    async def flow():
+        for index, body in enumerate(bodies):
+            plugin._run_browser_web_search = (
+                lambda event, _b=body, **kw: _returning(_b)
+            )  # type: ignore[assignment]
+            out = await plugin.browser_web_search(FakeEvent(), query=f"q{index}")
+            await plugin._background.task_of(task_id_of(out))
+
+    run(flow())
+    info = logger_recorder.lines("info")
+    ok_lines = [ln for ln in info if "后台任务终态 status=ok" in ln]
+    done_lines = [ln for ln in info if HEADERS[STATUS_OK] in ln]
+    assert ok_lines == [], f"失败场景不得出现 status=ok: {ok_lines}"
+    assert done_lines == [], f"失败场景不得出现【后台任务完成】: {done_lines}"
+    sent_texts = [message_text(chain) for _s, chain in ctx.sent]
+    assert len(sent_texts) == len(bodies)
+    assert all(not text.startswith(HEADERS[STATUS_OK]) for text in sent_texts)
+
+
+def test_h2_real_path_empty_query_and_no_provider_are_failures(logger_recorder):
+    """不桩执行体，走真实代码路径：空检索词 / 无可用 provider 都必须是失败。"""
+    ctx = FakeContext()
+    plugin = search_plugin(ctx)
+
+    async def flow():
+        first = await plugin.browser_web_search(FakeEvent(), query="   ")
+        await plugin._background.task_of(task_id_of(first))
+        second = await plugin.browser_web_search(FakeEvent(), query="北京天气")
+        await plugin._background.task_of(task_id_of(second))
+
+    run(flow())
+    texts = [message_text(chain) for _s, chain in ctx.sent]
+    assert len(texts) == 2
+    assert all(text.startswith(HEADERS[STATUS_FAILED]) for text in texts), texts
+    assert "empty_query" in texts[0] and "no_provider" in texts[1]
+    terminal = [ln for ln in logger_recorder.lines("info") if "后台任务终态" in ln]
+    assert len(terminal) == 2 and all("status=failed" in ln for ln in terminal)
+
+
+# ====================================================================
+# M1：all 模式下的同步拒绝（不得先「已受理」再异步失败）
+# ====================================================================
+
+
+def _assert_sync_rejection(plugin, coro_factory, expect_prefixes):
+    async def flow():
+        began = time.monotonic()
+        out = await coro_factory()
+        elapsed = time.monotonic() - began
+        return out, elapsed, len(plugin._background)
+
+    out, elapsed, registered = run(flow())
+    assert out.startswith(expect_prefixes), out
+    assert elapsed < 1.0, f"同步拒绝必须立刻返回（实测 {elapsed:.3f}s）"
+    assert "task_id" not in out, f"拒绝不得携带 task_id: {out}"
+    assert registered == 0, "拒绝不得登记任务"
+    return out
+
+
+def test_m1_all_mode_session_blacklist_is_synchronous(tmp_path):
+    ctx = FakeContext()
+    plugin = search_plugin(ctx)
+    plugin.config["security"] = {"session_blacklist": ["123456"]}
+    _assert_sync_rejection(
+        plugin, lambda: plugin.browse_web(FakeEvent(), "越权会话的任务"), ("【拒绝】",)
+    )
+
+
+def test_m1_all_mode_banned_task_is_synchronous():
+    from core.safety import SafetyFilter
+
+    ctx = FakeContext()
+    plugin = search_plugin(ctx)
+    plugin.safety = SafetyFilter(["赌博"], True)
+    out = _assert_sync_rejection(
+        plugin,
+        # perception 前缀必须被剔除后再做禁词判定（与 v1.4.0 口径一致）
+        lambda: plugin.browse_web(FakeEvent(), "perception=text 帮我查赌博网站"),
+        ("【拒绝】",),
+    )
+    assert "赌博" in out
+
+
+def test_m1_all_mode_local_page_missing_file_is_synchronous(tmp_path):
+    ctx = FakeContext()
+    plugin = search_plugin(ctx)
+    plugin._local_page_allowed_roots = (tmp_path,)
+    _assert_sync_rejection(
+        plugin,
+        lambda: plugin.browse_local_page(FakeEvent(), path=str(tmp_path / "nope.html")),
+        ("【错误】", "【拒绝】"),
+    )
+
+
+def test_m1_all_mode_local_page_bad_extension_is_synchronous(tmp_path):
+    target = tmp_path / "note.txt"
+    target.write_text("x", encoding="utf-8")
+    ctx = FakeContext()
+    plugin = search_plugin(ctx)
+    plugin._local_page_allowed_roots = (tmp_path,)
+    out = _assert_sync_rejection(
+        plugin,
+        lambda: plugin.browse_local_page(FakeEvent(), path=str(target)),
+        ("【拒绝】",),
+    )
+    assert ".html" in out
+
+
+def test_m1_all_mode_local_page_path_escape_is_synchronous(tmp_path):
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    outside = tmp_path / "outside.html"
+    outside.write_text("<html></html>", encoding="utf-8")
+    ctx = FakeContext()
+    plugin = search_plugin(ctx)
+    plugin._local_page_allowed_roots = (allowed,)
+    out = _assert_sync_rejection(
+        plugin,
+        lambda: plugin.browse_local_page(FakeEvent(), path=str(outside)),
+        ("【拒绝】",),
+    )
+    assert "路径不在允许范围内" in out
+
+
+def test_m1_all_mode_search_denied_session_is_synchronous():
+    """搜索工具在 all 模式下也必须在提交前拒绝黑名单会话。"""
+    ctx = FakeContext()
+    plugin = search_plugin(ctx)
+    plugin.config["security"] = {"session_blacklist": ["123456"]}
+    _assert_sync_rejection(
+        plugin,
+        lambda: plugin.browser_web_search(FakeEvent(), query="北京天气"),
+        ("【拒绝】",),
+    )
+
+
+# ====================================================================
+# M2：artifact_sink 必须在任务体内；后台态 event.send 直发为 0
+# ====================================================================
+
+
+def test_m2_artifact_sink_is_inside_background_job():
+    """结构断言：sink 必须开在 _run_background_job 里，入口/提交侧一律不许开。
+
+    为什么不能只靠行为断言：设计 §5.3-B 的**反模式**（入口 `with artifact_sink()`
+    后立刻退出，再让任务体在无 sink 的上下文里跑）在"只断言 chain 末段类型"的
+    用例下同样绿 —— 只有结构断言能把它打红。
+    """
+    node = next(
+        (n for n in ast.walk(MAIN_TREE)
+         if isinstance(n, ast.AsyncFunctionDef) and n.name == "_run_background_job"),
+        None,
+    )
+    assert node is not None
+    assert "with artifact_sink(" in (ast.get_source_segment(MAIN_SRC, node) or "")
+    for forbidden in (
+        "_submit_background",
+        "browse_web",
+        "browse_local_page",
+        "browser_web_search",
+    ):
+        dead = next(
+            (n for n in ast.walk(MAIN_TREE)
+             if isinstance(n, ast.AsyncFunctionDef) and n.name == forbidden),
+            None,
+        )
+        assert dead is not None, forbidden
+        body = ast.get_source_segment(MAIN_SRC, dead) or ""
+        assert "artifact_sink(" not in body, f"{forbidden} 不得开 sink（§5.3-B 反模式）"
+
+
+def test_m2_background_never_calls_event_send(tmp_path):
+    """后台任务里 event.send 直发次数必须为 0（媒体只能经 sink 进附件）。"""
+    mp4 = tmp_path / "clip.mp4"
+    mp4.write_bytes(b"mp4")
+    event = FakeEvent()
+    event.send_calls = 0
+    ctx = FakeContext()
+    plugin = make_plugin(tools_config("browse_only"), ctx)
+
+    async def flow():
+        out = await plugin._submit_background(
+            event=event,
+            tool_name=_BROWSE_WEB_TOOL_NAME,
+            runner=_MediaRunner(plugin, str(mp4)),
+        )
+        await plugin._background.task_of(task_id_of(out))
+
+    run(flow())
+    assert event.send_calls == 0, "后台执行体不得直接 event.send（event 已终结）"
+    chain = ctx.sent[0][1].chain
+    assert type(chain[-1]).__name__ == "Video"
+
+
+# ====================================================================
+# M3：R7 —— 终态投递抛错后仍可再次提交（单飞键不泄漏）
+# ====================================================================
+
+
+class _BadSendContext(FakeContext):
+    async def send_message(self, session, message_chain):
+        raise ValueError("不合法的 session 字符串")
+
+
+def test_t5b_delivery_error_still_frees_single_flight(logger_recorder):
+    ctx = _BadSendContext()
+    plugin = make_plugin(tools_config("browse_only"), ctx)
+
+    async def flow():
+        first = await plugin.browse_web(FakeEvent(), "第一轮")
+        await plugin._background.task_of(task_id_of(first))
+        left = len(plugin._background)
+        second = await plugin.browse_web(FakeEvent(), "第二轮")
+        await plugin._background.task_of(task_id_of(second))
+        return left, second
+
+    left, second = run(flow())
+    assert left == 0, "投递抛异常后登记表必须已清空（否则该会话永久被拒）"
+    assert second.startswith("【已受理】"), second
+    assert any("投递失败" in line for line in logger_recorder.lines("error"))
+
+
+# ====================================================================
+# L4（T8-8）：本地页截图在后台模式下进附件；前台行为不变
+# ====================================================================
+
+
+class _WritablePage:
+    """能真的落一张截图的假页面（不挂起）。"""
+
+    async def goto(self, url, wait_until="domcontentloaded", timeout=30000):
+        return None
+
+    async def screenshot(self, path=None, full_page=False):
+        Path(path).write_bytes(b"fake-png")
+
+    def is_closed(self):
+        return False
+
+
+class _ShootingBrowser:
+    async def new_page(self):
+        return _WritablePage()
+
+    async def close_page(self, page):
+        return None
+
+    async def screenshot(self, page, save_path):
+        Path(save_path).write_bytes(b"fake-png")
+        return save_path
+
+
+def _prepared_local_page(tmp_path, mode: str):
+    html = tmp_path / "page.html"
+    html.write_text("<html><body>hi</body></html>", encoding="utf-8")
+    event = FakeEvent()
+    event.send_calls = 0
+    ctx = FakeContext()
+    plugin = make_plugin(tools_config(mode), ctx)
+    plugin._local_page_allowed_roots = (tmp_path,)
+    plugin.browser = _ShootingBrowser()
+    plugin.extractor = _FakeExtractor()
+    return plugin, ctx, event, html
+
+
+def test_local_page_screenshot_goes_to_attachments_in_background(tmp_path):
+    plugin, ctx, _event, html = _prepared_local_page(tmp_path, "all")
+
+    async def flow():
+        out = await plugin.browse_local_page(FakeEvent(), path=str(html))
+        await plugin._background.task_of(task_id_of(out))
+
+    run(flow())
+    chain = ctx.sent[0][1].chain
+    assert type(chain[0]).__name__ == "Plain"
+    assert any(type(part).__name__ == "Image" for part in chain[1:]), (
+        "后台模式下本地页截图必须进附件随终态消息发"
+    )
+    assert "1 个媒体文件" in message_text(ctx.sent[0][1])
+
+
+def test_local_page_screenshot_stays_text_only_in_foreground(tmp_path):
+    """前台（off）行为与 v1.4.0 一致：只给截图路径，不发消息、不直发 event。"""
+    plugin, ctx, event, html = _prepared_local_page(tmp_path, "off")
+
+    async def _describe(_path, _event, page_url=None):
+        return "页面描述"
+
+    plugin._describe_screenshot = _describe
+    out = run(plugin.browse_local_page(event, path=str(html)))
+    assert "截图:" in out
+    assert ctx.sent == [], "前台不得主动投递消息"
+    assert event.send_calls == 0, "本地页前台从不 event.send（v1.4.0 行为）"
+
+
+# ====================================================================
+# L2：终态日志带 umo 摘要（三元组 task_id + tool + umo_digest）
+# ====================================================================
+
+
+def test_l2_terminal_log_carries_umo_digest(logger_recorder):
+    ctx = FakeContext()
+    plugin = make_plugin(tools_config("browse_only"), ctx)
+
+    async def flow():
+        out = await plugin.browse_web(FakeEvent(), "任务")
+        await plugin._background.task_of(task_id_of(out))
+
+    run(flow())
+    terminal = [ln for ln in logger_recorder.lines("info") if "后台任务终态" in ln]
+    assert len(terminal) == 1
+    assert f"umo={plugin._umo_digest(UMO)}" in terminal[0]
