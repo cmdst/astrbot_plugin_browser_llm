@@ -934,11 +934,17 @@ def test_log_keywords_are_unambiguous():
 
 
 def test_accepted_text_forbids_summarizing():
+    """受理文案逐字对齐设计 §2.6(a)：没有结果 / 禁止编造 / 唯一动作 / 禁止重复提交。"""
     text = render_accepted_text(task_id="bg-0007", tool="browse_web", budget_s=240)
     assert text.startswith("【已受理】")
-    assert "还没有" in text and "不要总结" in text and "不要编造" in text
+    assert "task_id=bg-0007" in text and "整任务硬预算 240 秒" in text
+    assert "单独作为一条消息" in text
     for header in HEADERS.values():
         assert header in text, "受理文案要点名四态前缀，便于用户对账"
+    assert "【重要】你现在**还没有**任何结果" in text
+    assert "不要总结、不要猜测、不要编造浏览内容" in text
+    assert '用一句话告诉用户"已开始处理，完成后会单独发结果"' in text
+    assert "不要重复提交同一任务" in text
 
 
 def test_rejected_text_mentions_task_and_action():

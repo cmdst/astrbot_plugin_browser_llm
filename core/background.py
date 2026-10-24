@@ -51,7 +51,8 @@ _BG_MAX_CONCURRENT = 4
 
 #: 并发上限的拒绝文案（逐字，与生产判据/README 对齐）。
 _BG_BUSY_TEXT = (
-    f"{REJECTED_HEADER}后台任务已达并发上限（{_BG_MAX_CONCURRENT}）：请稍后再试。"
+    f"{REJECTED_HEADER}后台任务已达并发上限（{_BG_MAX_CONCURRENT}），本次未提交。"
+    "请稍后再试；不要重试。"
 )
 
 #: 部分结果提示（超时/失败/中断时，若能拿到中断前的半成品才附）。
@@ -92,12 +93,10 @@ def render_accepted_text(*, task_id: str, tool: str, budget_s: float) -> str:
     关键约束：**必须明说"你现在还没有结果"**，否则主模型会当真去总结一个
     还不存在的结果（派单 §4.1）。四态前缀也在这里点名，用户/运营方据此对账。
     """
-    titles = "/".join(f"「{HEADERS[status]}」" for status in (
-        STATUS_OK,
-        STATUS_FAILED,
-        STATUS_TIMEOUT,
-        STATUS_CANCELLED,
-    ))
+    titles = "/".join(
+        f"「{HEADERS[status]}」"
+        for status in (STATUS_OK, STATUS_FAILED, STATUS_TIMEOUT, STATUS_CANCELLED)
+    )
     return (
         f"{ACCEPTED_HEADER}后台任务已开始执行（task_id={task_id}，工具={tool}，"
         f"整任务硬预算 {float(budget_s):.0f} 秒）。\n"
@@ -105,7 +104,7 @@ def render_accepted_text(*, task_id: str, tool: str, budget_s: float) -> str:
         "\n"
         "【重要】你现在**还没有**任何结果：不要总结、不要猜测、不要编造浏览内容，"
         "也不要依据这句话回答用户。\n"
-        "你现在唯一的动作：用一句话告诉用户“已开始处理，完成后会单独发结果”，"
+        '你现在唯一的动作：用一句话告诉用户"已开始处理，完成后会单独发结果"，'
         "然后结束本轮。\n"
         "不要重复提交同一任务（同一会话同时只允许一个后台任务），"
         "也不要调用其它工具去补这个结果。"
@@ -120,7 +119,7 @@ def render_rejected_text(
         f"{REJECTED_HEADER}{scope}已有一个后台任务在跑（task_id={task_id}，"
         f"工具={tool}，已运行 {max(0.0, float(elapsed_s)):.0f} 秒）。\n"
         f"同一会话同时只允许一个后台任务。不要再提交、不要换参数重试。\n"
-        "你现在的唯一动作：用一句话告诉用户“上一个任务还在跑，完成后会把结果发过来”。"
+        '你现在的唯一动作：用一句话告诉用户"上一个任务还在跑，完成后会把结果发过来"。'
     )
 
 
@@ -133,21 +132,21 @@ def render_terminal_text(
     reason: str = "",
     elapsed_ms: int = 0,
     budget_s: float = 0.0,
-    truncated: bool = False,
-    omitted: int = 0,
     artifact_count: int = 0,
     missing_files: int = 0,
     partial: str = "",
 ) -> str:
-    """渲染终态消息正文（四态共用头部，前缀按状态分流，见 :data:`HEADERS`）。"""
+    """渲染终态消息正文（四态共用头部，前缀按状态分流，见 :data:`HEADERS`）。
+
+    截断提示由 :func:`truncate_result` 追加在 ``text`` 末尾（设计 §4.4），
+    这里不再重复一遍（重复会让用户看到两条"已省略"）。
+    """
     head = (
         f"{HEADERS.get(status, HEADERS[STATUS_FAILED])}{tool}"
         f"（task_id={task_id}，耗时 {max(0, int(elapsed_ms)) / 1000:.1f}s）"
     )
     if status == STATUS_OK:
         lines = [head, text.strip() or "（任务执行完成，但没有返回可展示的文本）"]
-        if truncated:
-            lines.append(f"（已截断：{_TRUNCATION_NOTE.format(omitted=omitted)}）")
         if artifact_count or missing_files:
             note = f"（另附 {artifact_count} 个媒体文件"
             if missing_files:
@@ -155,30 +154,25 @@ def render_terminal_text(
             lines.append(note + "）")
         return "\n".join(lines)
 
-    # 非成功态：原因 + （可选）中断前的部分结果 + 处置建议
+    # 非成功态：原因 + （可选）中断前的部分结果 [+ 超时态处置建议]
     if status == STATUS_TIMEOUT:
-        lines = [
-            head,
-            f"已用满 {float(budget_s):.0f} 秒硬预算，任务被中断。",
-        ]
-        advice = "可调大 tools.background_timeout，或把任务拆小。"
+        lines = [head, f"已用满 {float(budget_s):.0f} 秒硬预算，任务被中断。"]
     elif status == STATUS_CANCELLED:
         lines = [
             head,
             "插件被重载或禁用（含 astrbot.service 重启/插件更新），任务被取消。",
         ]
-        advice = "重新发起即可。"
     else:
         lines = [
             head,
             f"失败原因：{shorten(reason, _REASON_LIMIT) or '未给出原因'}",
             "本次没有可用结果。",
         ]
-        advice = "可稍后重试，或把 tools.background_mode 设为 off 改用同步模式。"
     if partial.strip():
         lines.append(PARTIAL_NOTE)
         lines.append(partial.strip())
-    lines.append(advice)
+    if status == STATUS_TIMEOUT:
+        lines.append("可调大 tools.background_timeout，或把任务拆小。")
     return "\n".join(lines)
 
 

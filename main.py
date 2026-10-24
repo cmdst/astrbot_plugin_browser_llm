@@ -1804,7 +1804,7 @@ class BrowserLLMPlugin(Star):
             tuple[bool, str]: (是否投递成功, 消息首行)；首行由调用方再打一条
             info 便于按 ``【后台任务…】`` 对账（F3）。
         """
-        body, truncated, omitted = truncate_result(text, int(job.max_chars))
+        body = truncate_result(text, int(job.max_chars))[0]
         # 媒体只在成功态附：任务没跑完时半成品只会误导（口径裁决）。
         attachments = [p for p in artifacts] if status == STATUS_OK else []
         existing = [p for p in attachments if os.path.isfile(p)]
@@ -1817,8 +1817,6 @@ class BrowserLLMPlugin(Star):
             reason=reason,
             elapsed_ms=elapsed_ms,
             budget_s=float(job.budget_s),
-            truncated=truncated,
-            omitted=omitted,
             artifact_count=len(existing),
             missing_files=missing,
             partial=truncate_result(partial, int(job.max_chars))[0],
