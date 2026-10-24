@@ -156,11 +156,18 @@ def render_terminal_text(
 
     # 非成功态：原因 + （可选）中断前的部分结果 [+ 超时态处置建议]
     if status == STATUS_TIMEOUT:
-        lines = [head, f"已用满 {float(budget_s):.0f} 秒硬预算，任务被中断。"]
         if str(reason or "").strip():
-            # 超时原因（如 total_timeout）：不然用户只看到"被中断"，不知道
-            # 是整任务预算到了还是搜索自己的总预算到了。
-            lines.append(f"原因：{shorten(reason, _REASON_LIMIT)}")
+            # 工具**自报**超时（如搜索的 total_timeout 是工具自身的 60s 上限）：
+            # 首行不能写成"已用满 {budget} 秒硬预算"——那会让人以为是插件把任务
+            # 掐了，而实际是工具自己先超时、整任务预算还剩很多。
+            lines = [
+                head,
+                f"任务在 {float(budget_s):.0f} 秒预算内因工具自身超时而中断。",
+                f"原因：{shorten(reason, _REASON_LIMIT)}",
+            ]
+        else:
+            # 整任务硬预算到点（reason 为空，见 _run_background_job 的置空注释）。
+            lines = [head, f"已用满 {float(budget_s):.0f} 秒硬预算，任务被中断。"]
     elif status == STATUS_CANCELLED:
         lines = [
             head,

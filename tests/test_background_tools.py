@@ -43,7 +43,12 @@ from core.background import (
     truncate_result,
 )
 from core.config_map import KEY_MAP, V5_ONLY_PATHS
-from main import BrowserLLMPlugin, _BROWSE_WEB_TOOL_NAME, _LOCAL_PAGE_TOOL_NAME
+from main import (
+    BrowserLLMPlugin,
+    _BROWSE_WEB_TOOL_NAME,
+    _LOCAL_PAGE_TOOL_NAME,
+    _SEARCH_TOOL_NAME,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 SCHEMA = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
@@ -852,14 +857,21 @@ def test_d2_global_cap_constant_is_not_a_config_key():
 
 
 class _MediaRunner:
-    """假执行体：跑的时候经 _emit_media 登记一个媒体（模拟子工具截图/下载）。"""
+    """假执行体：跑的时候经 ``_emit_media`` 登记一个媒体（模拟子工具截图/下载）。
 
-    def __init__(self, plugin, path: str):
+    **必须传入口那个 event**（N1）：生产里子工具拿到的正是入口 event 对象，
+    若这里另造一个 ``FakeEvent()``，``send_calls`` 计数就钉在了另一个实例上，
+    「后台态 event.send == 0」这条断言会恒真（reviewer 实测：在 ``_emit_media``
+    的 sink 分支前插一句 ``await event.send(...)``，旧用例照样绿）。
+    """
+
+    def __init__(self, plugin, path: str, event: FakeEvent):
         self.plugin = plugin
         self.path = path
+        self.event = event
 
     async def __call__(self, progress):
-        await self.plugin._emit_media(FakeEvent(), self.path, "video")
+        await self.plugin._emit_media(self.event, self.path, "video")
         return "任务结果"
 
 
@@ -876,12 +888,14 @@ def test_terminal_chain_uses_video_for_video_artifact(tmp_path):
         ctx = FakeContext()
         plugin = make_plugin(tools_config("browse_only"), ctx)
         plugin._browser_toolset = SimpleNamespace(tools=[])
+        FakeEvent.send_calls = 0
+        event = FakeEvent()
 
-        async def flow(target=path):
+        async def flow(target=path, entry=event):
             out = await plugin._submit_background(
-                event=FakeEvent(),
+                event=entry,
                 tool_name=_BROWSE_WEB_TOOL_NAME,
-                runner=_MediaRunner(plugin, str(target)),
+                runner=_MediaRunner(plugin, str(target), entry),
             )
             await plugin._background.task_of(task_id_of(out))
 
@@ -889,6 +903,7 @@ def test_terminal_chain_uses_video_for_video_artifact(tmp_path):
         chain = ctx.sent[0][1].chain
         assert compare_type(chain[-1]) is expected_type, label
         assert type(chain[-1]).__name__ == expected_type.__name__
+        assert FakeEvent.send_calls == 0, f"{label}：后台态不得 event.send 直发"
 
 
 def compare_type(component):
@@ -999,6 +1014,42 @@ def test_terminal_text_shapes():
         task_id="bg-0004", tool=_BROWSE_WEB_TOOL_NAME, status=STATUS_CANCELLED
     )
     assert cancelled.startswith("【后台任务已取消】")
+
+
+def test_n2_timeout_first_line_distinguishes_tool_timeout_from_budget():
+    """N2：整任务预算超时 vs 工具自报超时，首行文案必须不同。
+
+    旧实现两种都写「已用满 {budget} 秒硬预算」——工具自报超时（如搜索
+    ``total_timeout``，是工具自己的 60s 上限）被说成"插件把任务掐了"，
+    而实际整任务预算还剩很多，运营方据此排障会找错方向。
+    """
+    budget = render_terminal_text(
+        task_id="bg-0100", tool=_SEARCH_TOOL_NAME, status=STATUS_TIMEOUT, budget_s=240
+    )
+    tool = render_terminal_text(
+        task_id="bg-0101",
+        tool=_SEARCH_TOOL_NAME,
+        status=STATUS_TIMEOUT,
+        budget_s=240,
+        reason="total_timeout: 【错误】搜索超过总预算被中断",
+    )
+    assert budget.startswith(HEADERS[STATUS_TIMEOUT])
+    assert "已用满 240 秒硬预算，任务被中断。" in budget
+    assert "工具自身超时" not in budget
+    assert "任务在 240 秒预算内因工具自身超时而中断。" in tool
+    assert "已用满" not in tool, "工具自报超时不得说成整任务预算到点"
+    assert "原因：total_timeout" in tool
+    # O-2 两条都必须明说没有可用结果（partial 为空）
+    assert "本次没有可用结果。" in budget and "本次没有可用结果。" in tool
+    # 有半成品时不出现"没有可用结果"，改走「已得部分结果」
+    with_partial = render_terminal_text(
+        task_id="bg-0102",
+        tool=_LOCAL_PAGE_TOOL_NAME,
+        status=STATUS_TIMEOUT,
+        budget_s=240,
+        partial="半成品文本",
+    )
+    assert "已得部分结果" in with_partial and "本次没有可用结果。" not in with_partial
 
 
 def test_truncate_result_keeps_short_and_marks_long():
@@ -1185,6 +1236,9 @@ def test_h2_search_total_timeout_is_reported_as_timeout(logger_recorder):
     text = message_text(ctx.sent[0][1])
     assert text.startswith(HEADERS[STATUS_TIMEOUT]), text
     assert "total_timeout" in text
+    # N2：工具自报超时的首行不得写成"已用满 N 秒硬预算"（会误导成插件掐的）
+    assert "任务在 240 秒预算内因工具自身超时而中断。" in text
+    assert "已用满" not in text
     terminal = [ln for ln in logger_recorder.lines("info") if "后台任务终态" in ln]
     assert terminal and "status=timeout" in terminal[-1]
     # O-2：超时且无半成品时明说「本次没有可用结果」
@@ -1372,8 +1426,8 @@ def test_m2_background_never_calls_event_send(tmp_path):
     """后台任务里 event.send 直发次数必须为 0（媒体只能经 sink 进附件）。"""
     mp4 = tmp_path / "clip.mp4"
     mp4.write_bytes(b"mp4")
+    FakeEvent.send_calls = 0  # 类级计数：入口与 runner 必须共用同一个 event 实例
     event = FakeEvent()
-    event.send_calls = 0
     ctx = FakeContext()
     plugin = make_plugin(tools_config("browse_only"), ctx)
 
@@ -1381,12 +1435,15 @@ def test_m2_background_never_calls_event_send(tmp_path):
         out = await plugin._submit_background(
             event=event,
             tool_name=_BROWSE_WEB_TOOL_NAME,
-            runner=_MediaRunner(plugin, str(mp4)),
+            runner=_MediaRunner(plugin, str(mp4), event),
         )
         await plugin._background.task_of(task_id_of(out))
 
     run(flow())
-    assert event.send_calls == 0, "后台执行体不得直接 event.send（event 已终结）"
+    assert FakeEvent.send_calls == 0, (
+        "后台执行体不得直接 event.send（event 已终结）"
+        f"；实测直发 {FakeEvent.send_calls} 次"
+    )
     chain = ctx.sent[0][1].chain
     assert type(chain[-1]).__name__ == "Video"
 
