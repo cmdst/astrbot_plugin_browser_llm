@@ -4,6 +4,75 @@
 `data/` 目录（主仓库 .gitignore 忽略）迁移初始化而来。仅跟踪插件源码与测试，运行时
 数据（`data/`：截图、运行时配置、临时文件）一律不入库。
 
+## [v1.5.0] - 2026-10-25
+
+### 特性：三个 LLM 工具支持后台异步执行（路线 D：插件内闭环、默认 off、零核心改动）
+
+- **新增 `tools` 配置组（第 6 组，3 键，默认关闭）**：
+  - `tools.background_mode`：`off`（默认，三工具全前台同步）/ `browse_only`
+    （只后台化 `browse_web`）/ `all`（三工具都后台化，**不推荐**）。非法值
+    fail-closed 回 `off` 并记一条 warning；
+  - `tools.background_timeout`：整任务硬预算（默认 240 秒，钳 30-900；核心的
+    工具调用超时对后台执行体已不生效，这条是唯一约束）；
+  - `tools.background_max_chars`：终态消息正文截断（默认 1500 字符，钳 200-8000）。
+  - **不需要手工迁移配置**：核心按 schema 自动补齐缺失组/叶，覆盖安装后配置里
+    自动长出 `tools` 组（值 = 默认 `off`）。
+- **新增 `core/background.py`（283 行，纯 Python 不 `import astrbot`，可独立单测）**：
+  `BackgroundRegistry`（umo→job 单飞索引、`active_job` / `active_task_id` /
+  `finish` / `running` / `cancel_all`）、`BackgroundJob`（**提交时快照**预算与
+  截断长度，运行中改配置不变）、四态四前缀 `HEADERS`、`render_accepted_text` /
+  `render_rejected_text` / `render_terminal_text`、`truncate_result`、
+  `_BG_MAX_CONCURRENT = 4` 与 `_BG_BUSY_TEXT`。
+- **三个入口拆成「同步前置校验 + 后台/前台分派」**：`browse_web` 的会话白/黑名单、
+  禁词校验与 `perception=` 前缀解析留在前台；`browse_local_page` 的四道路径校验
+  抽成 `_resolve_local_page_target()` 并留在前台；`browser_web_search` 的
+  `search.enabled` 闸门与检索词校验留在前台。⇒ 越权/禁词/路径非法**永远是同步
+  拒绝**，不会退化成一条异步失败消息。
+- **终态投递**：`context.send_message(umo, MessageChain([Plain(正文)] + 媒体))`；
+  媒体走既有 `artifact_sink()`，**只在成功态附**；投递失败只记日志、不重试，
+  且 `finish()` 在 `finally` 里（投递异常不会让该会话被永久单飞拒绝）。
+- **插件重载/禁用**：`terminate()` 先取消在跑任务（等至多 5 秒）再关浏览器，
+  发「【后台任务已取消】」；进程级重启没有终态消息（已知边界，见下）。
+
+### 行为边界（写清楚，免得运营方当 bug 报）
+
+- **前缀六个字面量、互不嵌套**：拒绝 `【拒绝】`、受理 `【已受理】`、终态
+  `【后台任务完成】` / `【后台任务失败】` / `【后台任务超时】` /
+  `【后台任务已取消】`。拒绝/受理**同步**返回，四态终态**异步投递**。
+  **拒绝态不占 `task_id`**（不登记、不排队、不进后台）。
+  四态分开的直接后果：生产判据 `grep -c "【后台任务完成】"` 只数成功，
+  失败/超时/取消不会被算进"完成"；日志侧另有 `后台任务终态 status=` 与
+  `后台任务受理` 两条结构化关键字可对账。
+- **部分结果规则**：`browse_local_page` 与 `browser_web_search` 超时/失败时附
+  「（以下是中断前已得部分结果，可能不完整）」+ 截断正文；
+  **`browse_web` 超时 = 无结果** —— 子代理只在**终局**返回结果文本，中途没有可
+  交付的半成品，超时消息里没有内容属预期。
+- **并发上限两个**：同一会话最多 **1 个**后台任务（单飞，第二个同步拒绝、不排队）；
+  全进程最多 **4 个**（`_BG_MAX_CONCURRENT`，**模块常量不是配置键**），第 5 个
+  同步拒绝（`【拒绝】后台任务已达并发上限（4），本次未提交。`）。
+- **后台结果不进主模型上下文**：终态消息是插件自己发的，不写 LLM 历史 ⇒ 用户
+  追问时主模型不知道结果。这是路线 D 的固有代价；要"结果回到主模型"需要路线 C
+  （核心补一行镜像 + 重启 AstrBot），**本版未实现**，也没有 `background_mode=core`
+  之类的取值。
+- **`off` 与 v1.4.0 逐字节一致**：三工具返回体、拒绝文案、`_refresh_config()`
+  调用次数都由用例钉住（`test_background_tools.py::test_t1_*`、`test_f1_*`）。
+- **回滚**：`tools.background_mode` 改回 `off` 即行为回退 —— 入口第一行重读配置，
+  **下一次工具调用生效，无需重载、无需重启**。代码级回滚时配置与代码**成对**回退：
+  v1.4.0 不认识 `tools` 组，核心会把这三个键当未知键删掉（`Config key removed`），
+  属预期行为。
+- **媒体只在成功态附**：超时/失败/取消只发文本 + 原因（半成品媒体会误导用户）。
+- **顺带清掉 HEAD 遗留的 7 处 F841**，让 `ruff check` 门禁真的能过（否则它是
+  "有存量告警但没人看"的假绿灯）。
+
+### 测试
+
+- 全量：`693 passed`（2026-10-25；v1.4.0 基线 650 条，本次**新增 43 条**）。
+  新增 `tests/test_background_tools.py`（1016 行）覆盖交接判据 T1–T7 +
+  三处实现纠偏 F1（模式热更新）/ F2（媒体仅成功态）/ F3（终态日志带 `status=`）
+  + D2（全局 4 并发），另有受理/拒绝/终态文案、六前缀互斥、截断、登记表纯单测。
+- `ruff check --no-cache .`：`All checks passed!`。
+- 仓库卫生：`git status -s` 空，无 `.pyc` / `.pytest_cache` / `.ruff_cache` 新增。
+
 ## [v1.4.0] - 2026-10-21
 
 ### 特性：配置分组化（5 组 / 41 键）+ 搜索 API 池 + LLM 搜索工具

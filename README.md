@@ -2,6 +2,8 @@
 
 Agent 驱动的网页浏览插件 —— 让 LLM 通过 function-calling 自主浏览网页：导航、搜索、点击链接、填表、滚动、截图识图、下载媒体，无需用户手动指令。
 
+当前版本：**v1.5.0**（变更见 [CHANGELOG](./CHANGELOG.md)；v1.5.0 新增「后台异步执行」，默认关闭）
+
 ## ✨ 功能特性
 
 - **工具化子代理架构**：主 LLM 只看到一个 `browse_web` 入口工具，24 个 `browse_*` 工具在子代理上下文中运行，显著减少主 LLM 的 token 占用
@@ -13,6 +15,7 @@ Agent 驱动的网页浏览插件 —— 让 LLM 通过 function-calling 自主�
 - **感知模式精细化**：页面感知方式可精确控制——`browse_web` 参数级前缀 `perception=text|text_image|image` 按任务覆盖、`perception_rules` 按会话（UMO 子串匹配）设定默认、全局 `page_perception` 兜底；全文本子代理（前端/测试等）不再为每次浏览付出截图识图开销
 - **识图缓存**：同一 URL（去 fragment/尾斜杠规范化）在 `vision_cache_ttl` 内重复识图直接复用结果（带 `[缓存]` 前缀），省识图耗时与 token
 - **配置热更新**：会话黑白名单、内容禁词、内网拦截开关、截图开关、识图 Provider、感知规则等修改后无需重启，下次工具调用即生效（Dashboard 保存即同步）
+- **后台异步执行（v1.5.0，默认关闭）**：`tools.background_mode` 打开后，`browse_web` / `browse_local_page` / `browser_web_search` 三个 LLM 工具**立刻**返回「已受理 + task_id」，真正的任务在后台跑，结果**单独作为一条消息**发到本会话（四态前缀、部分结果规则、并发上限、回滚见下文「后台异步执行」一节）；默认 `off` 与 v1.4.0 行为一致
 - **资源清理加固**：浏览器关闭/插件重载带超时保护与总超时兜底，避免 WebUI 重载后旧实例 chromium 残留进程
 - **安全防护**：SSRF 内网拦截、内容禁词过滤（`enable_banned_filter` 总开关，敏感词密集站点可关闭）、图形验证码自动停止、下载大小上限
 
@@ -30,6 +33,10 @@ Agent 驱动的网页浏览插件 —— 让 LLM 通过 function-calling 自主�
         ├── 无头渲染（独立页面，用完即关）
         ├── 路径白名单（工作区 + 插件 data 目录）
         └── 视觉描述 / 降级文本提取
+
+后台执行（v1.5.0，仅当 tools.background_mode ≠ off）
+  ├── BackgroundRegistry（同会话单飞 + 全局最多 4 个并发，core/background.py）
+  └── 终态投递 context.send_message（四态前缀；媒体只在成功态附）
 ```
 
 ## 📦 安装
@@ -40,9 +47,10 @@ Agent 驱动的网页浏览插件 —— 让 LLM 通过 function-calling 自主�
 
 ## ⚙️ 配置项（WebUI 插件配置）
 
-v1.4.0 起配置按 **5 个分组**组织（Dashboard 中折叠显示）：`browser` /
-`limits` / `security` / `perception` / `search`。前四组是既有 25 个键
-（只是从扁平结构搬进分组，**键名与语义不变**），`search` 是新增的搜索 API 组。
+v1.4.0 起配置按**分组**组织（Dashboard 中折叠显示），v1.5.0 起为 **6 个分组 / 44 个键**：
+`browser` / `limits` / `security` / `perception` / `search` / `tools`。前四组是既有
+25 个键（只是从扁平结构搬进分组，**键名与语义不变**），`search` 是 v1.4.0 新增的
+搜索 API 组（16 键），`tools` 是 v1.5.0 新增的后台任务组（3 键，默认关闭）。
 
 ### browser / limits / security / perception（既有 25 键）
 
@@ -129,22 +137,147 @@ provider 模板字段（每份 7 个）：`enabled`（默认 true）、`name`（
   前再走 `acheck_url`（含 DNS）并逐跳校验重定向；检索词命中禁词整单拒绝，
   结果标题/摘要命中只丢该条。
 
+### tools（v1.5.0 新增：后台任务）
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `tools.background_mode` | off | 三取值：`off`（三个工具都前台同步，与 v1.4.0 行为一致）/ `browse_only`（只把 `browse_web` 后台化）/ `all`（三个工具都后台化，**不推荐**）。写错的值按 `off` 处理并记一条 warning（fail-closed，不会让拼错的值变成后台） |
+| `tools.background_timeout` | 240 | 后台任务的**整任务**硬预算（秒，钳 30-900）。用满则中断并发一条「【后台任务超时】」终态消息；已在跑的任务用提交时快照，改配置不会把它中途掐断 |
+| `tools.background_max_chars` | 1500 | 终态消息正文的截断长度（字符，钳 200-8000），超出部分标注「…（完整结果已省略 N 字）」；媒体附件与消息头部不计入 |
+
+> **v1.5.0 不需要跑迁移器**：核心加载插件配置时会按 schema 自动补齐缺失的组/叶
+> （`Config key missing; added default.`），覆盖安装后配置里自动长出 `tools` 组
+> （值 = 默认 `off`），运营方不需要手动迁移、也不需要改配置文件。
+> `tools/migrate_config_v4.py` 只是保证"产物键集合齐全"的自洽工具，它的口径已跟上
+> **6 组 / 44 叶**。
+
+## 🕒 后台异步执行（v1.5.0，默认关闭）
+
+三个 LLM 工具默认都是**前台同步**：主模型要等工具返回才能继续回复，`browse_web`
+一次 68 秒量级会把该会话的回复卡住。v1.5.0 增加 **路线 D**（插件内闭环、零核心
+改动、不重启服务）的后台执行方式，由 `tools.background_mode` 控制，**默认 `off`**。
+
+### 开关语义
+
+| `tools.background_mode` | `browse_web` | `browse_local_page` | `browser_web_search` |
+|---|---|---|---|
+| `off`（默认） | 前台同步（与 v1.4.0 **逐字节一致**） | 前台 | 前台 |
+| `browse_only` | **后台** | 前台 | 前台 |
+| `all` | **后台** | **后台** | **后台（不推荐）** |
+
+`browser_web_search` 常态 1-3 秒，后台化等于多一条消息、且结果不进主模型上下文，
+**通常没必要**；`all` 只为"任何工具都不阻塞会话"这种一致性要求存在。
+
+### 前缀表（与 `core/background.py` 逐字一致：`REJECTED_HEADER` / `ACCEPTED_HEADER` / `HEADERS`）
+
+| 前缀 | 类别 | 谁返回 | 同步/异步 | 说明 |
+|---|---|---|---|---|
+| **`【拒绝】`** | 拒绝 | 工具入口（`_submit_background` 的前置校验，或工具自己的参数/路径校验） | **同步**立即返回 | 后台受理这条路的四类原因：同会话单飞占用 / 全局并发上限 / 会话黑白名单 / 内容禁词。另有工具自己的参数与路径校验（如 `browse_local_page` 的路径白名单、扩展名限制）也仍在**前台**完成，其文案沿用仓库既有 `【错误】` / `【拒绝】` 口径。**拒绝态不占 `task_id`**：不登记、不进后台、不排队，主模型看到的就是最终答复 |
+| **`【已受理】`** | 受理 | `_submit_background` | **同步**立即返回 | 文案含 `task_id` / 工具名 / 整任务硬预算，并明说「你现在还没有任何结果」+ 禁止编造 + 禁止重复提交 |
+| **`【后台任务完成】`** | 终态·成功 | 后台任务 → `context.send_message` | 异步投递 | **只有这一种算"完成"**；媒体附件只在这种情况下随消息发出 |
+| **`【后台任务失败】`** | 终态·失败 | 同上 | 异步投递 | 含失败原因摘要（≤300 字）；工具以 `【错误】` / `【拒绝】` 前缀作为文本返回的可预期失败（如"拿不到当前对话模型"）也归到这里 |
+| **`【后台任务超时】`** | 终态·超时 | 同上 | 异步投递 | 用满 `tools.background_timeout` 被中断；有部分结果时附「已得部分结果」，并给调参建议 |
+| **`【后台任务已取消】`** | 终态·取消 | 同上（best-effort，2 秒投递上限） | 异步投递 | 插件重载/禁用时取消在跑任务；进程级重启不发（见「代价与边界」） |
+
+读表四条：① 六个前缀**互不嵌套**——失败/超时/取消消息里不会出现"完成"，所以
+`grep -c "【后台任务完成】"` 只数成功；② 拒绝与受理**同步**、终态**异步**；
+③ 拒绝态**没有** `task_id`，日志里不该按 task_id 去找被拒的请求（单飞拒绝文案里
+出现的那个 `task_id` 是"正在跑"的任务，不是本次被拒的请求）；④ 插件日志关键字
+（`后台任务受理` / `后台任务终态 status=`）与用户可见前缀是**两套**口径，
+可以互相对账。
+
+### 部分结果规则（超时/失败时到底有没有内容）
+
+| 工具 | 超时/失败时有无部分结果 | 说明 |
+|---|---|---|
+| `browse_web` | **无** | 子代理只在**终局**返回结果文本，中途没有可交付的半成品 |
+| `browse_local_page` | 有 | 文本提取在截图/识图之前完成，已提取到的正文会随终态消息发出 |
+| `browser_web_search` | 有 | 每波结束的增量快照会被保留，按「title — url」最多渲染 5 条 |
+
+统一形状：先一行 `（以下是中断前已得部分结果，可能不完整）`，再跟截断后的正文。
+
+> **`browse_web` 超时 = 无结果**（子代理终局才返回）；只有 `browse_local_page` 与
+> `browser_web_search` 超时才附「已得部分结果」+ 截断。运营方看到 `browse_web`
+> 的超时消息里没有内容属**预期**，不要当 bug 报。
+
+### 并发上限：全局 4 个（模块常量，不是配置键）
+
+- **同会话单飞**：同一会话（UMO）同时最多 **1 个**后台任务；第二个提交立即同步拒绝
+  （`【拒绝】本会话已有一个后台任务在跑…`），**不排队**。
+- **全局上限**：全进程同时最多 **4 个**后台任务 —— `core/background.py` 的
+  `_BG_MAX_CONCURRENT = 4`，**模块常量、不是配置键**（面板上改不到它），第 5 个
+  同步拒绝（`【拒绝】后台任务已达并发上限（4），本次未提交。请稍后再试；不要重试。`）。
+- 为什么不把它做成配置键：每个后台任务 = 一套子代理链 + 一个浏览器 context + 最多
+  `limits.max_pages` 个标签，4 个并发已可能撞容量上限；这条闸是防雪崩的硬约束，
+  开放成旋钮只会用错。
+
+### 回滚：把 `tools.background_mode` 改回 `off` 即回退（**无需重启、无需重载**）
+
+`off` 是默认值，也是**行为级回滚**：三个工具恢复前台同步，返回体与 v1.4.0 逐字节
+一致。每个工具入口第一行都会重读配置，所以面板改回 `off` 后**下一次工具调用**即
+生效，**不需要重载插件、不需要重启 AstrBot**；唯一残留是当时在跑的那个任务会照常
+跑完并按四态发一条终态消息。
+
+代码级回滚（把插件目录退回 v1.4.0）时，**配置与代码成对回退**：v1.4.0 不认识
+`tools` 组，核心会把这三个键当未知键删掉（`Config key removed`）—— 这是**预期
+行为**，不是故障。
+
+### 代价与边界（路线 D 的固有取舍，别当 bug 报）
+
+- **后台结果不进主模型上下文**：终态消息由插件自己 `context.send_message` 发出，
+  不写 LLM 历史 ⇒ 用户之后追问"刚才看到什么"，主模型**不知道**答案。这是路线 D 的
+  固有代价，本版不做补救。要让"结果回到主模型、上下文连续"需要**路线 C**（核心补
+  一行镜像 + 重启 AstrBot）——**本版没有实现，也不提供 `background_mode=core` 之类
+  的取值**；本版能保证的只是"结果单独一条消息送达用户"。
+- **进程级重启没有终态消息**：Dashboard 热重载、插件禁用都会先取消在跑任务并发一条
+  「【后台任务已取消】」；但 `astrbot.service` 重启（进程被直接杀掉）没有 terminate
+  机会，在跑任务**直接消失、不发任何消息**。属已知边界（跨进程恢复要落盘任务状态，
+  不在本版范围）。
+- **后台模式下拿不到对话模型 = 异步失败**：`browse_web` 的 provider 解析在执行体里，
+  后台模式下失败会变成一条「【后台任务失败】…无法确定当前对话模型…」的终态消息，
+  而不是同步错误。
+- **搜索结果在后台消息里是 JSON**：`browser_web_search` 的返回体本就是 JSON，后台
+  模式下该 JSON 会按 `background_max_chars` 截断后原样发出（没做人读摘要），可读性
+  一般 —— 又一条"不建议把搜索工具后台化"的理由。
+- **媒体只在成功态附**：超时/失败/取消只发文本 + 原因，半成品截图/视频不发（否则
+  用户会以为任务完成了）。
+
+### 生产判据（部署后照抄；日志口径与用户口径分开数）
+
+```bash
+LOG=/root/AstrBot/data/logs/astrbot.log
+grep -c "后台任务受理" "$LOG"                     # 分母：受理成功次数（被拒绝的不算）
+grep -c "后台任务终态 status=" "$LOG"             # 四态合计；与上行相等 = 每个受理都收尾了
+grep -c "后台任务终态 status=ok" "$LOG"           # 成功（失败/超时/取消不算）
+grep -c "【后台任务完成】" "$LOG"                 # 用户真的看到的"成功"消息
+grep -c "【后台任务失败】\|【后台任务超时】\|【后台任务已取消】" "$LOG"
+```
+
+"受理"与"终态"条数不相等 = 还有任务在跑（正常）或投递前进程被杀（异常）；
+用户侧 `【后台任务…】` 条数与终态日志条数不相等 = 有终态消息没投递出去
+（`send_message` 返回 False，按 `task_id` 查日志）。
+
 ## 🔁 配置迁移与成对回滚（v3 → v4）
+
+> v1.5.0 只新增一个 `tools` 组（默认 `off`，3 键），**不需要手工迁移配置**：核心会
+> 按 schema 自动补齐缺失的组/叶（见上「tools」一节）。本节讲的是**一次性**
+> v3 → v4 的分组化迁移，对"从扁平 v3 直接升到当前版"仍然适用于。
 
 ### 为什么必须先迁配置
 
 核心 `AstrBotConfig.check_config_integrity()`（`astrbot/core/config/astrbot_config.py`）
 会把**schema 里没有的键判为 stale 并从配置里删掉、随后落盘**。本插件 v3 的配置是
-**扁平 25 键**，v4 schema 已改成 **5 个分组 / 41 叶**；直接把新代码装上去，旧配置的
-每个顶层键都会命中"未知键"⇒ 设置被静默清空（日志 `Config key removed: <key>`）。
+**扁平 25 键**，当前 schema 是 **6 个分组 / 44 叶**（v4 起分组，v1.5.0 加 `tools`
+组）；直接把新代码装上去，旧配置的每个顶层键都会命中"未知键"⇒ 设置被静默清空
+（日志 `Config key removed: <key>`）。
 
 **不变量（升级与回滚都要满足）**：配置文件里的键集合 ⊆ 代码 `_conf_schema.json` 的
 键集合。违反它的两个方向都不行：
 
 | 场景 | 代码 | 磁盘配置 | 后果 |
 |---|---|---|---|
-| 升级未做 | v4（5 组 41 叶） | v3（扁平 25 键） | 核心删掉全部扁平旧键 → 设置清零 |
-| 回滚只回代码 | v3（扁平 25 键） | v4（5 组 41 叶） | 核心删掉 5 个组 → 设置清零 |
+| 升级未做 | 当前版（6 组 44 叶） | v3（扁平 25 键） | 核心删掉全部扁平旧键 → 设置清零 |
+| 回滚只回代码 | v3（扁平 25 键） | 当前版（6 组 44 叶） | 核心删掉 6 个组 → 设置清零 |
 
 ### 升级步骤（先迁配置，再换代码）
 
@@ -163,7 +296,7 @@ python3 tools/migrate_config_v4.py --verify --config "$CFG" --baseline "<.bak-pr
 # 2b) 严格比对（同形态）：键集合 + 值都必须一致，用于"产物 vs 已知良好 v4 配置"
 python3 tools/migrate_config_v4.py --verify --config "$CFG" --against "<known-good-v4.json>"
 
-# 2c) 键集合必须 == schema 的 41 叶（迁移后自查，防丢组/多组；无需第二份配置）
+# 2c) 键集合必须 == schema 的 44 叶（迁移后自查，防丢组/多组；无需第二份配置）
 #     在**插件目录**下执行（脚本要读同目录的 _conf_schema.json）
 python3 - "$CFG" <<'PY'
 import json, sys
@@ -185,7 +318,7 @@ PY
 |---|---|---|
 | `--verify --baseline <旧配置>` | **只**比 25 条旧路径的**值** + 缺失清单 + 旧值指纹；键集合差异只作 INFO 打印 | 跨形态体检（扁平 v3 → 分组 v4），证明"迁移没动旧值" |
 | `--verify --against <参照配置>` | **键集合 + 逐路径值**都要一致，任一差异即 FAIL（退出码 3） | 同形态严格比对（迁后产物 vs 已知良好 v4 配置、或两份产物互比） |
-| 内联 `python3 - <<'PY'`（见 2c） | 产物的键集合 == `_conf_schema.json` 的 41 叶 | 迁移后自查，防"丢整组 / 多出死组" |
+| 内联 `python3 - <<'PY'`（见 2c） | 产物的键集合 == `_conf_schema.json` 的 44 叶 | 迁移后自查，防"丢整组 / 多出死组" |
 
 迁移器同时支持**扁平 v3** 与**分组 v3** 两种来源（生产同时存在这两份配置），
 并修掉了 v3 迁移器的四个坑：组顺序与 `KEY_MAP` 脱钩会静默丢整组、
@@ -201,8 +334,8 @@ python3 tools/migrate_config_v4.py --restore-from "<.bak-pre-v4-*>" --config "$C
 # v3 迁移器的 --from-backup 必须带同一个 --to（否则会回滚到另一份配置）
 ```
 
-**只回其一 = 静默丢设置**：只回代码，v4 的 `search` 组会被旧代码当未知键删掉；
-只回配置，v4 代码会把扁平 25 键删掉。两条都已用生产配置的只读副本演练过
+**只回其一 = 静默丢设置**：只回代码，分组化的 `search` / `tools` 组会被旧代码当未知键
+删掉；只回配置，新代码会把扁平 25 键删掉。两条都已用生产配置的只读副本演练过
 （迁移 → `--verify --baseline` 旧值零丢失 + `--verify --against` 键值严格一致 → 再回扁平 25 键，产物喂核心
 `check_config_integrity` 得到 `has_new=False / unchanged=True`）。
 
@@ -220,11 +353,12 @@ python3 tools/migrate_config_v4.py --restore-from "<.bak-pre-v4-*>" --config "$C
 > 保留的修正（StarTools 数据目录、workspaces 回退、截图/媒体目录）已移植进
 > `main.py`，"检测原插件"的 WARN 块按 D9 不移植（正式版改名后没有检测对象）。
 
-## 📁 仓库结构（v1.4.0 清理后）
+## 📁 仓库结构（v1.4.0 清理后，v1.5.0 增补）
 
 ```
 main.py                      插件入口：browse_web / browse_local_page / browser_web_search
 core/__init__.py             配置解析容错（as_int / as_float / as_bool）
+core/background.py           后台任务登记与四态文案（BackgroundRegistry / HEADERS / render_*）
 core/browser.py              Playwright 驱动（BrowserCore）
 core/config_map.py           配置键单一事实源（KEY_MAP / GROUPS / ConfigView / schema_leaf）
 core/crawler.py              搜索正文抓取（AiohttpFetcher：逐跳 SSRF + 限长 + 文本化）
@@ -236,7 +370,7 @@ core/search.py               搜索池：并行波次、去重合并、TTL 缓�
 core/search_providers.py     brave / bocha / firecrawl / tavily / exa 五个后端
 core/session.py              浏览会话与标签页（SessionManager）
 tools/migrate_config_v3.py   扁平 25 键 → 分组 v3（4 组）历史迁移器（保留给分组 v3 场景与既有测试）
-tools/migrate_config_v4.py   v3 → v4 迁移器（分组 5 组 + search 组）
+tools/migrate_config_v4.py   v3 → 当前版迁移器（6 组 / 44 叶：v4 加 search 组、v1.5.0 加 tools 组）
 ```
 
 每个 `core/` 模块都有**生产调用方**（`main.py` 或 `core/browser.py`），
@@ -285,10 +419,10 @@ text_image）。全文本子代理（前端/测试/工程等）读取本地 HTML
 
 ```bash
 cd astrbot_plugin_browser_llm
-python -m pytest tests/ -q    # 全量测试（640 passed，2026-10-21）
+PYTHONDONTWRITEBYTECODE=1 python -m pytest tests/ -q -p no:cacheprovider   # 693 passed（2026-10-25）
 ```
 
-测试覆盖（34 个文件 / 640 条）：
+测试覆盖（32 个文件 / 693 条）：
 
 - **工具契约**：`browse_web` / `browse_local_page` / `browser_web_search` 的 docstring
   与注册一致性、参数类型、入口装饰器白名单（`test_main_contract.py`、
@@ -300,6 +434,11 @@ python -m pytest tests/ -q    # 全量测试（640 passed，2026-10-21）
   （`test_search_migration_v4.py`）。
 - **配置**：schema ⇄ `KEY_MAP` ⇄ `main.py` 读取点三方一致（`test_core_config_map.py`、
   `test_core_config_readpoints.py`、`test_qa_complement.py`）。
+- **后台执行链路**（v1.5.0 新增 `test_background_tools.py`，1016 行）：T1–T7 判据
+  （`off` 逐字节一致 / 立即返回 / 四态终态各一条消息 / 同会话单飞 <1s 拒绝 /
+  `terminate()` 不悬挂 / schema⇄KEY_MAP⇄读取点三方一致）+ F1 模式热更新、F2 媒体
+  仅成功态、F3 终态日志带 `status=`、D2 全局 4 并发；另有受理/拒绝/终态文案、
+  六前缀互斥、截断、登记表纯单测。
 - **安全**：SSRF（含 DNS 与重定向）、禁词三处链路、点击/新标签/媒体嗅探行为级拦截。
 - **浏览**：感知模式前缀/规则/优先级、识图缓存与 provider 降级链、本地页面工具
   （白名单/路径穿越/降级文本）、会话与标签页、浏览器资源清理。
@@ -307,7 +446,7 @@ python -m pytest tests/ -q    # 全量测试（640 passed，2026-10-21）
   `core/delivery.py` 只含 artifact 三件套、`SearchService` 无串行入口、
   数据目录走 `_resolve_data_dir()`、`main.py` 无"重复插件检测" WARN 块。
 
-发布流程：commit → push main → 打 tag（如 `v1.4.0`）→ release.yml 自动
+发布流程：commit → push main → 打 tag（如 `v1.5.0`）→ release.yml 自动
 打包发布（zip 已排除 `dist/`、`.github/`、`data/`、`__pycache__`）。
 
 ## 🤝 致谢
