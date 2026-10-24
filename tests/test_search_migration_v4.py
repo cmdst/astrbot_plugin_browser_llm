@@ -60,14 +60,21 @@ def write(path: Path, data: dict, *, bom: bool = True) -> None:
 
 
 # ---------------------------------------------------------------
-# 坑 ①：组顺序由 KEY_MAP 派生，5 组一个不丢
+# 坑 ①：组顺序由 KEY_MAP 派生，组一个不丢
 # ---------------------------------------------------------------
 
 
 def test_group_order_derived_from_key_map():
     assert tuple(mig.GROUP_ORDER) == tuple(GROUPS)
-    assert set(mig.GROUP_ORDER) == {"browser", "limits", "security", "perception", "search"}
-    # 关键回归：nest() 必须输出**全部** 5 组（只给 KEY_MAP 加 search.* 而忘改
+    assert set(mig.GROUP_ORDER) == {
+        "browser",
+        "limits",
+        "security",
+        "perception",
+        "search",
+        "tools",
+    }
+    # 关键回归：nest() 必须输出**全部**组（只给 KEY_MAP 加新组而忘改
     # 组顺序时，search 整组会被静默丢掉）。用「所有路径都有值」的规范模型来测，
     # 才能覆盖"组里只有新增键"的情形。
     canonical = {path: f"v-{path}" for path in KEY_MAP}
@@ -105,6 +112,22 @@ def test_search_defaults_match_schema():
         assert leaf["default"] == default, path
 
 
+def test_tools_defaults_match_schema():
+    """v1.5.0 新增的 tools 组默认值必须与 schema 逐条相等（防两处漂移）。
+
+    默认必须 off / 240 / 1500：off 是"行为与 v1.4.0 一致"的档位，
+    250 行的 background_timeout 与 1500 字的截断长度由派单 §4.5/§4.7 定。
+    """
+    schema_items = SCHEMA["tools"]["items"]
+    assert set(mig.TOOLS_DEFAULTS) == {f"tools.{key}" for key in schema_items}
+    for path, default in mig.TOOLS_DEFAULTS.items():
+        leaf = schema_items[path.split(".", 1)[1]]
+        assert leaf["default"] == default, path
+    assert mig.TOOLS_DEFAULTS["tools.background_mode"] == "off"
+    # 迁移器补的默认值必须覆盖 KEY_MAP 里每一条"没有扁平旧键"的路径
+    assert set(mig.DEFAULTED_PATHS) == {p for p, v in KEY_MAP.items() if v is None}
+
+
 # ---------------------------------------------------------------
 # 纯函数：flatten / nest / migrate / is_migrated
 # ---------------------------------------------------------------
@@ -119,14 +142,14 @@ def test_flatten_flat_and_grouped_are_equivalent():
 
 
 def test_migrate_flat_v3_preserves_every_legacy_value():
-    """AC-01：25 条旧路径的值零变化 + 16 条新键取默认。"""
+    """AC-01：25 条旧路径的值零变化 + 19 条新键取默认。"""
     migrated = mig.migrate(flat_v3())
     paths, unknown = mig.flatten(migrated)
     assert unknown == []
-    assert len(paths) == 41
+    assert len(paths) == 44
     for path, flat in KEY_MAP.items():
         if flat is None:
-            assert paths[path] == mig.SEARCH_DEFAULTS[path]
+            assert paths[path] == mig.DEFAULTED_PATHS[path]
         else:
             assert paths[path] == f"value-{FLAT_KEYS.index(flat)}-{flat}"
     # 指纹在迁移前后一致（形态不同、旧值不变）
@@ -136,7 +159,7 @@ def test_migrate_flat_v3_preserves_every_legacy_value():
 def test_migrate_grouped_v3_preserves_every_legacy_value():
     migrated = mig.migrate(grouped_v3())
     paths, _ = mig.flatten(migrated)
-    assert len(paths) == 41
+    assert len(paths) == 44
     assert mig.legacy_fingerprint(grouped_v3()) == mig.legacy_fingerprint(migrated)
 
 

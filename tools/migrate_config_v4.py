@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""browser_llm 配置迁移器 v4（v3 -> v4：4 组/25 叶 -> 5 组/41 叶）。
+"""browser_llm 配置迁移器（v3 -> 当前版：4 组/25 叶 -> 6 组/44 叶）。
 
 **为什么必须独立于插件运行**：核心 ``AstrBotConfig.__init__`` 会在插件
 ``__init__`` 之前按 schema 删除未知键并落盘（``astrbot_config.py:113``、
@@ -33,7 +33,7 @@
 - 任何模式都**不打印配置值**，只打印键名 / 计数 / 分组名 / 叶值哈希；
 - ``--apply`` 先备份再原子替换，文件权限 0600、保留 BOM；
 - 未知键默认拒绝写盘（``--allow-unknown`` 才保留并继续）；
-- 幂等：已是 5 组齐全的 v4 结构时 no-op（只补缺失叶子，不覆盖已有值）；
+- 幂等：已是 6 组齐全的当前结构时 no-op（只补缺失叶子，不覆盖已有值）；
 - 任何路径段数 > 2 ⇒ 拒绝写盘（退出码 2）：本迁移器只支持"组 -> 叶"两层，
   ``providers`` 整值当**不透明叶子**搬运、不展开。
 
@@ -92,10 +92,27 @@ SEARCH_DEFAULTS: dict[str, Any] = {
     "search.proxy": "",
 }
 
+#: v1.5.0 纯新增的 tools 组默认值（同样无 v3 扁平旧键）。
+#: 与 ``_conf_schema.json["tools"]["items"][k]["default"]`` 逐条相等，由
+#: ``tests/test_search_migration_v4.py`` 钉住。默认 off ⇒ 迁移后的配置行为
+#: 与 v1.4.0 一致（这是"默认关闭"落在迁移产物上的那一面）。
+TOOLS_DEFAULTS: dict[str, Any] = {
+    "tools.background_mode": "off",
+    "tools.background_timeout": 240,
+    "tools.background_max_chars": 1500,
+}
+
+#: 全部"v3 没有的新键"默认值（迁移时整组补齐；设计 §1.3-⑨ 命名的
+#: ``DEFAULTED_PATHS``）。新增键只加在这里，``migrate()`` 与
+#: ``is_migrated()`` 自然跟上（不再各写一份），``V4_PATHS`` 保持
+#: ``tuple(KEY_MAP)`` 不动 —— 冻结成 41 条会让 ``is_migrated()``
+#: 对自己的产物返回 False。
+DEFAULTED_PATHS: dict[str, Any] = {**SEARCH_DEFAULTS, **TOOLS_DEFAULTS}
+
 #: 必须有值的叶集合：v3 的 25 条（迁移基线）。缺任一条 = 迁移源不完整。
 LEGACY_PATHS: tuple[str, ...] = tuple(sorted(_PATH_TO_FLAT))
 
-#: 全部 v4 路径（41 条）。
+#: 全部当前路径（44 条）。
 V4_PATHS: tuple[str, ...] = tuple(KEY_MAP)
 
 
@@ -186,7 +203,7 @@ def _ordered_leaf_paths() -> list[str]:
 
 
 def nest(canonical: dict[str, Any]) -> dict[str, Any]:
-    """``路径 -> 值`` -> 5 组嵌套结构；叶子顺序与 ``_conf_schema.json`` 对齐。
+    """``路径 -> 值`` -> 按组顺序的嵌套结构；叶子顺序与 ``_conf_schema.json`` 对齐。
 
     ``search.providers`` 原样搬运（不展开、不校验条目内部结构）。
     """
@@ -204,10 +221,11 @@ def nest(canonical: dict[str, Any]) -> dict[str, Any]:
 
 
 def migrate(config: dict, *, allow_unknown: bool = False) -> dict:
-    """v3（扁平或分组）-> v4（5 组 / 41 叶）。
+    """v3（扁平或分组）-> 当前形态（6 组 / 44 叶）。
 
     - 既有 25 条路径的**值原样搬运**（不做任何类型归一，避免改变语义）；
-    - 16 条 search 路径在源里没有 ⇒ 取 ``SEARCH_DEFAULTS``；
+    - v3 没有的新键（search 组 16 条、v1.5.0 的 tools 组 3 条）源里没有
+      ⇒ 取 ``DEFAULTED_PATHS``（= ``SEARCH_DEFAULTS`` + ``TOOLS_DEFAULTS``）；
     - ``search`` 组已存在时**只补缺失键，不覆盖已有值**（尤其 ``api_key``）；
     - 未知键默认拒绝；``allow_unknown=True`` 时原样保留（分组键放回组内）。
     """
@@ -217,7 +235,7 @@ def migrate(config: dict, *, allow_unknown: bool = False) -> dict:
         raise MigrationError(f"unknown keys, refusing to write: {names}")
 
     filled = dict(canonical)
-    for path, default in SEARCH_DEFAULTS.items():
+    for path, default in DEFAULTED_PATHS.items():
         if path not in filled:
             filled[path] = default
 
@@ -234,7 +252,7 @@ def migrate(config: dict, *, allow_unknown: bool = False) -> dict:
 
 
 def is_migrated(config: dict) -> bool:
-    """是否已是完整 v4 结构：无扁平旧键 + 5 组齐全 + 41 条路径全在。
+    """是否已是完整当前结构：无扁平旧键 + 6 组齐全 + 44 条路径全在。
 
     坑（audit §7.4-③）：v3 时代只要求"无扁平键 + 已存在的组是 dict"，于是
     "缺 search 组的 4 组配置"被判成已迁移、新增组永远进不了迁移。这里对

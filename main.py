@@ -8,8 +8,8 @@ astrbot_plugin_browser_llm — LLM 浏览器插件（Agent 驱动的网页浏览
 （v1.4.0 新增，直接调搜索 API 池，返回结构化 JSON）。24 个 ``browse_*``
 浏览工具**不**直接暴露给主 LLM，而是作为「浏览器子代理」的工具集：主 LLM
 调 ``browse_web`` 后由子代理（tool_loop_agent + 24 个 FunctionTool）自主
-完成真实网页交互。配置为 5 个分组 / 41 个叶键（含 v1.4.0 的 `search` 组
-16 键），见 ``_conf_schema.json``。
+完成真实网页交互。配置为 6 个分组 / 44 个叶键（含 v1.4.0 的 `search` 组 16 键与
+v1.5.0 的 `tools` 组 3 键），见 ``_conf_schema.json``。
 
 核心组件在 initialize() 中组装：BrowserCore（浏览器驱动）、
 SessionManager（会话隔离与回收）、ContentExtractor（内容提取）、
@@ -30,15 +30,30 @@ from typing import TYPE_CHECKING, Optional
 from urllib.parse import quote, urljoin, urlsplit
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.message_components import Image, Plain, Video
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 
 from .core import as_bool, as_float, as_int
+from .core.background import (
+    _BG_MAX_CONCURRENT,
+    _BG_BUSY_TEXT,
+    STATUS_CANCELLED,
+    STATUS_FAILED,
+    STATUS_OK,
+    STATUS_TIMEOUT,
+    BackgroundJob,
+    BackgroundRegistry,
+    render_accepted_text,
+    render_rejected_text,
+    render_terminal_text,
+    truncate_result,
+)
 from .core.browser import BrowserCore, validate_browser_type
 from .core.config_map import ConfigView, schema_leaf
 from .core.crawler import AiohttpFetcher, CrawlerLimits, FetchOutcome
-from .core.delivery import collect_artifact
+from .core.delivery import artifact_sink, collect_artifact
 from .core.extract import ContentExtractor
 from .core.safety import SafetyFilter, check_url_literal
 from .core.search import (
@@ -92,10 +107,26 @@ except OSError:
 # 内置族、与子代理的 ``browse_search`` 都不同名 ⇒ 并存、不接管。
 _SEARCH_TOOL_NAME = "browser_web_search"
 
+# 三个工具的名字（v1.5.0 后台模式按名字判开关语义）。装饰器里仍是字面量，
+# 这里集中一份供日志/登记/文案引用，避免"改一处漏一处"。
+_BROWSE_WEB_TOOL_NAME = "browse_web"
+_LOCAL_PAGE_TOOL_NAME = "browse_local_page"
+
+# 后台任务（v1.5.0 路线 D）：
+# - ``tools.background_mode`` 三取值：off（默认，行为与 v1.4.0 完全一致）/
+#   browse_only（只把 browse_web 后台化）/ all（三个工具都后台化）；
+# - 终态消息统一以「后台任务完成」开头，生产判据按前缀 grep（派单 §5.3）；
+# - 后台任务在 terminate() 时取消并等待一小段，绝不让插件重载悬挂。
+_BACKGROUND_MODES = ("off", "browse_only", "all")
+
 # terminate 资源清理总超时（秒）：超过则放弃等待并强制收尾，防止插件重载
 # 被悬挂的 close 阻塞（曾实测 browser.close 悬挂数小时，旧实例 chromium 进程
 # 与 playwright driver 长期残留）。底层 BrowserCore 已带单步超时，此为兜底。
 _TERMINATE_TIMEOUT = 20.0
+
+# 后台任务取消的等待上限（秒）：取消是协作式的，给一个很短的上限即可——
+# 超出就放弃等待（任务随后会随事件循环关闭），优先保证重载不被阻塞。
+_BACKGROUND_TERMINATE_TIMEOUT = 5.0
 
 # 数据目录：截图/媒体等资源保存位置。
 # 与插件安装目录解耦：优先走核心 StarTools（``data/plugin_data/<metadata.name>``），
@@ -799,14 +830,21 @@ class BrowserLLMPlugin(Star):
     # _load_config 时也保有安全默认（开启）。
     enable_banned_filter: bool = True
 
+    # 后台任务相关配置的类级默认（v1.5.0，与 _conf_schema.json 的 default
+    # 一致）：默认 off ⇒ 三个工具保持 v1.4.0 的前台同步行为。
+    background_mode: str = "off"
+    background_timeout: float = 240.0
+    background_max_chars: int = 1500
+
     def __init__(self, context: Context, config: AstrBotConfig = None):
         """初始化插件：读取全部配置项到 self.* 属性。
 
         Args:
             context: AstrBot 插件上下文，提供事件注册与消息发送能力。
-            config: 插件配置对象，对应 _conf_schema.json 的 5 个分组 /
-                41 个叶键（browser / limits / security / perception，以及
-                v1.4.0 新增的 search 组 16 键）；未传入时用空字典兜底。
+            config: 插件配置对象，对应 _conf_schema.json 的 6 个分组 /
+                44 个叶键（browser / limits / security / perception /
+                search，以及 v1.5.0 新增的 tools 组 3 键）；未传入时用
+                空字典兜底。
         """
         super().__init__(context)
         self.config = config or {}
@@ -855,14 +893,19 @@ class BrowserLLMPlugin(Star):
             "B站搜索": "https://search.bilibili.com/all?keyword={keyword}",
         }
 
+        # 后台任务登记表（v1.5.0 路线 D）：umo -> 任务，同 UMO 单飞。
+        # 纯内存、单事件循环内使用；terminate() 时整体取消。
+        self._background: BackgroundRegistry = BackgroundRegistry()
+
     def _load_config(self) -> None:
         """将 _conf_schema.json 中的配置项读取为实例属性。
 
-        全部 5 组 41 叶（``_conf_schema.json``）：``browser``（引擎/默认页/
+        全部 6 组 44 叶（``_conf_schema.json``）：``browser``（引擎/默认页/
         搜索引擎/视口/代理/超时）、``limits``（提取与链接上限/页数/空闲回收/
         子代理步数与超时）、``security``（禁词/审核总开关/内网拦截/会话黑白
         名单）、``perception``（感知模式/截图/识图 provider 与缓存）、
-        ``search``（v1.4.0 搜索 API 池 16 键：开关/池/并发/步数/超时/抓取）。
+        ``search``（v1.4.0 搜索 API 池 16 键：开关/池/并发/步数/超时/抓取）、
+        ``tools``（v1.5.0 后台任务 3 键：模式/整任务硬预算/结果截断长度）。
 
         类型健壮性（v1.3.1）：数值/布尔配置经 _as_int / _as_float /
         _as_bool 归一解析，非法值（字符串、None、类型错误）回退默认值并
@@ -1024,6 +1067,33 @@ class BrowserLLMPlugin(Star):
             self.search_safesearch = "moderate"
         # 搜索与抓取共用（与浏览器代理 browser.proxy 相互独立）。
         self.search_proxy: str = str(view.get("search.proxy", "") or "").strip()
+
+        # ---- tools 组（v1.5.0 路线 D）：后台任务化 ----
+        # 三个工具「前台阻塞 → 后台异步」的开关与整任务预算。默认 off ⇒ 与
+        # v1.4.0 行为逐字节一致（前台同步返回真实结果），这是本改动的
+        # 回滚档位：把 background_mode 改回 off 即回退行为，不需要降版本。
+        mode = str(view.get("tools.background_mode", "off") or "off").strip().lower()
+        # 非法值 fail-closed 到 off 并记 warning：宁可维持现行为，也不要
+        # "写错一个词就变后台"（设计 §1.7-1）。
+        if mode not in _BACKGROUND_MODES:
+            logger.warning(
+                f"[{self.metadata_name}] tools.background_mode={mode!r} 非法"
+                f"（可选 {'/'.join(_BACKGROUND_MODES)}），已按 off 处理（前台同步）。"
+            )
+            mode = "off"
+        self.background_mode: str = mode
+        # 整任务硬预算（秒）：后台模式必须自带上限——核心 tool_call_timeout
+        # 生产是 1000s，后台分支在平台原生路线下更宽，插件层不兜就等于没有上限。
+        self.background_timeout: float = _clamp(
+            self._as_float(view.get("tools.background_timeout", 240), 240), 30, 900
+        )
+        # 终态消息的结果截断长度（字符）：browse_web 的文本可能几千字，
+        # 直接发会刷屏；钳 200-8000（设计 §1.1，与 search.* 的钳制同风格）。
+        self.background_max_chars: int = _clamp(
+            self._as_int(view.get("tools.background_max_chars", 1500), 1500),
+            200,
+            8000,
+        )
 
     def _as_int(self, value, default: int) -> int:
         """int 配置解析：委托 core 共享实现（v1.3.3 收敛双实现）。"""
@@ -1477,6 +1547,9 @@ class BrowserLLMPlugin(Star):
         tag = f"[{self.metadata_name}]"
         self._stop_cache_cleanup_task()
         self._stop_vision_provider_sync_task()
+        # 后台任务（v1.5.0 路线 D）：先取消在跑任务并等一小段——否则浏览器关了
+        # 它们才抛错，终态消息面对的是已销毁的浏览器/页面，重载还多一批悬挂协程。
+        await self._cancel_background_tasks()
         try:
             await asyncio.wait_for(
                 self._shutdown_browser_resources(), timeout=_TERMINATE_TIMEOUT
@@ -1501,6 +1574,290 @@ class BrowserLLMPlugin(Star):
         logger.info(f"{tag} 已终止")
 
     # ================================================================
+    # 后台任务（v1.5.0 路线 D：插件内闭环，不依赖核心 is_background_task）
+    # ================================================================
+
+    #: 视频类媒体扩展名（``browse_sniff_media`` 会把视频交给 ``_emit_media``，
+    #: 统一按 Image 发会失败，必须按扩展名分流 —— 见 ``_deliver_terminal``）。
+    _VIDEO_SUFFIXES = (".mp4", ".webm", ".mov", ".m4v", ".mkv")
+
+    def _background_enabled_for(self, tool_name: str) -> bool:
+        """该工具本次是否走后台（按 ``tools.background_mode`` 判定）。
+
+        - ``off``（默认）：三个工具一律前台同步，行为与 v1.4.0 完全一致；
+        - ``browse_only``：只后台化 ``browse_web``——它是唯一 68s 量级的长
+          任务（一次调用跑整套子 Agent），也是唯一"用户要等一整段多步浏览"
+          的入口；
+        - ``all``：三个工具都后台化（``browser_web_search`` 常态 1-3s，后台化
+          等于多一次投递，只在明确要求"任何工具都不阻塞会话"时才开）。
+        """
+        mode = getattr(self, "background_mode", "off")
+        if mode == "all":
+            return True
+        if mode == "browse_only":
+            return tool_name == _BROWSE_WEB_TOOL_NAME
+        return False
+
+    @staticmethod
+    def _umo_digest(umo: str) -> str:
+        """日志用的会话摘要：只记 8 位 md5，不把原始 UMO 写进后台任务日志行。"""
+        return hashlib.md5(str(umo or "").encode("utf-8")).hexdigest()[:8]
+
+    async def _submit_background(
+        self,
+        *,
+        event: AstrMessageEvent,
+        tool_name: str,
+        runner,
+        task_text: str = "",
+    ) -> str:
+        """把一次工具执行提交为后台任务，立刻返回「已受理 + task_id」。
+
+        裁决顺序（设计 §3.2，任一命中都**同步**返回、不占 task_id、不登记）：
+        ① 便宜校验（会话白/黑名单、禁词——禁词对象必须是剔除 ``perception=``
+        前缀后的任务文本，与 v1.4.0 口径一致）；② 同 UMO 单飞；③ 全局并发上限。
+
+        Args:
+            event: 触发本次工具调用的消息事件（只用于取 UMO）。
+            tool_name: 三个工具之一的名字（日志/文案用）。
+            runner: ``runner(progress) -> Awaitable[str]``；``progress`` 是本次
+                任务专用的半成品容器（供超时/失败时发「已得部分结果」）。
+            task_text: 用户可见的任务文本（只用于禁词检查，**不落日志**）。
+
+        Returns:
+            str: 立即返回文案（含 task_id 与"你现在没有结果"的显式声明）。
+        """
+        tag = f"[{self.metadata_name}]"
+        umo = self._umo_of(event)
+        allowed, deny_reason = self._is_session_allowed(event)
+        if not allowed:
+            # 越权/黑名单必须让主模型**同步**知道（它不会再重试），不进后台。
+            return f"【拒绝】{deny_reason}"
+        banned = self._check_banned(task_text)
+        if banned:
+            return f"【拒绝】请求参数包含违禁内容：{banned}"
+        busy = self._background.active_job(umo)
+        if busy is not None:
+            # 单飞裁决：纯查表、无 await、不持锁、不排队（设计 §2.5）。
+            return render_rejected_text(
+                task_id=busy.task_id,
+                tool=busy.tool,
+                elapsed_s=busy.elapsed_s(),
+            )
+        if len(self._background.running()) >= _BG_MAX_CONCURRENT:
+            # 全局闸（D2）：不占 task_id、不登记，只回一句"稍后再试"。
+            return _BG_BUSY_TEXT
+        task_id = self._background.next_task_id()
+        # 提交时快照：运行中改配置不会让在跑的任务突然变预算/变截断（§1.7-3）。
+        job = BackgroundJob(
+            task_id=task_id,
+            umo=umo,
+            tool=tool_name,
+            started_at=time.monotonic(),
+            budget_s=float(self.background_timeout),
+            max_chars=int(self.background_max_chars),
+        )
+        self._background.register(job)
+        task = asyncio.create_task(
+            self._run_background_job(job, runner),
+            name=f"browser_llm:{task_id}",
+        )
+        self._background.attach_task(task_id, task)
+        logger.info(
+            f"{tag} 后台任务受理 task_id={task_id} tool={tool_name} "
+            f"umo={self._umo_digest(umo)} mode={self.background_mode} "
+            f"budget={job.budget_s:.0f}s max_chars={job.max_chars}"
+        )
+        return render_accepted_text(
+            task_id=task_id, tool=tool_name, budget_s=job.budget_s
+        )
+
+    async def _run_background_job(self, job: BackgroundJob, runner) -> None:
+        """后台执行体：跑任务 → 渲染终态 → 主动投递 → 登记出表。
+
+        四种终态（成功/失败/超时/已取消）都要有**用户可见**的终态消息，只有
+        日志等于结果丢了；投递失败也不能把任务悬挂在登记表里。
+        """
+        tag = f"[{self.metadata_name}]"
+        began = time.monotonic()
+        status, text, reason = STATUS_OK, "", ""
+        artifacts: list[str] = []
+        partial = ""
+        delivered = False
+        progress: dict = {}
+        try:
+            # artifact_sink 是 ContextVar：create_task 会拷贝当前上下文，因此
+            # 在**任务自己的**上下文里进 sink 即可拦住本任务经 event.send 出去的
+            # 媒体（_emit_media 优先 collect_artifact），任务结束时统一发送。
+            with artifact_sink() as bucket:
+                artifacts = bucket
+                text = await asyncio.wait_for(
+                    runner(progress), timeout=float(job.budget_s)
+                )
+        except asyncio.TimeoutError:
+            status = STATUS_TIMEOUT
+            reason = f"超过整任务硬预算 {float(job.budget_s):.0f}s 被中断"
+            partial = self._background_partial(job.tool, progress)
+        except asyncio.CancelledError:
+            status = STATUS_CANCELLED
+            reason = "插件重载/禁用"
+            partial = self._background_partial(job.tool, progress)
+        except Exception as exc:  # noqa: BLE001 — 后台任务不能把异常抛给事件循环
+            status = STATUS_FAILED
+            reason = f"{type(exc).__name__}: {exc}"
+            partial = self._background_partial(job.tool, progress)
+        # 工具把"可预期失败"以【错误】/【拒绝】前缀当文本返回（例如取不到当前
+        # 对话模型、页面内容命中禁词）：后台模式下必须判成失败，否则用户看到的
+        # 是「完成」里包着一条错误。
+        if status == STATUS_OK and str(text or "").startswith(("【错误】", "【拒绝】")):
+            status, reason = STATUS_FAILED, str(text)
+        elapsed_ms = int((time.monotonic() - began) * 1000)
+        note = ""
+        try:
+            if status == STATUS_CANCELLED:
+                # 终止路径：投递只作 best-effort（平台对象可能已在销毁），
+                # 给一个很短的硬上限，绝不让插件重载被投递拖住。
+                try:
+                    delivered, note = await asyncio.wait_for(
+                        self._deliver_terminal(
+                            job, status, text, reason, elapsed_ms, artifacts, partial
+                        ),
+                        timeout=2.0,
+                    )
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    delivered = False
+            else:
+                delivered, note = await self._deliver_terminal(
+                    job, status, text, reason, elapsed_ms, artifacts, partial
+                )
+        finally:
+            self._background.finish(job.task_id)
+            # 终态日志口径（F3）：一条一任务，`后台任务终态 status=` 供生产
+            # 判据 grep；不把四态混进「后台任务完成」这一个词里。
+            logger.info(
+                f"{tag} 后台任务终态 status={status} task_id={job.task_id} "
+                f"tool={job.tool} elapsed_ms={elapsed_ms} chars={len(text)} "
+                f"media={len(artifacts)} delivered={bool(delivered)}"
+            )
+            if note:
+                # 终态消息首行另打一条 info，便于按 `【后台任务…】` 对账。
+                logger.info(f"{tag} {note}")
+
+    def _background_partial(self, tool_name: str, progress: dict) -> str:
+        """中断前的半成品文本（没有就返回空串，绝不编造）。
+
+        - ``browse_local_page``：渲染段拿到页面文本就写 ``progress["text"]``；
+        - ``browser_web_search``：``progress`` 是 ``search_waves`` 的增量快照
+          （results/attempts），这里渲染成人读的条目；
+        - ``browse_web``：子代理只在终局返回 ``completion_text``，**没有**可
+          增量获取的部分结果（README/CHANGELOG 同步写明）。
+        """
+        if not isinstance(progress, dict) or not progress:
+            return ""
+        if tool_name == _LOCAL_PAGE_TOOL_NAME:
+            return str(progress.get("text") or "")
+        if tool_name == _SEARCH_TOOL_NAME:
+            return self._render_search_partial(progress)
+        return ""
+
+    @staticmethod
+    def _render_search_partial(progress: dict, limit: int = 5) -> str:
+        """把搜索的增量快照渲染成人读的部分结果（title — url，最多 ``limit`` 条）。"""
+        results = list(progress.get("results") or [])
+        lines: list[str] = []
+        for item in results[: max(0, int(limit))]:
+            title = str(getattr(item, "title", "") or "").strip() or "(无标题)"
+            url = str(getattr(item, "url", "") or "").strip()
+            lines.append(f"- {title} {url}".rstrip())
+        return "\n".join(lines)
+
+    @staticmethod
+    def _is_video_artifact(path: str) -> bool:
+        """按扩展名判断媒体类型（``_emit_media`` 用 "video" 发的是这几种）。"""
+        return str(path).lower().endswith(BrowserLLMPlugin._VIDEO_SUFFIXES)
+
+    @classmethod
+    def _media_component(cls, path: str):
+        """媒体路径 -> 消息链组件（视频走 ``Video``，其余走 ``Image``）。
+
+        为什么按扩展名而不是记 kind：``collect_artifact`` 只存路径字符串
+        （``core/delivery.py`` 被 AC-35 钉死、不能加 kind 通道），而下载路径的
+        扩展名由 ``_download_media`` 按 media_class 决定，可可靠还原。
+        """
+        if cls._is_video_artifact(path):
+            return Video.fromFileSystem(path)
+        return Image.fromFileSystem(path)
+
+    async def _deliver_terminal(
+        self,
+        job: BackgroundJob,
+        status: str,
+        text: str,
+        reason: str,
+        elapsed_ms: int,
+        artifacts: list[str],
+        partial: str = "",
+    ) -> tuple[bool, str]:
+        """渲染终态消息并主动投递到该会话；媒体只在成功态随消息一起发。
+
+        Returns:
+            tuple[bool, str]: (是否投递成功, 消息首行)；首行由调用方再打一条
+            info 便于按 ``【后台任务…】`` 对账（F3）。
+        """
+        body, truncated, omitted = truncate_result(text, int(job.max_chars))
+        # 媒体只在成功态附：任务没跑完时半成品只会误导（口径裁决）。
+        attachments = [p for p in artifacts] if status == STATUS_OK else []
+        existing = [p for p in attachments if os.path.isfile(p)]
+        missing = len(attachments) - len(existing)
+        message = render_terminal_text(
+            task_id=job.task_id,
+            tool=job.tool,
+            status=status,
+            text=body,
+            reason=reason,
+            elapsed_ms=elapsed_ms,
+            budget_s=float(job.budget_s),
+            truncated=truncated,
+            omitted=omitted,
+            artifact_count=len(existing),
+            missing_files=missing,
+            partial=truncate_result(partial, int(job.max_chars))[0],
+        )
+        chain: list = [Plain(message)]
+        for path in existing:
+            try:
+                chain.append(self._media_component(path))
+            except Exception as e:  # noqa: BLE001 — 单个坏附件不影响文本投递
+                logger.warning(f"[{self.metadata_name}] 后台任务媒体附件构造失败: {e}")
+        first_line = message.splitlines()[0] if message else ""
+        try:
+            sent = await self.context.send_message(job.umo, MessageChain(chain=chain))
+            return bool(sent), first_line
+        except Exception as e:  # noqa: BLE001 — 投递失败只记录，不能让任务悬挂
+            logger.error(
+                f"[{self.metadata_name}] 后台任务结果投递失败"
+                f" task_id={job.task_id}: {e}"
+            )
+            return False, first_line
+
+    async def _cancel_background_tasks(self) -> None:
+        """取消全部在跑的后台任务（插件终止时调用，协作式取消 + 有限等待）。"""
+        tag = f"[{self.metadata_name}]"
+        running = self._background.running()
+        if not running:
+            return
+        logger.info(
+            f"{tag} 取消 {len(running)} 个在跑的后台任务（插件终止）: "
+            f"{[job.task_id for job in running]}"
+        )
+        try:
+            await self._background.cancel_all(
+                timeout=float(_BACKGROUND_TERMINATE_TIMEOUT)
+            )
+        except Exception as e:  # noqa: BLE001 — 取消失败也要让 terminate 继续
+            logger.warning(f"{tag} 后台任务取消异常: {e}")
+
+    # ================================================================
     # 浏览器子代理入口（工具化子代理：browse_web）
     # ================================================================
 
@@ -1518,12 +1875,17 @@ class BrowserLLMPlugin(Star):
         注意：本入口不持 per-umo 锁（asyncio.Lock 不可重入——若在此持锁，
         子 Agent 工具 browse_* 内部再 acquire 同一锁会死锁）。串行化由
         子 Agent 工具内部持有锁完成（同一会话的浏览器操作被串行化）。
+
+        后台模式（v1.5.0 新增，配置 tools.background_mode）：开启后本次调用
+        立刻返回「已受理 + task_id」，真正的浏览在后台执行，结果**单独作为
+        一条消息**发到本会话，不会出现在这次返回里。
         """
         try:
-            logger.debug(f"[{self.metadata_name}] browse_web 进入，input={input!r}")
-            # 轻量热更新配置：Dashboard 保存的配置（黑名单/截图/内网拦截等）
-            # 在下次入口调用即生效，无需重启。
+            # 后台模式热更新（v1.5.0，F1）：入口第一行刷新配置——否则 Dashboard
+            # 把 background_mode 改回 off 要"下一次调用"才生效，而"关不掉"比
+            # "开不了"更糟。其余配置项（黑名单/截图/内网拦截）同样在此热更新。
             self._refresh_config()
+            logger.debug(f"[{self.metadata_name}] browse_web 进入，input={input!r}")
             # 顺带同步识图 provider 下拉（面板每次请求实时读取内存 schema，
             # 此入口被主 LLM 高频调用，可保持面板选项跟随运行时 provider 变化）。
             self._sync_vision_provider_options()
@@ -1546,36 +1908,62 @@ class BrowserLLMPlugin(Star):
                 f"[{self.metadata_name}] browse_web 感知模式={perception_mode}"
                 f"（显式={explicit_mode or '无'}）"
             )
-            instruction = self._build_subagent_instruction(perception_mode)
-            try:
-                provider_id = await self.context.get_current_chat_provider_id(
-                    umo=self._umo_of(event)
+            # 后台分支的**唯一合法位置**（v1.5.0，spec §2.2）：必须排在热更新/
+            # 会话白黑名单/感知前缀解析/禁词之后，否则"被拒绝"会变成一条异步
+            # 失败消息，v1.4.0 的同步拒绝语义就回退了。
+            if self._background_enabled_for(_BROWSE_WEB_TOOL_NAME):
+                return await self._submit_background(
+                    event=event,
+                    tool_name=_BROWSE_WEB_TOOL_NAME,
+                    # browse_web 没有可增量获取的部分结果（子代理只在终局返回
+                    # completion_text），progress 收下但不写。
+                    runner=lambda _progress: self._browse_web_run(
+                        event, task_input, perception_mode
+                    ),
+                    task_text=task_input,
                 )
-            except Exception as e:  # noqa: BLE001 — ProviderNotFoundError 等
-                logger.warning(
-                    f"[{self.metadata_name}] 获取当前对话 Provider 失败: {e}"
-                )
-                return "【错误】无法确定当前对话模型，浏览器子代理不可用。"
-            if not provider_id:
-                return "【错误】无法确定当前对话模型，浏览器子代理不可用。"
-            logger.debug(f"[{self.metadata_name}] browse_web prov_id={provider_id!r}")
-            resp = await self.context.tool_loop_agent(
-                event=event,
-                chat_provider_id=provider_id,
-                prompt=task_input or "请根据用户请求浏览网页并返回结果",
-                system_prompt=instruction,
-                tools=self._browser_toolset,
-                max_steps=self.agent_max_steps,
-                tool_call_timeout=self.agent_tool_timeout,
-            )
-            text = getattr(resp, "completion_text", "") or ""
-            logger.debug(
-                f"[{self.metadata_name}] browse_web tool_loop_agent 返回，len={len(text)}"
-            )
-            return text or "（浏览器子代理未返回内容）"
+            return await self._browse_web_run(event, task_input, perception_mode)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{self.metadata_name}] browse_web 执行异常: {e}")
             return f"【错误】浏览器子代理执行失败：{e}"
+
+    async def _browse_web_run(
+        self,
+        event: AstrMessageEvent,
+        task_input: str,
+        perception_mode: str,
+    ) -> str:
+        """browse_web 的执行体（provider 解析 + 子 Agent）；前台与后台共用。
+
+        provider 解析放在这里（而不是入口）：后台模式下拿不到模型应表现为
+        一条**异步失败终态消息**，而不是「被告知不可用却什么都没发生」。
+        ``event`` 只被读取（子工具取 umo / 加锁 / 发媒体由 sink 截流）。
+        """
+        instruction = self._build_subagent_instruction(perception_mode)
+        try:
+            provider_id = await self.context.get_current_chat_provider_id(
+                umo=self._umo_of(event)
+            )
+        except Exception as e:  # noqa: BLE001 — ProviderNotFoundError 等
+            logger.warning(f"[{self.metadata_name}] 获取当前对话 Provider 失败: {e}")
+            return "【错误】无法确定当前对话模型，浏览器子代理不可用。"
+        if not provider_id:
+            return "【错误】无法确定当前对话模型，浏览器子代理不可用。"
+        logger.debug(f"[{self.metadata_name}] browse_web prov_id={provider_id!r}")
+        resp = await self.context.tool_loop_agent(
+            event=event,
+            chat_provider_id=provider_id,
+            prompt=task_input or "请根据用户请求浏览网页并返回结果",
+            system_prompt=instruction,
+            tools=self._browser_toolset,
+            max_steps=self.agent_max_steps,
+            tool_call_timeout=self.agent_tool_timeout,
+        )
+        text = getattr(resp, "completion_text", "") or ""
+        logger.debug(
+            f"[{self.metadata_name}] browse_web tool_loop_agent 返回，len={len(text)}"
+        )
+        return text or "（浏览器子代理未返回内容）"
 
     # ================================================================
     # 本地页面渲染预览入口（面向子代理：browse_local_page）
@@ -1614,9 +2002,14 @@ class BrowserLLMPlugin(Star):
             perception(string): 本次感知模式：text / text_image / image（大小写
                 不敏感）。可省略：缺省或非法值回落全局 page_perception（再回落
                 text_image）。text 模式跳过截图与识图调用，仅返回页面文本提取结果。
+
+        后台模式（v1.5.0）：tools.background_mode=all 时本工具也后台化——立刻
+        返回「已受理 + task_id」，渲染结果单独作为一条消息发到本会话。
         """
         try:
-            # 轻量热更新配置：黑名单/截图/内网拦截等修改无需重启即生效。
+            # 后台模式热更新（v1.5.0）：入口第一行就刷新配置——否则 Dashboard
+            # 把 background_mode 改回 off 要"下一次调用"才生效，而"关不掉"
+            # 比"开不了"更糟（F1）。
             self._refresh_config()
             # 会话权限：与既有浏览工具一致，过白/黑名单（默认配置为空即放行）。
             allowed, deny_reason = self._is_session_allowed(event)
@@ -1634,147 +2027,194 @@ class BrowserLLMPlugin(Star):
             )
 
             # 1. 参数与路径安全校验（白名单 + 防路径穿越，越权路径直接拒绝）。
-            raw = str(path or "").strip()
-            if not raw:
-                return (
-                    "【错误】path 不能为空：请传入要渲染查看的本地 HTML 文件绝对路径。"
+            # 四道校验必须在**提交后台任务之前**（spec §2.3）：路径非法恰恰是
+            # 主模型的自纠输入，不能让它先"已受理"再收到一条异步失败消息。
+            target, err = self._resolve_local_page_target(path)
+            if err:
+                return err
+
+            # 2. 后台分支的唯一合法位置（v1.5.0，spec §2.3）：四道校验之后、
+            # 持 per-UMO 本地锁之前。锁仍由渲染段自己持有（跨工具并发允许：
+            # 后台 browse_web 与前台本地渲染各用各的页面与锁）。
+            if self._background_enabled_for(_LOCAL_PAGE_TOOL_NAME):
+                return await self._submit_background(
+                    event=event,
+                    tool_name=_LOCAL_PAGE_TOOL_NAME,
+                    runner=lambda progress: self._local_page_render(
+                        event, target, full_page, wait_ms, perception_mode, progress
+                    ),
                 )
-            if raw.lower().startswith("file://"):
-                raw = raw[len("file://") :]
-            try:
-                target = Path(raw).expanduser().resolve()
-            except Exception as e:  # noqa: BLE001
-                return f"【错误】路径解析失败：{e}"
-            ok, reason = self._check_local_page_path(target)
-            if not ok:
-                return f"【拒绝】{reason}"
-            if not target.is_file():
-                return f"【错误】文件不存在或不是普通文件：{target}"
-            if target.suffix.lower() not in _LOCAL_PAGE_ALLOWED_EXTS:
-                return f"【拒绝】仅支持 .html/.htm 文件：{target.name}"
-
-            # 2. per-umo 串行化（同一会话的本地页面渲染不并发）。
-            async with self._local_lock_for(self._umo_of(event)):
-                # 3. 独立页面渲染：不经过 SessionManager，不占浏览会话额度。
-                page = await self.browser.new_page()
-                try:
-                    file_uri = target.as_uri()
-                    await page.goto(
-                        file_uri,
-                        wait_until="domcontentloaded",
-                        timeout=int(self.timeout) * 1000,
-                    )
-                    try:
-                        wait = int(wait_ms)
-                    except (TypeError, ValueError):
-                        wait = 0
-                    if wait <= 0:
-                        wait = _LOCAL_PAGE_DEFAULT_WAIT_MS
-                    # 信息提取（text / text_image / image 模式都需要；
-                    # image 模式中页面文本作为识图描述的辅助内容）。
-                    info = await self.extractor.extract_page_info(page)
-                    text = await self.extractor.extract_text(
-                        page, max_chars=int(self.max_chars)
-                    )
-
-                    # 4. 感知模式 text：仅文本提取，跳过截图与识图调用
-                    # （全文本子代理读文档/报错场景零识图开销、不落盘截图）。
-                    if perception_mode == "text":
-                        if not text:
-                            return f"【错误】页面渲染成功但未提取到文本内容：{target}"
-                        banned = self._check_banned(text)
-                        if banned:
-                            return (
-                                f"【拒绝】页面内容包含违禁内容：{banned}，已拒绝输出。"
-                            )
-                        return self._format_local_page_text_result(
-                            target,
-                            info,
-                            text,
-                            note="感知模式 text：仅文本提取，未截图识图",
-                        )
-
-                    # 5. 截图（text_image / image 模式；保存到插件
-                    # data/screenshots/，可作交付附件路径）。
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                    umo_hash = hashlib.md5(
-                        self._umo_of(event).encode("utf-8")
-                    ).hexdigest()[:8]
-                    path_hash = hashlib.md5(str(target).encode("utf-8")).hexdigest()[:8]
-                    save_path = str(
-                        self._screenshot_dir
-                        / f"localpage_{umo_hash}_{path_hash}_{ts}.png"
-                    )
-                    screenshot_ok = False
-                    if bool(full_page):
-                        try:
-                            await page.screenshot(path=save_path, full_page=True)
-                            screenshot_ok = True
-                        except Exception as e:  # noqa: BLE001 — 整页截图失败降级视口
-                            logger.debug(f"整页截图失败，降级视口截图: {e}")
-                    if not screenshot_ok:
-                        screenshot_ok = bool(
-                            await self.browser.screenshot(page, save_path)
-                        )
-
-                    # 6. 视觉描述（mimo-v2.5 等，识图缓存正常生效）：成功返回
-                    # 描述；失败降级文本，保证不空转。
-                    desc = ""
-                    if screenshot_ok:
-                        desc = await self._describe_screenshot(
-                            save_path, event, page_url=target.as_uri()
-                        )
-                    if desc:
-                        banned = self._check_banned(desc)
-                        if banned:
-                            return (
-                                f"【拒绝】页面识图结果包含违禁内容：{banned}，"
-                                "已拒绝输出。"
-                            )
-                        if perception_mode == "image" and text:
-                            # image 模式：以截图识图为主，页面文本为辅（辅助
-                            # 文本同样过禁词，命中则不附带，避免泄露违禁内容）。
-                            if not self._check_banned(text):
-                                return (
-                                    f"【本地页面预览·识图模式】{target}\n"
-                                    f"标题: {info['title']}\n"
-                                    f"截图: {save_path}\n"
-                                    f"渲染视觉描述：\n{desc}\n"
-                                    f"页面文本（辅助）：\n{text}"
-                                )
-                        return (
-                            f"【本地页面预览】{target}\n"
-                            f"标题: {info['title']}\n"
-                            f"截图: {save_path}\n"
-                            f"渲染视觉描述：\n{desc}"
-                        )
-
-                    # 7. 降级路径：视觉模型不可用/截图失败 → 文本提取，保证不空转。
-                    if text:
-                        banned = self._check_banned(text)
-                        if banned:
-                            return (
-                                f"【拒绝】页面内容包含违禁内容：{banned}，已拒绝输出。"
-                            )
-                        return self._format_local_page_text_result(
-                            target,
-                            info,
-                            text,
-                            note="视觉模型不可用或截图失败，已降级为文本提取",
-                        )
-                    if screenshot_ok:
-                        return (
-                            f"【本地页面预览】{target}\n"
-                            "页面渲染成功，但未提取到文本内容"
-                            f"（可能为纯图形页面）。截图: {save_path}"
-                        )
-                    return f"【错误】页面渲染成功但截图与文本提取均失败：{target}"
-                finally:
-                    # 用完即关：独立页面不残留，不影响既有浏览会话。
-                    await self.browser.close_page(page)
+            return await self._local_page_render(
+                event, target, full_page, wait_ms, perception_mode, {}
+            )
         except Exception as e:  # noqa: BLE001 — LLM 工具必须容错
             logger.warning(f"[{METADATA_NAME}] browse_local_page 失败: {e}")
             return f"【错误】本地页面渲染预览失败：{e}"
+
+    def _resolve_local_page_target(self, path: str) -> tuple[Path | None, str]:
+        """本地页面的参数/路径前置校验（非空 → resolve → 白名单 → 存在+扩展名）。
+
+        Returns:
+            tuple[Path | None, str]: (已 resolve 的目标路径, 错误文案)；成功时
+            错误文案为空串、路径非 None。
+        """
+        raw = str(path or "").strip()
+        if not raw:
+            return None, (
+                "【错误】path 不能为空：请传入要渲染查看的本地 HTML 文件绝对路径。"
+            )
+        if raw.lower().startswith("file://"):
+            raw = raw[len("file://") :]
+        try:
+            target = Path(raw).expanduser().resolve()
+        except Exception as e:  # noqa: BLE001
+            return None, f"【错误】路径解析失败：{e}"
+        ok, reason = self._check_local_page_path(target)
+        if not ok:
+            return None, f"【拒绝】{reason}"
+        if not target.is_file():
+            return None, f"【错误】文件不存在或不是普通文件：{target}"
+        if target.suffix.lower() not in _LOCAL_PAGE_ALLOWED_EXTS:
+            return None, f"【拒绝】仅支持 .html/.htm 文件：{target.name}"
+        return target, ""
+
+    async def _local_page_render(
+        self,
+        event: AstrMessageEvent,
+        target: Path,
+        full_page: bool,
+        wait_ms: int,
+        perception_mode: str,
+        progress: dict | None = None,
+    ) -> str:
+        """渲染段执行体（持 per-UMO 本地锁）：new_page → goto → 提取 → 截图 → 识图 → close。
+
+        ``progress``（可选 dict）：中断前的半成品放这里——拿到页面文本就写
+        ``progress["text"]``，后台任务超时/失败时据此发「已得部分结果」
+        （设计 §2.7）。前台传空 dict / None，行为与 v1.4.0 完全一致。
+        """
+        async with self._local_lock_for(self._umo_of(event)):
+            # 3. 独立页面渲染：不经过 SessionManager，不占浏览会话额度。
+            page = await self.browser.new_page()
+            try:
+                file_uri = target.as_uri()
+                await page.goto(
+                    file_uri,
+                    wait_until="domcontentloaded",
+                    timeout=int(self.timeout) * 1000,
+                )
+                try:
+                    wait = int(wait_ms)
+                except (TypeError, ValueError):
+                    wait = 0
+                if wait <= 0:
+                    wait = _LOCAL_PAGE_DEFAULT_WAIT_MS
+                # 信息提取（text / text_image / image 模式都需要；
+                # image 模式中页面文本作为识图描述的辅助内容）。
+                info = await self.extractor.extract_page_info(page)
+                text = await self.extractor.extract_text(
+                    page, max_chars=int(self.max_chars)
+                )
+                # 已得部分结果（v1.5.0）：后台任务被预算掐断时，这段文本是
+                # 唯一能回给用户的东西；前台 progress 为空 dict，无副作用。
+                if progress is not None and text:
+                    progress["text"] = text
+
+                # 4. 感知模式 text：仅文本提取，跳过截图与识图调用
+                # （全文本子代理读文档/报错场景零识图开销、不落盘截图）。
+                if perception_mode == "text":
+                    if not text:
+                        return f"【错误】页面渲染成功但未提取到文本内容：{target}"
+                    banned = self._check_banned(text)
+                    if banned:
+                        return (
+                            f"【拒绝】页面内容包含违禁内容：{banned}，已拒绝输出。"
+                        )
+                    return self._format_local_page_text_result(
+                        target,
+                        info,
+                        text,
+                        note="感知模式 text：仅文本提取，未截图识图",
+                    )
+
+                # 5. 截图（text_image / image 模式；保存到插件
+                # data/screenshots/，可作交付附件路径）。
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                umo_hash = hashlib.md5(
+                    self._umo_of(event).encode("utf-8")
+                ).hexdigest()[:8]
+                path_hash = hashlib.md5(str(target).encode("utf-8")).hexdigest()[:8]
+                save_path = str(
+                    self._screenshot_dir
+                    / f"localpage_{umo_hash}_{path_hash}_{ts}.png"
+                )
+                screenshot_ok = False
+                if bool(full_page):
+                    try:
+                        await page.screenshot(path=save_path, full_page=True)
+                        screenshot_ok = True
+                    except Exception as e:  # noqa: BLE001 — 整页截图失败降级视口
+                        logger.debug(f"整页截图失败，降级视口截图: {e}")
+                if not screenshot_ok:
+                    screenshot_ok = bool(
+                        await self.browser.screenshot(page, save_path)
+                    )
+
+                # 6. 视觉描述（mimo-v2.5 等，识图缓存正常生效）：成功返回
+                # 描述；失败降级文本，保证不空转。
+                desc = ""
+                if screenshot_ok:
+                    desc = await self._describe_screenshot(
+                        save_path, event, page_url=target.as_uri()
+                    )
+                if desc:
+                    banned = self._check_banned(desc)
+                    if banned:
+                        return (
+                            f"【拒绝】页面识图结果包含违禁内容：{banned}，"
+                            "已拒绝输出。"
+                        )
+                    if perception_mode == "image" and text:
+                        # image 模式：以截图识图为主，页面文本为辅（辅助
+                        # 文本同样过禁词，命中则不附带，避免泄露违禁内容）。
+                        if not self._check_banned(text):
+                            return (
+                                f"【本地页面预览·识图模式】{target}\n"
+                                f"标题: {info['title']}\n"
+                                f"截图: {save_path}\n"
+                                f"渲染视觉描述：\n{desc}\n"
+                                f"页面文本（辅助）：\n{text}"
+                            )
+                    return (
+                        f"【本地页面预览】{target}\n"
+                        f"标题: {info['title']}\n"
+                        f"截图: {save_path}\n"
+                        f"渲染视觉描述：\n{desc}"
+                    )
+
+                # 7. 降级路径：视觉模型不可用/截图失败 → 文本提取，保证不空转。
+                if text:
+                    banned = self._check_banned(text)
+                    if banned:
+                        return (
+                            f"【拒绝】页面内容包含违禁内容：{banned}，已拒绝输出。"
+                        )
+                    return self._format_local_page_text_result(
+                        target,
+                        info,
+                        text,
+                        note="视觉模型不可用或截图失败，已降级为文本提取",
+                    )
+                if screenshot_ok:
+                    return (
+                        f"【本地页面预览】{target}\n"
+                        "页面渲染成功，但未提取到文本内容"
+                        f"（可能为纯图形页面）。截图: {save_path}"
+                    )
+                return f"【错误】页面渲染成功但截图与文本提取均失败：{target}"
+            finally:
+                # 用完即关：独立页面不残留，不影响既有浏览会话。
+                await self.browser.close_page(page)
 
     def _local_lock_for(self, umo: str) -> asyncio.Lock:
         """返回该会话的本地页面预览专用锁（不存在则创建）。
@@ -3539,6 +3979,72 @@ class BrowserLLMPlugin(Star):
             providers(string): 逗号分隔的 provider 名（如 "brave#1,bocha#1"），只允许池内已启用项，用于覆盖默认顺序。可省略
             fetch_pages(boolean): 是否抓取结果正文（需插件配置 search.fetch_pages 已开启，取「与」）。可省略
             fetch_top_n(number): 抓取前 N 条（0-5）。0 表示用插件配置值。可省略
+
+        后台模式（v1.5.0）：tools.background_mode=all 时本工具后台化——立刻
+        返回「已受理 + task_id」**纯文本**（不是 JSON），搜索结果单独作为一条
+        消息发到本会话。因此后台模式下**不要**用这次返回值回答事实问题。
+        """
+        # 后台模式热更新（v1.5.0）：入口第一行刷新配置，Dashboard 把
+        # background_mode 改回 off 时下一次调用即生效（F1）。
+        self._refresh_config()
+        if not self.search_enabled:
+            return self._search_payload(
+                status="disabled",
+                code="disabled",
+                summary="【拒绝】搜索工具已在插件配置中关闭（search.enabled=false）",
+                query=(query or "").strip(),
+                hint=(
+                    "如需使用，请在插件配置「搜索 API（browser_web_search）」里"
+                    "打开 enabled 并至少填写一个 provider 的 api_key。"
+                ),
+            )
+        if self._background_enabled_for(_SEARCH_TOOL_NAME):
+            return await self._submit_background(
+                event=event,
+                tool_name=_SEARCH_TOOL_NAME,
+                runner=lambda prog: self._run_browser_web_search(
+                    event,
+                    query=query,
+                    max_results=max_results,
+                    rounds=rounds,
+                    timeout=timeout,
+                    providers=providers,
+                    fetch_pages=fetch_pages,
+                    fetch_top_n=fetch_top_n,
+                    progress=prog,
+                    refresh=False,
+                ),
+                task_text=query,
+            )
+        return await self._run_browser_web_search(
+            event,
+            query=query,
+            max_results=max_results,
+            rounds=rounds,
+            timeout=timeout,
+            providers=providers,
+            fetch_pages=fetch_pages,
+            fetch_top_n=fetch_top_n,
+        )
+
+    async def _run_browser_web_search(
+        self,
+        event: AstrMessageEvent,
+        query: str = "",
+        max_results: int = 0,
+        rounds: int = 0,
+        timeout: int = 0,
+        providers: str = "",
+        fetch_pages: bool = False,
+        fetch_top_n: int = 0,
+        progress: dict | None = None,
+        refresh: bool = True,
+    ) -> str:
+        """browser_web_search 的实际执行体（前台同步调用与后台任务共用）。
+
+        ``progress``：增量快照容器（后台任务会传入自己的那份，超时时据此
+        渲染「已得部分结果」）；``refresh``：是否在开头重读配置——入口已刷新
+        时传 False（后台分支），避免一次调用读两遍配置。
         """
         began = time.monotonic()
         text = (query or "").strip()
@@ -3546,11 +4052,13 @@ class BrowserLLMPlugin(Star):
         # 搜索阶段的**增量快照**容器（t6 M-1）：search_waves 每波结束都把
         # 已得 results/attempts/rounds_used/status 写进来；外层 wait_for 超时
         # 会取消协程并丢掉返回值，这里保留最后一次快照用于渲染 partial。
-        progress: dict = {}
+        # v1.5.0：后台任务传入自己那份（超时后由调用方读它渲染「已得部分结果」）。
+        progress = progress if progress is not None else {}
         try:
             # 入口兜底（captain 要求）：①面板单独停用了该工具、②外部直接改
             # 配置文件但没触发 reload —— 两种情况都在这里返回 disabled。
-            self._refresh_config()
+            if refresh:
+                self._refresh_config()
             if not self.search_enabled:
                 return self._search_payload(
                     status="disabled",
@@ -3792,7 +4300,7 @@ class BrowserLLMPlugin(Star):
 
     def _build_search_instruction(self) -> str:
         """搜索工具的使用指引（仅在工具 active 时注入，避免让模型去调不存在的工具）。"""
-        return (
+        text = (
             "\n\n## 搜索工具指引（browser_web_search）\n"
             "你可以用 browser_web_search 直接做联网检索：它并行调用本插件配置的"
             "搜索 API 池，返回 JSON（results 里带 url/snippet，可选抓正文）。\n\n"
@@ -3804,6 +4312,16 @@ class BrowserLLMPlugin(Star):
             " web_search_<provider> 是两套独立实现（各自的 key、不互相降级）；"
             "同时可见时**只选其一**，不要对同一个问题重复搜两遍。"
         )
+        if self.background_mode == "all":
+            # 后台模式下本工具返回【已受理】而不是 JSON（设计 §2.4）：主模型
+            # 若照着这条返回值回答，等于凭空编造搜索结果，必须点明。
+            text += (
+                "\n\n【后台模式已开启】本工具此刻是**后台**执行：拿到的是"
+                "「【已受理】+ task_id」纯文本，不是搜索结果。"
+                "此时不要用这次返回值回答事实问题，只回一句"
+                "“已开始搜索，结果稍后单独发送”。"
+            )
+        return text
 
     # ================================================================
     # LLM 请求注入：浏览指引

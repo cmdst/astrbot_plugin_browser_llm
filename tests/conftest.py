@@ -22,6 +22,7 @@ def _install_astrbot_stub() -> None:
     api = types.ModuleType("astrbot.api")
     star = types.ModuleType("astrbot.api.star")
     event = types.ModuleType("astrbot.api.event")
+    message_components = types.ModuleType("astrbot.api.message_components")
     provider = types.ModuleType("astrbot.api.provider")
     core = types.ModuleType("astrbot.core")
     core_agent = types.ModuleType("astrbot.core.agent")
@@ -32,6 +33,7 @@ def _install_astrbot_stub() -> None:
     astrbot.api = api
     api.star = star
     api.event = event
+    api.message_components = message_components
     api.provider = provider
     astrbot.core = core
     core.agent = core_agent
@@ -49,6 +51,48 @@ def _install_astrbot_stub() -> None:
     class Star:
         def __init__(self, context=None):
             self.context = context
+
+    class Plain:
+        """消息链文本段桩：只保留 text（后台任务终态消息的断言对象）。"""
+
+        def __init__(self, text="", **kwargs):
+            self.text = text
+            self.type = "Plain"
+
+        def __repr__(self):
+            return f"Plain({self.text!r})"
+
+    class Image:
+        """消息链图片段桩：``fromFileSystem`` 与真实组件同名同语义。"""
+
+        def __init__(self, file="", **kwargs):
+            self.file = file
+            self.path = kwargs.get("path", "")
+            self.type = "Image"
+
+        @staticmethod
+        def fromFileSystem(path, **kwargs):
+            return Image(file=f"file://{path}", path=str(path), **kwargs)
+
+    class Video(Image):
+        """消息链视频段桩（与 Image 同形，仅类型名不同）。"""
+
+        def __init__(self, file="", **kwargs):
+            super().__init__(file=file, **kwargs)
+            self.type = "Video"
+
+        @staticmethod
+        def fromFileSystem(path, **kwargs):
+            return Video(file=f"file://{path}", path=str(path), **kwargs)
+
+    class MessageChain:
+        """消息链桩：持有组件列表（``chain`` 与真实类同名）。"""
+
+        def __init__(self, chain=None, **kwargs):
+            self.chain = list(chain or [])
+
+        def __repr__(self):
+            return f"MessageChain({self.chain!r})"
 
     class AstrMessageEvent:
         """最小事件桩：llm_tool 测试可能用到的方法。"""
@@ -191,6 +235,10 @@ def _install_astrbot_stub() -> None:
     )
     event.AstrMessageEvent = AstrMessageEvent
     event.filter = _Filter()
+    event.MessageChain = MessageChain
+    message_components.Plain = Plain
+    message_components.Image = Image
+    message_components.Video = Video
     provider.ProviderRequest = ProviderRequest
     core_agent_message.TextPart = TextPart
     core_agent_tool.FunctionTool = FunctionTool
@@ -202,6 +250,7 @@ def _install_astrbot_stub() -> None:
     sys.modules["astrbot.api"] = api
     sys.modules["astrbot.api.star"] = star
     sys.modules["astrbot.api.event"] = event
+    sys.modules["astrbot.api.message_components"] = message_components
     sys.modules["astrbot.api.provider"] = provider
     sys.modules["astrbot.core"] = core
     sys.modules["astrbot.core.agent"] = core_agent

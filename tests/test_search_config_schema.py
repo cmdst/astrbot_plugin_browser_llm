@@ -37,14 +37,14 @@ def schema_paths(schema: dict) -> set[str]:
 
 
 def test_schema_leaves_match_key_map():
-    """schema 的 41 个叶子 == KEY_MAP 的 41 条路径（双向）。"""
+    """schema 的 44 个叶子 == KEY_MAP 的 44 条路径（双向）。"""
     schema = load_schema()
     paths = schema_paths(schema)
     assert paths == set(KEY_MAP), (
         f"仅 schema 有: {sorted(paths - set(KEY_MAP))}；"
         f"仅 KEY_MAP 有: {sorted(set(KEY_MAP) - paths)}"
     )
-    assert len(paths) == 41
+    assert len(paths) == 44
 
 
 def test_group_names_match_groups():
@@ -52,11 +52,18 @@ def test_group_names_match_groups():
     schema = load_schema()
     used = {path.split(".", 1)[0] for path in KEY_MAP}
     assert set(schema) == set(GROUPS) == used
-    assert set(GROUPS) == {"browser", "limits", "security", "perception", "search"}
+    assert set(GROUPS) == {
+        "browser",
+        "limits",
+        "security",
+        "perception",
+        "search",
+        "tools",
+    }
 
 
 def test_search_paths_are_two_segments():
-    """迁移器只支持 2 层：所有 search.* 路径必须恰好 2 段。"""
+    """迁移器只支持 2 层：所有 search.* / tools.* 路径必须恰好 2 段。"""
     assert len(V4_ONLY_PATHS) == 16
     for path in V4_ONLY_PATHS:
         parts = path.split(".")

@@ -24,6 +24,26 @@ _ROOT = Path(__file__).resolve().parent.parent
 _SRC = (_ROOT / "main.py").read_text(encoding="utf-8")
 _TREE = ast.parse(_SRC)
 
+def _bodies(*names: str) -> str:
+    """取若干函数的源码片段拼接（v1.5.0 起工具入口与实现体分家）。
+
+    为什么需要它：三个入口为了支持后台模式，把"真正的执行体"拆成了
+    ``_browse_web_run`` / ``_local_page_render`` / ``_run_browser_web_search``，
+    入口只做「前置校验 + 后台 or 前台分派」。原先这类静态守卫扫入口函数体，
+    现在必须同时扫实现体，否则守卫会因为"代码搬了家"而误报。
+    """
+    parts: list[str] = []
+    for name in names:
+        node = next(
+            (n for n in ast.walk(_TREE)
+             if isinstance(n, ast.AsyncFunctionDef) and n.name == name),
+            None,
+        )
+        if node is not None:
+            parts.append(ast.get_source_segment(_SRC, node) or "")
+    return "\n".join(parts)
+
+
 # 允许的参数类型标注（工具 parameters JSON Schema 类型）
 _ALLOWED_TYPES = {"string", "number", "object", "array", "boolean"}
 
@@ -351,13 +371,8 @@ def test_tool_loop_agent_and_toolset_present():
 
 def test_browse_web_uses_plugin_config():
     """browse_web 用 agent_max_steps / agent_tool_timeout 配置。"""
-    node = next(
-        (n for n in ast.walk(_TREE)
-         if isinstance(n, ast.AsyncFunctionDef) and n.name == "browse_web"),
-        None,
-    )
-    assert node is not None
-    body = ast.get_source_segment(_SRC, node) or ""
+    body = _bodies("browse_web", "_browse_web_run")
+    assert body, "未找到 browse_web 入口/实现体"
     assert "agent_max_steps" in body and "agent_tool_timeout" in body
 
 
@@ -402,7 +417,8 @@ def test_new_configs_in_schema():
     """
     import json
     schema = json.loads((_ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
-    assert set(schema) == {"browser", "limits", "security", "perception", "search"}
+    assert set(schema) == {
+        "browser", "limits", "security", "perception", "search", "tools"}
     for group in schema.values():
         assert group["type"] == "object"
 
@@ -472,13 +488,8 @@ def test_browse_web_uses_dynamic_instruction():
     全局 page_perception；system_prompt 用本次模式动态构建，而不是
     固定使用预构建的 self._browser_instruction。
     """
-    node = next(
-        (n for n in ast.walk(_TREE)
-         if isinstance(n, ast.AsyncFunctionDef) and n.name == "browse_web"),
-        None,
-    )
-    assert node is not None
-    body = ast.get_source_segment(_SRC, node) or ""
+    body = _bodies("browse_web", "_browse_web_run")
+    assert body, "未找到 browse_web 入口/实现体"
     assert "_parse_perception_prefix" in body, "应解析 input 感知模式前缀"
     assert "_resolve_perception_mode" in body, "应按优先级解析感知模式"
     assert "_build_subagent_instruction(" in body, "应按本次模式动态构造指令"

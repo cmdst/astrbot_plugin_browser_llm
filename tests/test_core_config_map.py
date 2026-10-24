@@ -5,7 +5,9 @@ from core.config_map import (
     FLAT_KEYS,
     GROUPS,
     KEY_MAP,
+    NO_FLAT_PATHS,
     V4_ONLY_PATHS,
+    V5_ONLY_PATHS,
     ConfigView,
     flat_key,
     nested_paths,
@@ -13,7 +15,7 @@ from core.config_map import (
 
 
 def test_key_map_covers_all_25_flat_keys():
-    """25 条 v3 旧键一条不少，外加 16 条 v4 纯新增键（映射为 None）。
+    """25 条 v3 旧键一条不少，外加 19 条纯新增键（search 16 + tools 3）。
 
     v4 起 ``KEY_MAP`` 的值可能是 ``None``：表示"该路径没有 v3 扁平旧键"。
     因此旧键集合必须用 ``sorted(v for v in ... if v)`` 过滤后再比。
@@ -21,11 +23,15 @@ def test_key_map_covers_all_25_flat_keys():
     assert len(FLAT_KEYS) == 25
     assert sorted(v for v in KEY_MAP.values() if v) == list(FLAT_KEYS)
     assert len(set(FLAT_KEYS)) == 25  # 无重复映射
-    assert sum(1 for v in KEY_MAP.values() if v is None) == 16
-    assert len(KEY_MAP) == 41
-    # 16 条 None 全部落在 search 组（v4 只做加法，不改既有路径）
+    assert sum(1 for v in KEY_MAP.values() if v is None) == 19
+    assert len(KEY_MAP) == 44
+    # 19 条 None 只落在两个"纯新增"组（既有路径一条都没改）
     assert V4_ONLY_PATHS and all(p.startswith("search.") for p in V4_ONLY_PATHS)
-    assert set(V4_ONLY_PATHS) == {p for p, v in KEY_MAP.items() if v is None}
+    assert len(V4_ONLY_PATHS) == 16
+    assert V5_ONLY_PATHS and all(p.startswith("tools.") for p in V5_ONLY_PATHS)
+    assert len(V5_ONLY_PATHS) == 3
+    assert set(NO_FLAT_PATHS) == {p for p, v in KEY_MAP.items() if v is None}
+    assert set(NO_FLAT_PATHS) == set(V4_ONLY_PATHS) | set(V5_ONLY_PATHS)
 
 
 def test_mapped_groups_are_declared():
@@ -36,17 +42,24 @@ def test_mapped_groups_are_declared():
     的组上。因此这里用相等断言。
     """
     used = {path.split(".", 1)[0] for path in KEY_MAP}
-    assert set(GROUPS) == {"browser", "limits", "security", "perception", "search"}
+    assert set(GROUPS) == {
+        "browser",
+        "limits",
+        "security",
+        "perception",
+        "search",
+        "tools",
+    }
     assert used == set(GROUPS)
     for dead in ("async", "delivery", "crawler", "vision"):
         assert dead not in GROUPS, f"{dead} 是死组（零键零读取点），不应出现在 GROUPS"
 
 
 def test_v4_paths_have_no_flat_fallback():
-    """v4 纯新增路径**不**做扁平兜底：只有扁平旧键的配置里必须"缺键"。"""
+    """纯新增路径（v4 search + v5 tools）**不**做扁平兜底：扁平旧配置里必须"缺键"。"""
     flat_cfg = {key: f"v-{key}" for key in FLAT_KEYS}
     view = ConfigView(flat_cfg)
-    for path in V4_ONLY_PATHS:
+    for path in NO_FLAT_PATHS:
         value, found = view.lookup(path, "default")
         assert found is False, f"{path} 不应命中扁平兜底"
         assert value == "default"

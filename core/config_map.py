@@ -8,6 +8,11 @@ v4（2026-10-21）：新增 ``search`` 组 16 个键（无扁平旧键，映射�
 ``GROUPS`` 收敛到**实际有读取点的 5 组**：``async``/``delivery``/``crawler``
 三组没有任何键与读取点，声明它们只会骗过"分组已声明"类守卫（audit §7.4-②）。
 
+v1.5.0（2026-10-25）：新增 ``tools`` 组 3 个键（后台任务化：模式/整任务预算/
+结果截断长度，同样无扁平旧键）。放独立组而不是塞 ``limits`` 的理由：后台化是
+"工具怎么被调用"的语义，不是资源上限；``limits`` 已有 7 个资源类键，混进去
+会让"这组是资源限制"的口径失效，也会让面板上的说明更难写。
+
 本模块是纯 Python，不 import astrbot，可独立单测。
 """
 
@@ -15,17 +20,19 @@ from __future__ import annotations
 
 from typing import Any
 
-#: 5 个目标分组（与 ``_conf_schema.json`` 的顶层键一一对应）。
+#: 6 个目标分组（与 ``_conf_schema.json`` 的顶层键一一对应）。
 GROUPS: tuple[str, ...] = (
     "browser",
     "limits",
     "security",
     "perception",
     "search",
+    "tools",
 )
 
 #: 新点号路径 -> 旧扁平键。v4 起值为 ``None`` 表示"该路径是纯新增键，
-#: 没有对应的 v3 扁平键"（``search.*`` 16 条）；仍是 25 条旧键映射。
+#: 没有对应的 v3 扁平键"（``search.*`` 16 条 + ``tools.*`` 3 条）；仍是
+#: 25 条旧键映射。
 #
 # 注意：``data_dir`` 不在本表里。它不是 schema 配置键，而是插件
 # initialize() 注入给 BrowserCore 的运行时路径；若将来把它做成配置键，
@@ -75,15 +82,37 @@ KEY_MAP: dict[str, str | None] = {
     "search.region": None,
     "search.safesearch": None,
     "search.proxy": None,
+    # ---- v1.5.0 新增 tools 组（3 条，无扁平旧键） ----
+    "tools.background_mode": None,
+    "tools.background_timeout": None,
+    "tools.background_max_chars": None,
 }
 
 #: 旧扁平键全集（迁移基线；测试钉住它恒为 25 个）。
 FLAT_KEYS: tuple[str, ...] = tuple(sorted(k for k in KEY_MAP.values() if k))
 
-#: v4 纯新增路径（没有 v3 扁平旧键），守卫用。
+#: v4 纯新增路径（``search.*`` 16 条）。守卫用：它们**不得**从扁平键兜底
+#: （缺键 ≠ 空值）。v1.5.0 起**收窄到 search 前缀**——``tools.*`` 是 v5 的
+#: 新键，不该冒充 v4 的（设计 §1.3-④）。
 V4_ONLY_PATHS: tuple[str, ...] = tuple(
-    sorted(path for path, flat in KEY_MAP.items() if flat is None)
+    sorted(
+        path
+        for path, flat in KEY_MAP.items()
+        if flat is None and path.startswith("search.")
+    )
 )
+
+#: v1.5.0 纯新增路径（``tools.*`` 3 条）：同样不做扁平兜底。
+V5_ONLY_PATHS: tuple[str, ...] = tuple(
+    sorted(
+        path
+        for path, flat in KEY_MAP.items()
+        if flat is None and path.startswith("tools.")
+    )
+)
+
+#: 所有"无 v3 扁平旧键"的路径（v4 + v5）；守卫遍历它，新增组才不会被漏掉。
+NO_FLAT_PATHS: tuple[str, ...] = tuple(sorted(V4_ONLY_PATHS + V5_ONLY_PATHS))
 
 _MISSING = object()
 
