@@ -89,7 +89,7 @@ def test_ensure_page_returns_active_tab(sm):
 # ------------------------------------------------------------
 
 def test_new_tab_appends_and_activates(sm):
-    p1 = _run(sm.ensure_page("grp-a"))
+    _run(sm.ensure_page("grp-a"))
     p2 = _run(sm.new_tab("grp-a", "https://example.com/2"))
     assert sm.tab_count("grp-a") == 2
     assert sm._active["grp-a"] == 1 and sm._pages["grp-a"][1] is p2
@@ -128,7 +128,7 @@ def test_tab_count_zero_for_unknown(sm):
 # ------------------------------------------------------------
 
 def test_close_tab_active_prefers_previous(sm, mb):
-    p1 = _run(sm.ensure_page("grp-a"))
+    _run(sm.ensure_page("grp-a"))
     p2 = _run(sm.new_tab("grp-a", "u2"))
     p3 = _run(sm.new_tab("grp-a", "u3"))
     _run(sm.switch_tab("grp-a", 3))  # 激活 p3 (active=2)
@@ -139,7 +139,7 @@ def test_close_tab_active_prefers_previous(sm, mb):
 
 
 def test_close_tab_active_first_prefers_next(sm):
-    p1 = _run(sm.ensure_page("grp-a"))
+    _run(sm.ensure_page("grp-a"))
     p2 = _run(sm.new_tab("grp-a", "u2"))
     _run(sm.switch_tab("grp-a", 1))  # 激活第一个标签
     assert _run(sm.close_tab("grp-a", 1)) is True
@@ -147,8 +147,8 @@ def test_close_tab_active_first_prefers_next(sm):
 
 
 def test_close_tab_before_active_keeps_page(sm):
-    p1 = _run(sm.ensure_page("grp-a"))
-    p2 = _run(sm.new_tab("grp-a", "u2"))
+    _run(sm.ensure_page("grp-a"))
+    _run(sm.new_tab("grp-a", "u2"))
     p3 = _run(sm.new_tab("grp-a", "u3"))
     _run(sm.switch_tab("grp-a", 3))  # 激活 p3 (active=2)
     assert _run(sm.close_tab("grp-a", 1)) is True  # 关闭激活前的标签

@@ -354,7 +354,7 @@ def test_click_link_normal_link_still_works():
     links = "[1] 正常链接 → https://example.org"
     page = FakePage()
     plugin = _make_plugin(page, links_text=links)
-    result = _run(plugin.browse_click_link(FakeEvent(), index=1))
+    _run(plugin.browse_click_link(FakeEvent(), index=1))
     assert page.goto_urls == ["https://example.org"]
 
 
@@ -750,7 +750,7 @@ def test_browse_search_normal_url_encoded():
     plugin = _make_plugin(page)
     plugin.default_search_engine = "必应搜索"
     plugin._search_engines = {"必应搜索": "https://cn.bing.com/search?q={keyword}"}
-    result = _run(plugin.browse_search(FakeEvent(), query="北京 天气", engine=""))
+    _run(plugin.browse_search(FakeEvent(), query="北京 天气", engine=""))
     from urllib.parse import quote
     assert page.goto_urls[0] == f"https://cn.bing.com/search?q={quote('北京 天气')}"
 
