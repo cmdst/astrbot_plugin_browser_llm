@@ -460,10 +460,10 @@ text_image）。全文本子代理（前端/测试/工程等）读取本地 HTML
 
 ```bash
 cd astrbot_plugin_browser_llm
-PYTHONDONTWRITEBYTECODE=1 python -m pytest tests/ -q -p no:cacheprovider   # 719 passed（2026-10-25）
+PYTHONDONTWRITEBYTECODE=1 python -m pytest tests/ -q -p no:cacheprovider   # 720 passed（2026-10-25）
 ```
 
-测试覆盖（32 个文件 / 719 条）：
+测试覆盖（32 个文件 / 720 条）：
 
 - **工具契约**：`browse_web` / `browse_local_page` / `browser_web_search` 的 docstring
   与注册一致性、参数类型、入口装饰器白名单（`test_main_contract.py`、
@@ -475,7 +475,7 @@ PYTHONDONTWRITEBYTECODE=1 python -m pytest tests/ -q -p no:cacheprovider   # 719
   （`test_search_migration_v4.py`）。
 - **配置**：schema ⇄ `KEY_MAP` ⇄ `main.py` 读取点三方一致（`test_core_config_map.py`、
   `test_core_config_readpoints.py`、`test_qa_complement.py`）。
-- **后台执行链路**（v1.5.0 新增 `test_background_tools.py`，1511 行）：T1–T7 判据
+- **后台执行链路**（v1.5.0 新增 `test_background_tools.py`，1568 行）：T1–T7 判据
   （`off` 逐字节一致 / 立即返回 / 四态终态各一条消息 / 同会话单飞 <1s 拒绝 /
   `terminate()` 不悬挂 / schema⇄KEY_MAP⇄读取点三方一致）+ F1 模式热更新、F2 媒体
   仅成功态、F3 终态日志带 `status=`、D2 全局 4 并发；`all` 模式下的六类**同步拒绝**

@@ -17,7 +17,7 @@
   - `tools.background_max_chars`：终态消息正文截断（默认 1500 字符，钳 200-8000）。
   - **不需要手工迁移配置**：核心按 schema 自动补齐缺失组/叶，覆盖安装后配置里
     自动长出 `tools` 组（值 = 默认 `off`）。
-- **新增 `core/background.py`（299 行，纯 Python 不 `import astrbot`，可独立单测）**：
+- **新增 `core/background.py`（306 行，纯 Python 不 `import astrbot`，可独立单测）**：
   `BackgroundRegistry`（umo→job 单飞索引、`active_job` / `active_task_id` /
   `finish` / `running` / `cancel_all` / `clear`）、`BackgroundJob`（**提交时快照**
   预算与截断长度，运行中改配置不变）、四态四前缀 `HEADERS`、`render_accepted_text` /
@@ -100,9 +100,9 @@
 
 ### 测试
 
-- 全量：`719 passed`（2026-10-25；v1.4.0 基线 650 条 ⇒ 本版累计**新增 69 条**，
+- 全量：`720 passed`（2026-10-25；v1.4.0 基线 650 条 ⇒ 本版累计**新增 70 条**，
   其中评审 T8 返工新增 26 条）。
-- `tests/test_background_tools.py`（1511 行）覆盖交接判据 T1–T7 + 三处实现纠偏
+- `tests/test_background_tools.py`（1568 行）覆盖交接判据 T1–T7 + 三处实现纠偏
   F1（模式热更新）/ F2（媒体仅成功态）/ F3（终态日志带 `status=`）+ D2（全局 4
   并发）+ 返工项 H1/H2（搜索终态人读化与 `status` 映射）、M1（`all` 模式六类同步
   拒绝）、M2（后台态零直发 + `artifact_sink` AST 守卫）、M3（R7 投递异常后仍可再次
