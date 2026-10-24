@@ -80,7 +80,7 @@ METADATA_NAME = "astrbot_plugin_browser_llm"
 # 运行时 Star 实例无 self.metadata 属性，无法动态读取；metadata.yaml 在插件
 # 目录中随发布流程维护，发布时只改这一处）。读取失败（文件缺失/无 version
 # 字段）时回退内置兜底值，保证插件在异常部署形态下仍可加载。
-_PLUGIN_VERSION_FALLBACK = "v1.4.0"
+_PLUGIN_VERSION_FALLBACK = "v1.5.0"
 
 #: 插件目录与 metadata.yaml 路径（数据目录/标识解析共用，只算一次）。
 _PLUGIN_DIR = Path(__file__).resolve().parent
