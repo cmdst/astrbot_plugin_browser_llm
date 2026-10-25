@@ -13,6 +13,10 @@ v1.5.0（2026-10-25）：新增 ``tools`` 组 3 个键（后台任务化：模�
 "工具怎么被调用"的语义，不是资源上限；``limits`` 已有 7 个资源类键，混进去
 会让"这组是资源限制"的口径失效，也会让面板上的说明更难写。
 
+v1.6.0（2026-10-25）：``tools`` 组再 +1 —— ``background_engine``（后台**机制**：
+plugin 默认 / core 平台原生）。它与 ``background_mode``（范围）正交，因此仍放
+``tools`` 组；同样是纯新增键，无扁平旧键。
+
 本模块是纯 Python，不 import astrbot，可独立单测。
 """
 
@@ -86,6 +90,8 @@ KEY_MAP: dict[str, str | None] = {
     "tools.background_mode": None,
     "tools.background_timeout": None,
     "tools.background_max_chars": None,
+    # ---- v1.6.0 新增 tools.background_engine（1 条，无扁平旧键） ----
+    "tools.background_engine": None,
 }
 
 #: 旧扁平键全集（迁移基线；测试钉住它恒为 25 个）。
@@ -102,7 +108,7 @@ V4_ONLY_PATHS: tuple[str, ...] = tuple(
     )
 )
 
-#: v1.5.0 纯新增路径（``tools.*`` 3 条）：同样不做扁平兜底。
+#: v1.5.0/v1.6.0 纯新增路径（``tools.*`` 4 条）：同样不做扁平兜底。
 V5_ONLY_PATHS: tuple[str, ...] = tuple(
     sorted(
         path

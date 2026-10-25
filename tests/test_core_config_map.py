@@ -15,7 +15,7 @@ from core.config_map import (
 
 
 def test_key_map_covers_all_25_flat_keys():
-    """25 条 v3 旧键一条不少，外加 19 条纯新增键（search 16 + tools 3）。
+    """25 条 v3 旧键一条不少，外加 20 条纯新增键（search 16 + tools 4）。
 
     v4 起 ``KEY_MAP`` 的值可能是 ``None``：表示"该路径没有 v3 扁平旧键"。
     因此旧键集合必须用 ``sorted(v for v in ... if v)`` 过滤后再比。
@@ -23,13 +23,13 @@ def test_key_map_covers_all_25_flat_keys():
     assert len(FLAT_KEYS) == 25
     assert sorted(v for v in KEY_MAP.values() if v) == list(FLAT_KEYS)
     assert len(set(FLAT_KEYS)) == 25  # 无重复映射
-    assert sum(1 for v in KEY_MAP.values() if v is None) == 19
-    assert len(KEY_MAP) == 44
-    # 19 条 None 只落在两个"纯新增"组（既有路径一条都没改）
+    assert sum(1 for v in KEY_MAP.values() if v is None) == 20
+    assert len(KEY_MAP) == 45
+    # 20 条 None 只落在两个"纯新增"组（既有路径一条都没改）
     assert V4_ONLY_PATHS and all(p.startswith("search.") for p in V4_ONLY_PATHS)
     assert len(V4_ONLY_PATHS) == 16
     assert V5_ONLY_PATHS and all(p.startswith("tools.") for p in V5_ONLY_PATHS)
-    assert len(V5_ONLY_PATHS) == 3
+    assert len(V5_ONLY_PATHS) == 4
     assert set(NO_FLAT_PATHS) == {p for p, v in KEY_MAP.items() if v is None}
     assert set(NO_FLAT_PATHS) == set(V4_ONLY_PATHS) | set(V5_ONLY_PATHS)
 

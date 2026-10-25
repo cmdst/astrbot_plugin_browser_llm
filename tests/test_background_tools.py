@@ -597,6 +597,8 @@ TOOLS_KEYS = {
     "tools.background_mode": ("background_mode", "off"),
     "tools.background_timeout": ("background_timeout", 240),
     "tools.background_max_chars": ("background_max_chars", 1500),
+    # v1.6.0：后台**机制**维度（默认 plugin ⇒ 行为与 v1.5.0 一致）。
+    "tools.background_engine": ("background_engine", "plugin"),
 }
 
 
@@ -845,9 +847,10 @@ def test_d2_global_concurrency_cap_rejects_fifth_task():
 
 
 def test_d2_global_cap_constant_is_not_a_config_key():
-    """上限是模块常量（4），schema 不得出现第 4 个 tools 叶。"""
+    """上限是模块常量（4），schema 不得出现与并发相关的配置叶。"""
     assert main_module._BG_MAX_CONCURRENT == 4
-    assert len(SCHEMA["tools"]["items"]) == 3, sorted(SCHEMA["tools"]["items"])
+    # v1.6.0：tools 组共 4 叶（3 个后台键 + background_engine），但**没有**并发键。
+    assert len(SCHEMA["tools"]["items"]) == 4, sorted(SCHEMA["tools"]["items"])
     assert not any("concurrent" in key for key in SCHEMA["tools"]["items"])
 
 

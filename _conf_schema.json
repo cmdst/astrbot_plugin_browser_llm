@@ -602,7 +602,7 @@
   "tools": {
     "type": "object",
     "description": "工具执行方式（后台任务）",
-    "hint": "三个 LLM 工具（browse_web / browse_local_page / browser_web_search）默认是前台同步执行：主模型要等到工具返回才继续回复，长任务会把该会话的回复卡住（实测 browse_web 可达 68 秒）。打开本组后，工具入口改为立刻返回「【已受理】+ task_id」，真正的执行转到后台任务，结果由插件**单独发一条消息**到本会话，消息首行按四态区分：「【后台任务完成】」/「【后台任务失败】」/「【后台任务超时】」/「【后台任务已取消】」。并发两条闸：同会话同时最多 1 个后台任务（单飞）、全进程最多 4 个（模块常量，不是配置键），超出的提交**同步**返回「【拒绝】」且不占 task_id。部分结果：browse_local_page / browser_web_search 超时会附「已得部分结果」，browse_web 超时**没有**结果（子代理只在终局返回）；超时且没有任何半成品时会明说「本次没有可用结果。」。搜索结果在终态消息里是**人读摘要**（检索词 / 命中条数 / 前几条 title+url / 后端摘要），不是 JSON；可预期失败（空检索词 / 会话被拒 / 禁词 / 无可用后端 / total_timeout / 内部异常）按失败或超时呈现，**不会算成完成**。代价：后台结果不进入主模型上下文——用户追问时模型不知道结果。默认 off ⇒ 行为与 v1.4.0 完全一致；把 mode 改回 off 即回退（下一次工具调用生效，不需要重载插件、不需要重启），也不需要降版本。",
+    "hint": "三个 LLM 工具（browse_web / browse_local_page / browser_web_search）默认是前台同步执行：主模型要等到工具返回才继续回复，长任务会把该会话的回复卡住（实测 browse_web 可达 68 秒）。打开本组后，工具入口改为立刻返回「【已受理】+ task_id」，真正的执行转到后台任务，结果由插件**单独发一条消息**到本会话，消息首行按四态区分：「【后台任务完成】」/「【后台任务失败】」/「【后台任务超时】」/「【后台任务已取消】」。并发两条闸：同会话同时最多 1 个后台任务（单飞）、全进程最多 4 个（模块常量，不是配置键），超出的提交**同步**返回「【拒绝】」且不占 task_id。部分结果：browse_local_page / browser_web_search 超时会附「已得部分结果」，browse_web 超时**没有**结果（子代理只在终局返回）；超时且没有任何半成品时会明说「本次没有可用结果。」。搜索结果在终态消息里是**人读摘要**（检索词 / 命中条数 / 前几条 title+url / 后端摘要），不是 JSON；可预期失败（空检索词 / 会话被拒 / 禁词 / 无可用后端 / total_timeout / 内部异常）按失败或超时呈现，**不会算成完成**。代价：后台结果不进入主模型上下文——用户追问时模型不知道结果。默认 off ⇒ 行为与 v1.4.0 完全一致；把 mode 改回 off 即回退（下一次工具调用生效，不需要重载插件、不需要重启），也不需要降版本。【v1.6.0 双引擎】本组还多一个 background_engine（plugin / core，默认 plugin）。注意 core 只对 browse_web 生效：即使 background_mode=all，browse_local_page 与 browser_web_search 在 engine=core 下仍然按**前台同步**执行（不会回落 plugin 后台）——想让这两个工具也后台化，请把 background_engine 改回 plugin。core 依赖核心修复 + 重启 astrbot.service；核心未修时插件自动拒绝 core、记一条 ERROR 并回落到 plugin。",
     "items": {
       "background_mode": {
         "type": "string",
@@ -626,6 +626,16 @@
         "description": "后台结果截断长度（字符）",
         "hint": "200-8000，默认 1500。后台任务结束把结果发到会话时按此长度截断（browse_web 的文本可能几千字，直接发会刷屏），超出部分标注「…（完整结果已省略 N 字）」；媒体附件与消息头部不计入此上限。",
         "default": 1500
+      },
+      "background_engine": {
+        "type": "string",
+        "description": "后台任务引擎",
+        "options": [
+          "plugin",
+          "core"
+        ],
+        "default": "plugin",
+        "hint": "plugin=插件自管后台（v1.5.0 路线 D：工具入口立刻返回【已受理】，任务跑完由插件单独发一条消息；交付确定，但结果不进主模型上下文）。core=平台原生后台任务（工具标 is_background_task，由核心派发、核心在完成后唤醒一轮主 LLM 交付；结果进上下文，但依赖模型调 send_message_to_user，且需要核心修复 + 重启）。core 只对 browse_web 生效：browse_local_page 永久排除（路径校验是安全相关，必须同步拒绝）、browser_web_search 排除（1-3 秒的任务后台化净亏一轮模型调用）。engine=core 但核心未修（包装器不镜像 is_background_task）时自动拒绝 core、记一条 ERROR 并回落到 plugin；绝不静默前台。engine=core 且 background_mode=off 时不探测、不告警（机制无关）。默认 plugin ⇒ 与 v1.5.0 行为一致；回滚把 engine 改回 plugin（下一次工具调用生效，无需重启/重载），止血把 background_mode 改回 off。"
       }
     }
   }

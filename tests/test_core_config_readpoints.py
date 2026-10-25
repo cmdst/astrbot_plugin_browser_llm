@@ -143,8 +143,8 @@ def test_flat_only_config_keeps_v4_paths_missing():
 
 
 def test_flat_only_config_keeps_v5_paths_missing():
-    """v1.5.0 的 tools.* 同样不做扁平兜底（3 条，独立断言便于定位）。"""
-    assert len(V5_ONLY_PATHS) == 3
+    """tools.*（v1.5.0 的 3 条 + v1.6.0 的 background_engine）同样不做扁平兜底。"""
+    assert len(V5_ONLY_PATHS) == 4
     view = ConfigView({key: f"v-{key}" for key in FLAT_KEYS})
     for path in V5_ONLY_PATHS:
         _value, found = view.lookup(path)

@@ -142,11 +142,11 @@ def test_flatten_flat_and_grouped_are_equivalent():
 
 
 def test_migrate_flat_v3_preserves_every_legacy_value():
-    """AC-01：25 条旧路径的值零变化 + 19 条新键取默认。"""
+    """AC-01：25 条旧路径的值零变化 + 20 条新键取默认。"""
     migrated = mig.migrate(flat_v3())
     paths, unknown = mig.flatten(migrated)
     assert unknown == []
-    assert len(paths) == 44
+    assert len(paths) == 45
     for path, flat in KEY_MAP.items():
         if flat is None:
             assert paths[path] == mig.DEFAULTED_PATHS[path]
@@ -159,7 +159,7 @@ def test_migrate_flat_v3_preserves_every_legacy_value():
 def test_migrate_grouped_v3_preserves_every_legacy_value():
     migrated = mig.migrate(grouped_v3())
     paths, _ = mig.flatten(migrated)
-    assert len(paths) == 44
+    assert len(paths) == 45
     assert mig.legacy_fingerprint(grouped_v3()) == mig.legacy_fingerprint(migrated)
 
 

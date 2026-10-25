@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""browser_llm 配置迁移器（v3 -> 当前版：4 组/25 叶 -> 6 组/44 叶）。
+"""browser_llm 配置迁移器（v3 -> 当前版：4 组/25 叶 -> 6 组/45 叶）。
 
 **为什么必须独立于插件运行**：核心 ``AstrBotConfig.__init__`` 会在插件
 ``__init__`` 之前按 schema 删除未知键并落盘（``astrbot_config.py:113``、
@@ -92,7 +92,8 @@ SEARCH_DEFAULTS: dict[str, Any] = {
     "search.proxy": "",
 }
 
-#: v1.5.0 纯新增的 tools 组默认值（同样无 v3 扁平旧键）。
+#: v1.5.0 纯新增的 tools 组默认值 + v1.6.0 的 ``tools.background_engine``
+#: （同样无 v3 扁平旧键）。
 #: 与 ``_conf_schema.json["tools"]["items"][k]["default"]`` 逐条相等，由
 #: ``tests/test_search_migration_v4.py`` 钉住。默认 off ⇒ 迁移后的配置行为
 #: 与 v1.4.0 一致（这是"默认关闭"落在迁移产物上的那一面）。
@@ -100,6 +101,9 @@ TOOLS_DEFAULTS: dict[str, Any] = {
     "tools.background_mode": "off",
     "tools.background_timeout": 240,
     "tools.background_max_chars": 1500,
+    # v1.6.0：后台**机制**维度。默认 plugin ⇒ 迁移产物的行为与 v1.5.0 一致；
+    # core 需要核心修复 + 重启，绝不做成默认值。
+    "tools.background_engine": "plugin",
 }
 
 #: 全部"v3 没有的新键"默认值（迁移时整组补齐；设计 §1.3-⑨ 命名的
@@ -112,7 +116,7 @@ DEFAULTED_PATHS: dict[str, Any] = {**SEARCH_DEFAULTS, **TOOLS_DEFAULTS}
 #: 必须有值的叶集合：v3 的 25 条（迁移基线）。缺任一条 = 迁移源不完整。
 LEGACY_PATHS: tuple[str, ...] = tuple(sorted(_PATH_TO_FLAT))
 
-#: 全部当前路径（44 条）。
+#: 全部当前路径（45 条）。
 V4_PATHS: tuple[str, ...] = tuple(KEY_MAP)
 
 
@@ -221,10 +225,11 @@ def nest(canonical: dict[str, Any]) -> dict[str, Any]:
 
 
 def migrate(config: dict, *, allow_unknown: bool = False) -> dict:
-    """v3（扁平或分组）-> 当前形态（6 组 / 44 叶）。
+    """v3（扁平或分组）-> 当前形态（6 组 / 45 叶）。
 
     - 既有 25 条路径的**值原样搬运**（不做任何类型归一，避免改变语义）；
-    - v3 没有的新键（search 组 16 条、v1.5.0 的 tools 组 3 条）源里没有
+    - v3 没有的新键（search 组 16 条、tools 组 4 条 = v1.5.0 的 3 条 +
+      v1.6.0 的 ``background_engine``）源里没有
       ⇒ 取 ``DEFAULTED_PATHS``（= ``SEARCH_DEFAULTS`` + ``TOOLS_DEFAULTS``）；
     - ``search`` 组已存在时**只补缺失键，不覆盖已有值**（尤其 ``api_key``）；
     - 未知键默认拒绝；``allow_unknown=True`` 时原样保留（分组键放回组内）。
@@ -252,7 +257,7 @@ def migrate(config: dict, *, allow_unknown: bool = False) -> dict:
 
 
 def is_migrated(config: dict) -> bool:
-    """是否已是完整当前结构：无扁平旧键 + 6 组齐全 + 44 条路径全在。
+    """是否已是完整当前结构：无扁平旧键 + 6 组齐全 + 45 条路径全在。
 
     坑（audit §7.4-③）：v3 时代只要求"无扁平键 + 已存在的组是 dict"，于是
     "缺 search 组的 4 组配置"被判成已迁移、新增组永远进不了迁移。这里对

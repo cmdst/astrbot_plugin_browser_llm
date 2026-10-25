@@ -8,8 +8,8 @@ astrbot_plugin_browser_llm — LLM 浏览器插件（Agent 驱动的网页浏览
 （v1.4.0 新增，直接调搜索 API 池，返回结构化 JSON）。24 个 ``browse_*``
 浏览工具**不**直接暴露给主 LLM，而是作为「浏览器子代理」的工具集：主 LLM
 调 ``browse_web`` 后由子代理（tool_loop_agent + 24 个 FunctionTool）自主
-完成真实网页交互。配置为 6 个分组 / 44 个叶键（含 v1.4.0 的 `search` 组 16 键与
-v1.5.0 的 `tools` 组 3 键），见 ``_conf_schema.json``。
+完成真实网页交互。配置为 6 个分组 / 45 个叶键（含 v1.4.0 的 `search` 组 16 键、
+v1.5.0 的 `tools` 组 3 键与 v1.6.0 的 `tools.background_engine`），见 ``_conf_schema.json``。
 
 核心组件在 initialize() 中组装：BrowserCore（浏览器驱动）、
 SessionManager（会话隔离与回收）、ContentExtractor（内容提取）、
@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import time
 import weakref
 from collections.abc import Awaitable, Callable
@@ -41,6 +42,7 @@ from .core import as_bool, as_float, as_int
 from .core.background import (
     _BG_MAX_CONCURRENT,
     _BG_BUSY_TEXT,
+    C_UNTRUSTED_PREFIX,
     STATUS_CANCELLED,
     STATUS_FAILED,
     STATUS_OK,
@@ -48,6 +50,7 @@ from .core.background import (
     BackgroundJob,
     BackgroundRegistry,
     render_accepted_text,
+    render_c_media_block,
     render_rejected_text,
     render_terminal_text,
     truncate_result,
@@ -82,7 +85,7 @@ METADATA_NAME = "astrbot_plugin_browser_llm"
 # 运行时 Star 实例无 self.metadata 属性，无法动态读取；metadata.yaml 在插件
 # 目录中随发布流程维护，发布时只改这一处）。读取失败（文件缺失/无 version
 # 字段）时回退内置兜底值，保证插件在异常部署形态下仍可加载。
-_PLUGIN_VERSION_FALLBACK = "v1.5.0"
+_PLUGIN_VERSION_FALLBACK = "v1.6.0"
 
 #: 插件目录与 metadata.yaml 路径（数据目录/标识解析共用，只算一次）。
 _PLUGIN_DIR = Path(__file__).resolve().parent
@@ -124,6 +127,82 @@ _LOCAL_PAGE_TOOL_NAME = "browse_local_page"
 #   ``grep -c "后台任务终态 status="``（四态合计）+ 按前缀数成功数；
 # - 后台任务在 terminate() 时取消并等待一小段，绝不让插件重载悬挂。
 _BACKGROUND_MODES = ("off", "browse_only", "all")
+
+# 后台**机制**维度（v1.6.0，配置 ``tools.background_engine``）：
+# - plugin（默认）：沿用 v1.5.0 路线 D，插件自持任务与终态投递；
+# - core：把（且只把）``browse_web`` 的 ``is_background_task`` 置真，由核心
+#   派发、核心在完成后唤醒一轮主 LLM 交付。
+# 两个维度**正交**：``background_mode`` 管"范围"，本键管"机制"——把 core 塞进
+# mode 会同时坏掉「off × core 无法表达」「回滚两个动作耦合」「六格要重写文档」
+# 三件事。
+_BACKGROUND_ENGINES = ("plugin", "core")
+
+# C 模式（平台原生后台）的**永久**范围（D3 冻结）：只有 browse_web。
+# - browse_local_page 永久排除：四道路径校验是**安全相关**，越权路径必须
+#   保持"当场同步拒绝"，不能退化成唤醒轮里的一条异步失败；
+# - browser_web_search 排除：常态 1-3s，后台化 = 多一轮完整主模型调用（净亏）。
+_C_SCOPE_TOOLS = frozenset({_BROWSE_WEB_TOOL_NAME})
+
+# 本插件注册的三个 LLM 工具名（置 is_background_task 与归属识别都用它）。
+_ALL_TOOL_NAMES = (_BROWSE_WEB_TOOL_NAME, _LOCAL_PAGE_TOOL_NAME, _SEARCH_TOOL_NAME)
+
+# 核心修复指引（探测失败时逐字进 ERROR，方便 fix 对照行号）。两个行号范围都
+# 写全：214-250 是 ``_PermissionGuardedTool`` 类与 ``__init__`` 的整段（生产
+# 4.29.1），228-244 是实际漏镜像 ``is_background_task`` 的那几行。
+_CORE_FIX_HINT = (
+    "astrbot/core/provider/func_tool_manager.py:214-250"
+    "（``_PermissionGuardedTool``，构造体见 func_tool_manager.py:228-244）"
+    "未镜像 is_background_task；修法一行："
+    'self.is_background_task = getattr(tool, "is_background_task", False)；'
+    "改完必须重启 astrbot.service（核心模块不会随插件重载重新导入）"
+)
+
+# 拒绝启用 core 的日志标记（生产判据 grep 它，规格 §3.8）。
+_BG_ENGINE_REFUSED = "tools.background_engine=core 拒绝启用"
+
+
+def c_scope_targets(*, engine: str, mode: str) -> frozenset[str]:
+    """本次配置下**应当**置 ``is_background_task=True`` 的工具集合（纯函数）。
+
+    三条矩阵不变量（规格 §1.3）：
+    - ``mode == "off"`` ⇒ 空集（D2：机制无关，不探测、不告警、不置标志）；
+    - ``engine != "core"`` ⇒ 空集（plugin 引擎**从不**写 flag）；
+    - 否则只有 ``_C_SCOPE_TOOLS``（当前恒为 ``{browse_web}``，D3 永久排除 L/S）。
+    """
+    if mode == "off" or engine != "core":
+        return frozenset()
+    return _C_SCOPE_TOOLS
+
+
+def resolve_effective_engine(*, engine: str, mode: str, probe_ok: bool) -> str:
+    """生效引擎：只有「想开 core + 有范围 + 探测通过」三者同时成立才是 core。"""
+    if mode == "off" or engine != "core":
+        return "plugin"
+    return "core" if probe_ok else "plugin"
+
+
+def _c_media_public_root() -> Path | None:
+    """C 模式媒体发布根（核心 ``send_message_to_user`` **能发**的目录）。
+
+    为什么不能直接给插件 data 目录下的绝对路径（规格 §6.5）：唤醒轮的
+    ``send_message_to_user`` 对本地文件只允许「会话工作区 + ``data/temp`` +
+    系统 temp/``.astrbot``」，而本插件的截图落在 ``data/plugin_data/<name>/``；
+    生产 ``computer_use_runtime=local`` 且 member 档 ``filesystem_scope`` 不是
+    ``host`` ⇒ 那里会被 ``raise PermissionError``。``data/temp`` 对 member/admin
+    两档都在允许根内，因此发布到 ``<data>/temp/browser_llm_c_media``。
+
+    取不到（单测桩/旧核心没有该 helper）返回 ``None`` ⇒ 调用方退回原始路径
+    （fail-soft：宁可转发可能被拒，也不要静默丢媒体）。
+    """
+    try:
+        from astrbot.core.utils.astrbot_path import (  # noqa: PLC0415 — 延迟导入
+            get_astrbot_temp_path,
+        )
+
+        return Path(get_astrbot_temp_path()) / "browser_llm_c_media"
+    except Exception:  # noqa: BLE001 — 桩环境/旧核心没有该 helper
+        return None
+
 
 # terminate 资源清理总超时（秒）：超过则放弃等待并强制收尾，防止插件重载
 # 被悬挂的 close 阻塞（曾实测 browser.close 悬挂数小时，旧实例 chromium 进程
@@ -842,15 +921,25 @@ class BrowserLLMPlugin(Star):
     background_timeout: float = 240.0
     background_max_chars: int = 1500
 
+    # 后台**机制**（v1.6.0）与探测态的类级默认：真实实例由 ``_load_config`` /
+    # ``_sync_background_engine`` 覆盖；测试直接构造实例（不走 initialize）时
+    # 也保有安全默认（plugin ⇒ 与 v1.5.0 行为逐字节一致）。
+    background_engine: str = "plugin"
+    background_engine_effective: str = "plugin"
+    _bg_core_ok: bool = True
+    _bg_probe_reason: str = ""
+    _bg_probe_sig: tuple | None = None
+    _bg_clash_warned: frozenset = frozenset()
+
     def __init__(self, context: Context, config: AstrBotConfig = None):
         """初始化插件：读取全部配置项到 self.* 属性。
 
         Args:
             context: AstrBot 插件上下文，提供事件注册与消息发送能力。
             config: 插件配置对象，对应 _conf_schema.json 的 6 个分组 /
-                44 个叶键（browser / limits / security / perception /
-                search，以及 v1.5.0 新增的 tools 组 3 键）；未传入时用
-                空字典兜底。
+                45 个叶键（browser / limits / security / perception /
+                search，以及 tools 组 4 键：v1.5.0 的 3 个后台键 + v1.6.0
+                的 background_engine）；未传入时用空字典兜底。
         """
         super().__init__(context)
         self.config = config or {}
@@ -903,15 +992,22 @@ class BrowserLLMPlugin(Star):
         # 纯内存、单事件循环内使用；terminate() 时整体取消。
         self._background: BackgroundRegistry = BackgroundRegistry()
 
+        # 后台引擎探测态（v1.6.0）：类属性给了默认值，这里给**实例**副本，
+        # 避免多实例共享可变对象；``_bg_probe_sig`` 为 None 表示"还没探过"。
+        self._bg_core_ok = True
+        self._bg_probe_reason = ""
+        self._bg_probe_sig = None
+        self._bg_clash_warned: set[str] = set()
+
     def _load_config(self) -> None:
         """将 _conf_schema.json 中的配置项读取为实例属性。
 
-        全部 6 组 44 叶（``_conf_schema.json``）：``browser``（引擎/默认页/
+        全部 6 组 45 叶（``_conf_schema.json``）：``browser``（引擎/默认页/
         搜索引擎/视口/代理/超时）、``limits``（提取与链接上限/页数/空闲回收/
         子代理步数与超时）、``security``（禁词/审核总开关/内网拦截/会话黑白
         名单）、``perception``（感知模式/截图/识图 provider 与缓存）、
         ``search``（v1.4.0 搜索 API 池 16 键：开关/池/并发/步数/超时/抓取）、
-        ``tools``（v1.5.0 后台任务 3 键：模式/整任务硬预算/结果截断长度）。
+        ``tools``（v1.5.0 后台任务 3 键 + v1.6.0 的 ``background_engine``）。
 
         类型健壮性（v1.3.1）：数值/布尔配置经 _as_int / _as_float /
         _as_bool 归一解析，非法值（字符串、None、类型错误）回退默认值并
@@ -1100,6 +1196,19 @@ class BrowserLLMPlugin(Star):
             200,
             8000,
         )
+        # 后台**机制**（v1.6.0）：plugin（默认，v1.5.0 路线 D）/ core（平台原生
+        # is_background_task）。与 background_mode 正交（mode 管范围、engine 管
+        # 机制）。非法值 fail-closed 到 plugin：宁可维持已验收的行为，也不要
+        # "写错一个词就换机制"（换了机制，回滚路径与交付确定性全都变）。
+        raw_engine = view.get("tools.background_engine", "plugin")
+        engine = str(raw_engine or "plugin").strip().lower()
+        if engine not in _BACKGROUND_ENGINES:
+            logger.warning(
+                f"[{self.metadata_name}] tools.background_engine={raw_engine!r} 非法"
+                f"（可选 {'/'.join(_BACKGROUND_ENGINES)}），已按 plugin 处理（插件自管后台）。"
+            )
+            engine = "plugin"
+        self.background_engine: str = engine
 
     def _as_int(self, value, default: int) -> int:
         """int 配置解析：委托 core 共享实现（v1.3.3 收敛双实现）。"""
@@ -1130,6 +1239,10 @@ class BrowserLLMPlugin(Star):
         关闭开关不会摘除已装拦截（保持安全方向）。
         """
         self._load_config()
+        # 后台引擎（v1.6.0）：必须紧随 ① 读配置之后——置 is_background_task 标志、
+        # 必要时（签名变化）探测能力、core 不可用时**先清 flag 再**降级到 plugin。
+        # 方法内部已 try/except 收口，不会因引擎问题打断热更新（规格 §4.2）。
+        self._sync_background_engine()
         # max_pages / idle_timeout / default_url 固化在 SessionManager，
         # 同步热更新：新额度/新阈值对新标签与下一轮回收立即生效。
         if self.sessions is not None:
@@ -1207,6 +1320,11 @@ class BrowserLLMPlugin(Star):
         # 搜索工具可见性对齐（v4）：配置是唯一事实源，initialize() 双向收敛
         # "持久化 inactivated_llm_tools 名单"与配置之间的分叉。
         await self._reconcile_search_tool()
+        # 后台引擎（v1.6.0）：重载后 ``llm_tools.func_list`` 是**全新对象**
+        # （核心 remove_func(name) + append），旧对象上的 flag 不会被继承 ⇒
+        # 必须重放；并在加载后强探测一次（核心修复 + 重启后靠它自动恢复 core）。
+        self._bg_probe_sig = None
+        self._sync_background_engine(force_probe=True)
         logger.info(f"[{self.metadata_name}] 插件 {PLUGIN_VERSION} 已激活")
         logger.info(f"[{self.metadata_name}] 浏览器引擎: {self.browser_type}")
         logger.info(
@@ -1270,19 +1388,33 @@ class BrowserLLMPlugin(Star):
             return 0
         cutoff = time.time() - self.cache_days * 86400
         removed = 0
+        # C 模式（v1.6.0）的媒体**发布副本**也随 cache_days 过期：它落在
+        # ``data/temp/browser_llm_c_media/<umo8>/`` 下，不清理就会无限增长
+        # （data/temp 是核心的临时目录，没人替我们收）。
+        publish_root = _c_media_public_root()
         for base in (
             getattr(self, "_media_dir", None),
             getattr(self, "_screenshot_dir", None),
+            publish_root,
         ):
             if base is None or not base.is_dir():
                 continue
-            for f in base.iterdir():
+            for f in sorted(base.rglob("*")):
                 try:
                     if f.is_file() and f.stat().st_mtime < cutoff:
                         f.unlink()
                         removed += 1
                 except Exception as e:  # noqa: BLE001 — 单文件失败不影响其余
                     logger.debug(f"清理缓存文件失败 {f}: {e}")
+            if base == publish_root:
+                # 发布根按 <umo8> 分子目录：文件清空后把空目录也删掉。
+                for child in sorted(base.iterdir()):
+                    if not child.is_dir():
+                        continue
+                    try:
+                        child.rmdir()
+                    except OSError:  # 非空/竞态：下一轮再收
+                        continue
         if removed:
             logger.info(
                 f"[{self.metadata_name}] 缓存清理完成，删除 {removed} 个过期文件"
@@ -1591,7 +1723,7 @@ class BrowserLLMPlugin(Star):
     _VIDEO_SUFFIXES = (".mp4", ".webm", ".mov", ".m4v", ".mkv")
 
     def _background_enabled_for(self, tool_name: str) -> bool:
-        """该工具本次是否走后台（按 ``tools.background_mode`` 判定）。
+        """该工具本次是否走 **plugin 引擎**的后台路径（v1.5.0 语义 + 一条新闸）。
 
         - ``off``（默认）：三个工具一律前台同步，行为与 v1.4.0 完全一致；
         - ``browse_only``：只后台化 ``browse_web``——它是唯一 68s 量级的长
@@ -1599,13 +1731,337 @@ class BrowserLLMPlugin(Star):
           的入口；
         - ``all``：三个工具都后台化（``browser_web_search`` 常态 1-3s，后台化
           等于多一次投递，只在明确要求"任何工具都不阻塞会话"时才开）。
+
+        v1.6.0 新闸：``background_engine_effective != "plugin"`` 时**恒 False**
+        —— core 生效时插件登记表必须恒空、不得出现【已受理】（互斥契约）。
+        因此 ``mode=all × engine=core`` 下 L/S 走前台同步，**不**回落本路径。
         """
+        if getattr(self, "background_engine_effective", "plugin") != "plugin":
+            return False
         mode = getattr(self, "background_mode", "off")
         if mode == "all":
             return True
         if mode == "browse_only":
             return tool_name == _BROWSE_WEB_TOOL_NAME
         return False
+
+    # ----------------------------------------------------------------
+    # 后台引擎（v1.6.0）：置标志 / 重放 / 能力探测 / 降级
+    # ----------------------------------------------------------------
+
+    def _background_c_mode_for(self, tool_name: str) -> bool:
+        """该工具本次是否走 **C 路径**（平台原生后台任务）。
+
+        条件源与 flag 同源（``c_scope_targets``），另加一条 ``effective=="core"``：
+        探测失败时 flag 已被清、effective 已回落 plugin，这里自然为 False。
+        """
+        targets = c_scope_targets(
+            engine=getattr(self, "background_engine", "plugin"),
+            mode=getattr(self, "background_mode", "off"),
+        )
+        return (
+            bool(targets)
+            and getattr(self, "background_engine_effective", "plugin") == "core"
+            and tool_name in _C_SCOPE_TOOLS
+        )
+
+    def _own_llm_tools(self) -> dict[str, object]:
+        """name -> 本插件的**原始** ``FuncTool``（只含 ``_ALL_TOOL_NAMES`` 三个名字）。
+
+        归属判定沿用既有实现（``_is_own_search_tool`` 的三级判定：模块路径 →
+        ``handler.__module__`` → ``partial.func.__module__``），不新造第二套。
+        同名但属别人者**跳过**（fail-closed：绝不碰别人注册的对象），每个名字
+        只记一次 warning（本方法在热路径上，每次工具调用都会跑）。
+        """
+        try:
+            from astrbot.core.provider.register import llm_tools  # noqa: PLC0415
+        except Exception:  # noqa: BLE001 — 桩/早期环境没有注册器
+            return {}
+        own: dict[str, object] = {}
+        clashed: list[str] = []
+        for func in list(getattr(llm_tools, "func_list", []) or []):
+            name = str(getattr(func, "name", "") or "")
+            if name not in _ALL_TOOL_NAMES:
+                continue
+            if not self._is_own_llm_tool(func):
+                clashed.append(name)
+                continue
+            own[name] = func  # 后注册覆盖前一个（与 ToolSet.add_tool 同向）
+        if clashed:
+            warned = getattr(self, "_bg_clash_warned", None)
+            if not isinstance(warned, set):
+                warned = set()
+                self._bg_clash_warned = warned
+            fresh = sorted(set(clashed) - warned)
+            if fresh:
+                warned.update(fresh)
+                logger.warning(
+                    f"[{self.metadata_name}] 这些同名工具不属于本插件，"
+                    f"已跳过后台标志置位：{fresh}（不碰其它插件的对象）"
+                )
+        return own
+
+    def _apply_background_flags(self, targets: frozenset[str]) -> int:
+        """把 ``targets`` 里的工具置 True、其余本插件工具置 False；返回改动数。
+
+        只在值不同时赋值：``_refresh_config`` 让本方法在**每次工具调用**都会
+        被调到，零改动必须是零写入。置位失败只记 warning 不抛——由
+        ``_probe_background_capability`` 的前置分支判成"不可用"并降级。
+        """
+        changed = 0
+        for name, tool in self._own_llm_tools().items():
+            want = name in targets
+            if bool(getattr(tool, "is_background_task", False)) == want:
+                continue
+            try:
+                tool.is_background_task = want
+                changed += 1
+            except Exception as exc:  # noqa: BLE001 — 只读/被替换的对象
+                logger.warning(
+                    f"[{self.metadata_name}] 置 {name}.is_background_task={want} 失败："
+                    f"{type(exc).__name__}"
+                )
+        return changed
+
+    def _bg_epoch(self) -> tuple:
+        """本插件三个原始工具的对象身份快照。
+
+        用 ``id()`` 而不是 ``handler``/``repr``：插件重载后核心走
+        ``remove_func(name)`` + ``append``（新对象），``id`` 必变；同一对象在
+        生命周期内 ``id`` 稳定。空 dict（桩环境/注册未完成）⇒ ``()``，探测会走
+        "找不到原始对象"分支（fail-closed），符合预期。
+        """
+        own = self._own_llm_tools()
+        return tuple(sorted((name, id(tool)) for name, tool in own.items()))
+
+    def _probe_background_capability(self) -> tuple[bool, str]:
+        """探测平台原生后台是否真的可用。返回 ``(是否可用, 失败原因)``。
+
+        **为什么必须探测**：生产核心的 ``_PermissionGuardedTool.__init__``
+        （``func_tool_manager.py:228-244``）只镜像 ``active`` 与
+        ``handler_module_path``，**不镜像** ``is_background_task``；而
+        ``get_full_tool_set()`` 每次调用都重建包装器。于是"插件把原始
+        ``FuncTool`` 的 flag 置真"对 ``tools=null`` 人格（生产主力）**恒无效
+        且静默**——工具照旧前台阻塞。探测就是量这件事：原始 True / 包装 False
+        ⇒ 核心未修。
+
+        三分支（**任何取不到的东西都算不可用**，D5 fail-closed）：
+        - A 可用：每个 target 的原始 flag ``is True`` **且**包装对象 flag ``is True``；
+        - B 核心未修：原始 True / 包装 False；
+        - C 无法探测：任一取不到（``None`` / 属性缺失 / 抛异常 / 同名冲突）。
+        """
+        targets = c_scope_targets(
+            engine=getattr(self, "background_engine", "plugin"),
+            mode=getattr(self, "background_mode", "off"),
+        )
+        if not targets:
+            # 没有目标：不探测（D2）。有效引擎由 mode 决定，永不报错。
+            return True, ""
+
+        raw_map = self._own_llm_tools()
+        for name in sorted(targets):
+            raw = raw_map.get(name)
+            if raw is None:
+                return False, f"func_list 中找不到本插件的原始工具 {name}（注册未完成？）"
+            if getattr(raw, "is_background_task", None) is not True:
+                return False, (
+                    f"原始工具 {name} 的 is_background_task 未被置真"
+                    f"（置位失败或被重注册覆盖）"
+                )
+
+        try:
+            tmgr = self.context.get_llm_tool_manager()
+        except Exception as exc:  # noqa: BLE001
+            return False, f"get_llm_tool_manager() 不可用：{type(exc).__name__}"
+        if tmgr is None:
+            return False, "get_llm_tool_manager() 返回 None"
+        try:
+            toolset = tmgr.get_full_tool_set()
+        except Exception as exc:  # noqa: BLE001
+            return False, f"get_full_tool_set() 抛错：{type(exc).__name__}"
+        if toolset is None or not hasattr(toolset, "get_tool"):
+            return False, "get_full_tool_set() 返回值不具备 get_tool()"
+
+        for name in sorted(targets):
+            wrapper = toolset.get_tool(name)
+            if wrapper is None:
+                return False, f"get_full_tool_set() 中找不到包装对象 {name}"
+            wrapper_flag = getattr(wrapper, "is_background_task", None)
+            if wrapper_flag is None:
+                return False, f"包装对象 {name} 没有 is_background_task 属性"
+            # 身份软校验：取不到 _wrapped 就跳过（换实现的核心不该被判失败），
+            # 取得到却不是本插件的对象 ⇒ 同名冲突 ⇒ 不可用。
+            wrapped = getattr(wrapper, "_wrapped", None)
+            if wrapped is not None and wrapped is not raw_map[name]:
+                return False, f"包装对象 {name} 包的不是本插件的原始对象（同名冲突）"
+            if bool(wrapper_flag) is not True:
+                return False, (
+                    f"包装对象 {name} 的 is_background_task 为 False 而原始对象为 True"
+                    f"（核心未镜像该标志）"
+                )
+        return True, ""
+
+    def _sync_background_engine(self, *, force_probe: bool = False) -> str:
+        """置标志 → （必要时）探测 → 定档 / 降级。幂等，热路径调用。
+
+        探测时机（唯一口径，规格 §3.6）：``initialize()`` 强探一次；``_refresh_config()``
+        只在「有目标」且 ``(engine, mode, epoch)`` 签名变化时探；``mode=off`` /
+        ``engine=plugin`` 一律不探（D2）。**不引入时间维度**：不设定时重试，
+        探测结果只在签名变化时重算（可复现、可测）。
+
+        降级顺序（写死）：core（探测 A）→ plugin（探测 B/C 失败或引擎异常）→
+        off（plugin 引擎自身不可用；v1.6.0 无触发路径，保留为"禁止静默前台"的
+        唯一合法兜底）。全流程不把异常抛给调用方（工具入口第一行会调它）。
+        """
+        try:
+            engine_cfg = getattr(self, "background_engine", "plugin")
+            mode = getattr(self, "background_mode", "off")
+            targets = c_scope_targets(engine=engine_cfg, mode=mode)
+
+            # 1) 先按"假设 core 可用"写标志；探测失败时步骤 4 再清。
+            epoch = self._bg_epoch()
+            self._apply_background_flags(targets)
+
+            # 2) 满足条件才探测。
+            if targets:
+                sig = (engine_cfg, mode, epoch)
+                if force_probe or self._bg_probe_sig != sig:
+                    ok, reason = self._probe_background_capability()
+                    self._bg_probe_sig = sig
+                    self._bg_core_ok = bool(ok)
+                    self._bg_probe_reason = "" if ok else str(reason)
+                    if ok:
+                        logger.info(
+                            f"[{self.metadata_name}] 后台引擎=core（原生后台任务）："
+                            f"mode={mode} 范围={sorted(targets)}"
+                        )
+                        if mode == "all":
+                            logger.info(
+                                f"[{self.metadata_name}] tools.background_mode=all 在 "
+                                f"engine=core 下只对 {_BROWSE_WEB_TOOL_NAME} 生效；"
+                                f"{_LOCAL_PAGE_TOOL_NAME} 与 {_SEARCH_TOOL_NAME} 按前台同步"
+                                f"执行（永久排除，见 README「两个引擎下 browse_web 的差别」）。"
+                                f"想让这两个工具也后台化：把 tools.background_engine 改回 plugin。"
+                            )
+                    else:
+                        logger.error(
+                            f"[{self.metadata_name}] {_BG_ENGINE_REFUSED}：{reason}。"
+                            f"已降级为 plugin 引擎（插件自管后台，mode={mode}）；"
+                            f"不会静默按前台执行。修复指引：{_CORE_FIX_HINT}"
+                        )
+            else:
+                # mode=off 或 engine=plugin：机制无关，清掉探测态（D2 不告警）。
+                self._bg_core_ok = True
+                self._bg_probe_reason = ""
+                self._bg_probe_sig = None
+
+            # 3) 定档。
+            effective = resolve_effective_engine(
+                engine=engine_cfg, mode=mode, probe_ok=bool(self._bg_core_ok)
+            )
+            if effective == "core":
+                self.background_engine_effective = "core"
+                return "core"
+
+            # 4) 降级：**先清 flag 再定档**（顺序是正确性，不是风格）。
+            if targets:
+                self._apply_background_flags(frozenset())
+            self.background_engine_effective = "plugin"
+            return "plugin"
+        except Exception as exc:  # noqa: BLE001 — fail-closed
+            logger.error(
+                f"[{self.metadata_name}] 后台引擎同步异常（{type(exc).__name__}: {exc}）；"
+                f"已 fail-closed 到 plugin 引擎并清空全部后台标志。"
+            )
+            try:
+                self._apply_background_flags(frozenset())
+            except Exception:  # noqa: BLE001
+                pass
+            self.background_engine_effective = "plugin"
+            self._bg_core_ok = False
+            return "plugin"
+
+    # ----------------------------------------------------------------
+    # C 模式执行体与媒体发布（媒体边界 A：只给路径，禁止 event.send）
+    # ----------------------------------------------------------------
+
+    def _publish_c_media(self, umo: str, path: str) -> tuple[str, bool]:
+        """把媒体发布到核心可发送目录。返回 ``(对外路径, 是否已发布)``。"""
+        src = Path(str(path))
+        if not src.is_file():
+            return str(path), False
+        root = _c_media_public_root()
+        if root is None:
+            return str(path), False
+        # 目录名只要 UMO 摘要：不把原始会话标识写进 data/temp 的路径里。
+        target_dir = root / self._umo_digest(umo)[:8]
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            # 文件名带源路径 8 位摘要：两次截图同名（browse_xxx.png）不互相覆盖。
+            digest = hashlib.md5(str(src).encode("utf-8")).hexdigest()[:8]
+            dst = target_dir / f"{src.stem}_{digest}{src.suffix}"
+            if dst.exists():
+                return str(dst), True
+            try:
+                os.link(src, dst)  # 零拷贝（同一 data 文件系统）
+            except OSError:
+                shutil.copy2(src, dst)  # 跨文件系统/权限回退
+            return str(dst), True
+        except Exception as exc:  # noqa: BLE001 — fail-soft：不静默丢媒体
+            logger.warning(
+                f"[{self.metadata_name}] C 模式媒体发布失败（{type(exc).__name__}），"
+                f"改用原路径"
+            )
+            return str(path), False
+
+    async def _run_c_background_body(
+        self, event: AstrMessageEvent, task_input: str, perception_mode: str
+    ) -> str:
+        """C 模式执行体：在核心的后台任务里跑真正的浏览，返回**给唤醒轮看的文本**。
+
+        三件事（顺序即正确性）：①``artifact_sink`` 截流媒体（机械保证不
+        ``event.send``）②整任务预算自截断 ③不可信前缀 + 截断正文 + 媒体块。
+        **没有任何**"已受理"文案：核心已经先回过提交回执了。
+
+        预算仍用 ``tools.background_timeout``（默认 240）：核心那层是 3600s
+        硬编码，插件不自带预算就等于没有上限。超时不是异常抛出，而是一条
+        ``【错误】`` 文本返回给唤醒轮（与失败同口径）。
+        """
+        umo = self._umo_of(event)
+        budget = float(self.background_timeout)
+        media: list[str] = []
+        try:
+            with artifact_sink() as bucket:
+                try:
+                    text = await asyncio.wait_for(
+                        self._browse_web_run(event, task_input, perception_mode),
+                        timeout=budget,
+                    )
+                except asyncio.TimeoutError:
+                    text = (
+                        f"【错误】浏览超过 {budget:.0f} 秒整任务预算被中断"
+                        f"（C 模式；{_BROWSE_WEB_TOOL_NAME} 没有中断前的部分结果）。"
+                    )
+                media = [str(p) for p in bucket]
+        except Exception as exc:  # noqa: BLE001 — 后台任务不能把异常抛给核心
+            logger.warning(f"[{self.metadata_name}] browse_web（C 模式）执行异常: {exc}")
+            text = f"【错误】浏览器子代理执行失败：{exc}"
+        published = [self._publish_c_media(umo, p) for p in media if os.path.isfile(p)]
+        paths = [dst for dst, _ok in published]
+        unpublished = any(not ok for _dst, ok in published)
+        body = truncate_result(str(text or ""), int(self.background_max_chars))[0]
+        ok_text = not body.startswith(("【错误】", "【拒绝】"))
+        parts: list[str] = []
+        if ok_text:
+            # 前缀只给"可信性未知的正文"；错误/拒绝是我们自己的可信文本，且
+            # 唤醒轮要靠【错误】/【拒绝】前缀分流。
+            parts.append(C_UNTRUSTED_PREFIX)
+        parts.append(body)
+        if paths and ok_text:
+            # 媒体只附成功态（与 v1.5.0 同口径）；媒体块在**截断之后**拼接，
+            # 否则绝对路径会被砍断（"媒体只给路径"方案的致命细节）。
+            parts.append(render_c_media_block(paths, unpublished=unpublished))
+        return "\n".join(parts)
 
     @staticmethod
     def _umo_digest(umo: str) -> str:
@@ -2014,6 +2470,13 @@ class BrowserLLMPlugin(Star):
         后台模式（v1.5.0 新增，配置 tools.background_mode）：开启后本次调用
         立刻返回「已受理 + task_id」，真正的浏览在后台执行，结果**单独作为
         一条消息**发到本会话，不会出现在这次返回里。
+
+        引擎（v1.6.0，配置 tools.background_engine）：plugin（默认，同上）/
+        core（平台原生后台任务：由核心派发，完成后核心唤醒一轮主 LLM 交付；
+        返回值会被塞进那一轮的系统提示词，因此带「不可信外部内容」前缀并按
+        tools.background_max_chars 截断；媒体只给绝对路径，由唤醒轮调用
+        send_message_to_user 转发）。core 只在核心已修复时可用，否则插件自动
+        拒绝并降级回 plugin（不会静默前台执行）。
         """
         try:
             # 后台模式热更新（v1.5.0，F1）：入口第一行刷新配置——否则 Dashboard
@@ -2046,6 +2509,16 @@ class BrowserLLMPlugin(Star):
             # 后台分支的**唯一合法位置**（v1.5.0，spec §2.2）：必须排在热更新/
             # 会话白黑名单/感知前缀解析/禁词之后，否则"被拒绝"会变成一条异步
             # 失败消息，v1.4.0 的同步拒绝语义就回退了。
+            # v1.6.0：C 路径（平台原生后台）优先；两门互斥——effective=core 时
+            # ``_background_enabled_for`` 恒 False，不会出现"一条任务两条消息"。
+            # 窗口期（规格 §4.5）：核心在调 handler **之前**读 flag，所以刚把
+            # engine 改成 core 的那一次调用仍可能按前台派发，此时本执行体在前台
+            # 跑完并返回"前缀 + 截断正文"（不发媒体、不发【已受理】）——这是
+            # 配置热更新的固有延迟，不是静默降级；下一次调用起由核心后台派发。
+            if self._background_c_mode_for(_BROWSE_WEB_TOOL_NAME):
+                return await self._run_c_background_body(
+                    event, task_input, perception_mode
+                )
             if self._background_enabled_for(_BROWSE_WEB_TOOL_NAME):
                 return await self._submit_background(
                     event=event,
@@ -3889,6 +4362,9 @@ class BrowserLLMPlugin(Star):
         module = str(getattr(handler, "__module__", "") or "")
         return self._is_own_module_path(module)
 
+    # v1.6.0：后台引擎按名字定位三个工具时复用同一个归属判定（不新造第二套）。
+    _is_own_llm_tool = _is_own_search_tool
+
     def _search_tool_registry_state(self) -> tuple[bool, list]:
         """返回 (本插件是否已注册该工具, 同名"别人家"工具列表)。"""
         try:
@@ -4453,9 +4929,12 @@ class BrowserLLMPlugin(Star):
             " web_search_<provider> 是两套独立实现（各自的 key、不互相降级）；"
             "同时可见时**只选其一**，不要对同一个问题重复搜两遍。"
         )
-        if self.background_mode == "all":
+        if self._background_enabled_for(_SEARCH_TOOL_NAME):
             # 后台模式下本工具返回【已受理】而不是 JSON（设计 §2.4）：主模型
             # 若照着这条返回值回答，等于凭空编造搜索结果，必须点明。
+            # 用 ``_background_enabled_for`` 而不是 ``background_mode == "all"``：
+            # v1.6.0 的 ``all × engine=core`` 下本工具是**前台同步**（D3 永久
+            # 排除），此时再说"本工具此刻是后台执行"就是在骗模型。
             text += (
                 "\n\n【后台模式已开启】本工具此刻是**后台**执行：拿到的是"
                 "「【已受理】+ task_id」纯文本，不是搜索结果。"

@@ -37,14 +37,14 @@ def schema_paths(schema: dict) -> set[str]:
 
 
 def test_schema_leaves_match_key_map():
-    """schema 的 44 个叶子 == KEY_MAP 的 44 条路径（双向）。"""
+    """schema 的 45 个叶子 == KEY_MAP 的 45 条路径（双向）。"""
     schema = load_schema()
     paths = schema_paths(schema)
     assert paths == set(KEY_MAP), (
         f"仅 schema 有: {sorted(paths - set(KEY_MAP))}；"
         f"仅 KEY_MAP 有: {sorted(set(KEY_MAP) - paths)}"
     )
-    assert len(paths) == 44
+    assert len(paths) == 45
 
 
 def test_group_names_match_groups():
