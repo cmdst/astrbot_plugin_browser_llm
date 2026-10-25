@@ -18,6 +18,7 @@ SafetyFilter（禁词过滤与 SSRF 防护），以及 24 个 FunctionTool 构�
 """
 
 import asyncio
+import difflib
 import functools
 import hashlib
 import json
@@ -318,6 +319,25 @@ _INVALID_PERCEPTION_PREFIX_RE = re.compile(
 )
 # 识图短时缓存防膨胀阈值：写入后缓存条目数超过该值即清理过期项。
 _VISION_CACHE_MAX_ENTRIES = 256
+# 识图缓存键的图像内容哈希位数（v1.6.1）：sha256(截图文件字节) 十六进制
+# **前 32 位**（= 128 bit）。写死为常量、不做成配置项：它只用于「是不是
+# 同一张图」的判定，32 位在 256 条缓存量级下碰撞概率可忽略，且比全 64 位
+# 省一半内存。**不许用时间戳/序号/文件路径冒充**——2026-10-26 事故的根因
+# 就是「同 URL 共用一个槽」，路径与序号都区分不出画面变化。
+_VISION_IMAGE_HASH_LEN = 32
+# 识图缓存键的提示词哈希位数（v1.6.1）：运营方改 perception.vision_prompt
+# 后必须重新识图，否则会命中「按旧提示词生成的描述」。
+_VISION_PROMPT_HASH_LEN = 8
+# 识图默认提示词（v1.6.1 提到模块级）：缓存键要对**实际使用的提示词**取
+# 哈希，抽成常量避免默认提示词字面量在多处漂移。
+_DEFAULT_VISION_PROMPT = (
+    "请用中文描述这张网页截图的重点内容，包括主要文字、按钮、链接和页面结构。"
+)
+# browse_click_text 失败时的相近候选（v1.6.1）：采集上限 / 展示条数 /
+# 单条文本长度上限（过长的容器文本不是「可点击标签」，属噪声）。
+_CLICK_TEXT_CANDIDATE_SCAN_LIMIT = 400
+_CLICK_TEXT_CANDIDATE_TOP_N = 5
+_CLICK_TEXT_CANDIDATE_MAX_LEN = 40
 
 # ---------------------------------------------------------------
 # 识图拒识检测：纯文本模型拒识文案识别
@@ -779,11 +799,17 @@ _BROWSER_TOOLS = [
     },
     {
         "name": "browse_checkbox",
-        "description": "网页交互场景专用：设置复选框/单选框的选中状态。",
+        "description": "网页交互场景专用：设置复选框/单选框/按钮式选项的选中状态（多匹配时用 index 指定第几个）。",
         "parameters": _params(
             {
                 "selector": ("复选框的 CSS 选择器", "string"),
                 "checked": ("目标选中状态（true=勾选，false=取消）", "boolean"),
+            },
+            {
+                "index": (
+                    "多个元素匹配同一选择器时的序号，从 0 开始，默认 0（第一个）",
+                    "number",
+                )
             },
         ),
         "method": "browse_checkbox",
@@ -857,7 +883,8 @@ _BROWSER_AGENT_INSTRUCTION = (
     "- browse_click_link：按编号点击链接继续浏览；\n"
     "- browse_click_text：按文本内容精准点击元素（按钮/选项）；\n"
     "- browse_set_slider / browse_select_option / browse_checkbox：滑块/"
-    "下拉框/复选框设置；\n"
+    "下拉框/复选框设置（browse_checkbox 多匹配时用 index 指定第几个，"
+    "从 0 开始，按钮式选项也可用）；\n"
     "- browse_click_coords：按视口坐标点击（识图后定位无文本元素）；\n"
     "- browse_zoom_crop：裁剪页面区域放大识图（查看小字/无文本区域）；\n"
     "- browse_sniff_media：嗅探页面图片/视频资源并下载发送到群聊；\n"
@@ -890,7 +917,11 @@ _BROWSER_AGENT_INSTRUCTION = (
     "通过：遇到时立即停止操作，不要尝试点击、刷新、重试或盲猜坐标；"
     "如实报告『遇到图形验证码，需要用户手动处理』并返回当前页面状态；\n"
     "8. 浏览失败时根据错误信息调整策略，必要时更换搜索词或链接；\n"
-    "9. 完成后用简洁中文总结浏览结果（URL、关键内容），不要暴露工具调用"
+    "9. 选项标签必须来自页面实际文本，禁止臆造：点击/选择任何选项前，"
+    "其文本必须能在 browse_get_text / browse_current_page 的返回里找到原文；"
+    "不要用近义词、同义改写或凭印象编造的标签（臆造标签必然点击失败并"
+    "浪费等待时间）。工具返回「相近可点击文本」时，只能从中挑选重试；\n"
+    "10. 完成后用简洁中文总结浏览结果（URL、关键内容），不要暴露工具调用"
     "过程细节。\n\n"
     "提交后等待结果（重要）：\n"
     "- 点击生成/提交类按钮后，不要刷新页面、不要重新开始、不要后退，"
@@ -900,6 +931,47 @@ _BROWSER_AGENT_INSTRUCTION = (
     "- 若页面仍在生成中（进度指示/空白），继续等待重读，不要中途放弃；\n"
     "- 拿到结果后，原样返回结果页的关键文字。"
 )
+
+# browse_click_text 失败时的「相近可点击文本」采集脚本（v1.6.1）。
+# 只收**看起来可点**的元素（标签 / role / onclick / tabindex），文本取
+# innerText→value→aria-label 后压空白；按小写文本去重。长度上限与展示
+# 条数在 Python 侧用 _CLICK_TEXT_CANDIDATE_* 常量控制（JS 里不掺 Python
+# 值，避免字符串插值）。每条带 tag（含 role）与 visible（尺寸 +
+# display/visibility/opacity 判定）——事故里模型最缺的就是「页面上真实
+# 存在的文本长什么样、能不能点」。
+_CLICK_TEXT_CANDIDATES_JS = r"""() => {
+  const sels = [
+    'a', 'button', 'label', 'option', 'summary',
+    'input[type=submit]', 'input[type=button]', 'input[type=radio]',
+    'input[type=checkbox]',
+    '[role=button]', '[role=option]', '[role=radio]', '[role=checkbox]',
+    '[role=tab]', '[role=menuitem]', '[role=link]', '[onclick]', '[tabindex]',
+  ].join(',');
+  const out = [];
+  const seen = new Set();
+  for (const el of Array.from(document.querySelectorAll(sels))) {
+    const raw = el.innerText || el.value || el.getAttribute('aria-label') || '';
+    const text = String(raw).replace(/\s+/g, ' ').trim();
+    if (!text) continue;
+    const key = text.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const r = el.getBoundingClientRect();
+    const cs = window.getComputedStyle(el);
+    const visible = r.width > 0 && r.height > 0
+      && cs.visibility !== 'hidden' && cs.display !== 'none'
+      && cs.opacity !== '0';
+    const tag = el.tagName.toLowerCase();
+    const role = el.getAttribute('role');
+    out.push({
+      text: text,
+      type: role ? tag + '[' + role + ']' : tag,
+      visible: visible,
+    });
+    if (out.length >= 2000) break;
+  }
+  return out;
+}"""
 
 
 class BrowserLLMPlugin(Star):
@@ -972,13 +1044,18 @@ class BrowserLLMPlugin(Star):
         self._search_service_signature: tuple | None = None
         self._search_tool_active: bool = False
 
-        # 识图短时缓存（v1.3.0）：(umo, 规范化URL) -> (写入时间戳, 描述文本)。
+        # 识图短时缓存（v1.3.0；v1.6.1 换键）：键是七元组
+        # (umo, 规范化URL, 工具种类, 裁剪参数, 图像内容哈希, 提示词哈希,
+        #  provider_id) -> (写入时间戳, 描述文本)，见 _vision_cache_key。
+        # v1.6.1 之前键只有 (umo, 规范化URL)：同一 URL 下所有截图/裁剪共用
+        # 一个槽，交互改变画面后仍返回上一张（甚至局部裁剪）的描述
+        # （2026-10-26 事故主因）。
         # 并发安全说明：插件运行在 asyncio 单线程事件循环内，dict 读/写天然
-        # 原子，无需额外锁；同一 URL 并发首次识图可能重复调用 LLM（无害，
+        # 原子，无需额外锁；同一键并发首次识图可能重复调用 LLM（无害，
         # 结果一致，仅多一次 token 消耗），不引入锁以保持实现简单。条目按
         # TTL 惰性过期，超过 _VISION_CACHE_MAX_ENTRIES 时清理过期项防膨胀，
         # terminate 时整体清空（防重载残留）。
-        self._vision_cache: dict[tuple[str, str], tuple[float, str]] = {}
+        self._vision_cache: dict[tuple, tuple[float, str]] = {}
 
         # 搜索引擎模板：{keyword} 会被 URL 编码后替换。
         self._search_engines = {
@@ -3132,6 +3209,112 @@ class BrowserLLMPlugin(Star):
         """返回该会话的专用锁（串行化同一会话的并发工具调用）。"""
         return self.sessions.get_lock(self._umo_of(event))
 
+    @staticmethod
+    async def _locator_count(loc) -> int | None:
+        """定位器匹配数（v1.6.1）。
+
+        Playwright 的 ``locator.count()`` 是协程；测试桩/极旧实现可能没有该
+        方法，此时返回 None 表示「候选数未知」——调用方按单一匹配处理，
+        保持 v1.6.0 及以前的宽松行为（不因为数不出候选而报错）。
+        """
+        counter = getattr(loc, "count", None)
+        if counter is None:
+            return None
+        try:
+            return int(await counter())
+        except Exception as e:  # noqa: BLE001 — 计数失败按「未知」处理
+            logger.debug(f"定位器 count() 失败，按未知处理: {e}")
+            return None
+
+    @staticmethod
+    async def _checkbox_state(loc) -> bool | None:
+        """读取元素的「选中状态」（v1.6.1）。
+
+        - 真 checkbox/radio：走 ``is_checked()``（Playwright async API，必须
+          await）；
+        - 按钮式选项（``<button aria-pressed>`` / ``role=radio`` 等）：
+          ``is_checked()`` 会抛「Not a checkbox or radio button」，此时依次
+          读 aria-checked / aria-pressed / aria-selected；
+        - 两者都不可用 → None（调用方据此走「按钮式选项」兜底分支）。
+        """
+        try:
+            return bool(await loc.is_checked())
+        except Exception as e:  # noqa: BLE001 — 非 checkbox/radio：改读 ARIA
+            logger.debug(f"is_checked 不可用，改读按钮式选项的 ARIA 状态: {e}")
+        getter = getattr(loc, "get_attribute", None)
+        if getter is None:
+            return None
+        for attr in ("aria-checked", "aria-pressed", "aria-selected"):
+            try:
+                value = await getter(attr)
+            except Exception:  # noqa: BLE001 — 单个属性读取失败不影响其它
+                continue
+            if value is None:
+                continue
+            text = str(value).strip().lower()
+            if text in ("true", "false"):
+                return text == "true"
+        return None
+
+    async def _click_text_candidates(self, page, text: str) -> str:
+        """采集页面**真实**可点击文本，按与目标文本的相似度返回 top-N（v1.6.1）。
+
+        仅在 browse_click_text 失败时调用：候选来自页面实际渲染文本（不做
+        任何改写），排序规则 = 目标文本是候选子串（最高）> 候选是目标子串
+        > difflib 相似度，同级按文本字典序。每条带元素类型与可见性，模型
+        据此重试；一条都没有时返回空串（调用方只回原错误）。
+
+        采集失败（无 evaluate / evaluate 抛错 / 结果非预期结构）一律返回
+        空串——候选是**附加信息**，绝不能因为它把原错误语义盖掉。
+        """
+        evaluate = getattr(page, "evaluate", None)
+        if evaluate is None:
+            return ""
+        try:
+            raw = await evaluate(_CLICK_TEXT_CANDIDATES_JS)
+        except Exception as e:  # noqa: BLE001 — 采集失败不影响原错误返回
+            logger.debug(f"采集可点击文本候选失败: {e}")
+            return ""
+        items = []
+        for item in raw or []:
+            if not isinstance(item, dict):
+                continue
+            cand = str(item.get("text") or "").strip()
+            if not cand or len(cand) > _CLICK_TEXT_CANDIDATE_MAX_LEN:
+                continue
+            items.append(
+                (
+                    cand,
+                    str(item.get("type") or "?"),
+                    bool(item.get("visible")),
+                )
+            )
+            if len(items) >= _CLICK_TEXT_CANDIDATE_SCAN_LIMIT:
+                break
+        if not items:
+            return ""
+        needle = str(text).strip().lower()
+        scored = []
+        for cand, etype, visible in items:
+            low = cand.lower()
+            if needle and needle in low:
+                score = 2.0
+            elif low and low in needle:
+                score = 1.5
+            else:
+                score = difflib.SequenceMatcher(None, needle, low).ratio()
+            scored.append((score, cand, etype, visible))
+        scored.sort(key=lambda row: (-row[0], row[1]))
+        top = scored[:_CLICK_TEXT_CANDIDATE_TOP_N]
+        lines = [
+            f"相近的可点击文本（top {len(top)}，页面共采集 {len(items)} 个候选）："
+        ]
+        for i, (_score, cand, etype, visible) in enumerate(top, 1):
+            state = "可见" if visible else "不可见"
+            lines.append(f"{i}. 「{cand}」（{etype}，{state}）")
+        lines.append("请只用上面列出的真实文本重试，禁止臆造选项标签。")
+        return "\n".join(lines)
+
     # ================================================================
     # LLM 工具：浏览能力（全部返回 str，异常兜底，绝不抛出）
     # ================================================================
@@ -3324,6 +3507,7 @@ class BrowserLLMPlugin(Star):
                     return "【错误】direction 仅支持 down/下 或 up/上。"
                 y = sign * int(pixels)
                 await page.evaluate(f"window.scrollBy(0, {y})")
+                self._vision_cache_invalidate(event, getattr(page, "url", ""))
                 return await self._page_summary(page)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{METADATA_NAME}] browse_scroll 失败: {e}")
@@ -3336,10 +3520,13 @@ class BrowserLLMPlugin(Star):
                 page, err = await self._get_page(event)
                 if page is None:
                     return f"【错误】{err}"
+                # 导航类原语：失效用**动作前**的 URL（动作后 URL 已变）。
+                pre_url = getattr(page, "url", "")
                 try:
                     await page.go_back()
                 except Exception as e:  # noqa: BLE001
                     return f"【错误】后退失败：{e}"
+                self._vision_cache_invalidate(event, pre_url)
                 return await self._page_summary(page)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{METADATA_NAME}] browse_go_back 失败: {e}")
@@ -3352,10 +3539,13 @@ class BrowserLLMPlugin(Star):
                 page, err = await self._get_page(event)
                 if page is None:
                     return f"【错误】{err}"
+                # 导航类原语：失效用**动作前**的 URL（动作后 URL 已变）。
+                pre_url = getattr(page, "url", "")
                 try:
                     await page.go_forward()
                 except Exception as e:  # noqa: BLE001
                     return f"【错误】前进失败：{e}"
+                self._vision_cache_invalidate(event, pre_url)
                 return await self._page_summary(page)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{METADATA_NAME}] browse_go_forward 失败: {e}")
@@ -3412,9 +3602,13 @@ class BrowserLLMPlugin(Star):
                 page, err = await self._get_page(event)
                 if page is None:
                     return f"【错误】{err}"
+                # 切标签前记下「离开的那一页」的 URL：只失效它的缓存，
+                # 其它标签页的条目一条都不动（不跨标签误删）。
+                pre_url = getattr(page, "url", "")
                 target = await self.sessions.switch_tab(umo, index)
                 if target is None:
                     return f"【错误】标签页编号 {index} 不存在（当前共 {total} 个，编号从 1 开始）。"
+                self._vision_cache_invalidate(event, pre_url)
                 summary = await self._page_summary(target)
                 return f"已切换到标签 {index}（共 {total} 个）。\n{summary}"
         except Exception as e:  # noqa: BLE001
@@ -3441,9 +3635,12 @@ class BrowserLLMPlugin(Star):
                 page, err = await self._get_page(event)
                 if page is None:
                     return f"【错误】{err}"
+                # 关标签前记下当前页 URL：只失效这一页的缓存（不跨标签误删）。
+                pre_url = getattr(page, "url", "")
                 closed = await self.sessions.close_tab(umo, index)
                 if not closed:
                     return f"【错误】标签页编号 {index} 不存在（当前共 {total} 个，编号从 1 开始）。"
+                self._vision_cache_invalidate(event, pre_url)
                 remaining = self.sessions.tab_count(umo)
                 return f"已关闭标签 {index}，剩余 {remaining} 个标签。"
         except Exception as e:  # noqa: BLE001
@@ -3469,6 +3666,7 @@ class BrowserLLMPlugin(Star):
                 except Exception as e:  # noqa: BLE001 — fill 失败降级 type
                     logger.debug(f"page.fill 失败，降级 page.type: {e}")
                     await page.type(selector, text)
+                self._vision_cache_invalidate(event, getattr(page, "url", ""))
                 return f"已在 {selector} 输入文本：{text}"
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{METADATA_NAME}] browse_input 失败: {e}")
@@ -3508,6 +3706,7 @@ class BrowserLLMPlugin(Star):
                         f"支持：{'/'.join(sorted(allowed_keys))}"
                     )
                 await page.keyboard.press(canonical)
+                self._vision_cache_invalidate(event, getattr(page, "url", ""))
                 return f"已按下按键 {canonical}。"
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{METADATA_NAME}] browse_press_key 失败: {e}")
@@ -3556,8 +3755,13 @@ class BrowserLLMPlugin(Star):
                     except Exception as e:  # noqa: BLE001 — 发图失败不阻塞识图
                         logger.warning(f"[{METADATA_NAME}] 发送截图失败: {e}")
                 # 识图（可选）：配置了 vision_provider_id 才尝试。
+                # kind="screenshot" 进缓存键：全图与 browse_zoom_crop 的裁剪
+                # 结果不再互相命中（v1.6.1）。
                 desc = await self._describe_screenshot(
-                    result, event, page_url=getattr(page, "url", None)
+                    result,
+                    event,
+                    page_url=getattr(page, "url", None),
+                    kind="screenshot",
                 )
                 if desc:
                     # 内容安全（v1.3.3）：识图结果与页面正文同口径过禁词
@@ -3612,11 +3816,20 @@ class BrowserLLMPlugin(Star):
                         await page.locator(f"text={text}").first.click(timeout=10000)
                         clicked = True
                     except Exception as e:  # noqa: BLE001
+                        # 失败路径（v1.6.1）：**不伪装成功**——保留【错误】
+                        # 前缀与告警日志，另附「相近可点击文本 top-5」帮内层
+                        # 模型自我纠正（事故里模型臆造了页面不存在的选项
+                        # 标签，只回「找不到」⇒ 只能继续猜）。
                         logger.warning(
                             f"[{METADATA_NAME}] 未找到可点击元素（文本: {text}）: {e}"
                         )
-                        return f"【错误】页面上找不到包含文本「{text}」的可点击元素。"
+                        message = (
+                            f"【错误】页面上找不到包含文本「{text}」的可点击元素。"
+                        )
+                        candidates = await self._click_text_candidates(page, text)
+                        return f"{message}\n{candidates}" if candidates else message
                 logger.info(f"[{METADATA_NAME}] 已按文本点击: {text}")
+                self._vision_cache_invalidate(event, getattr(page, "url", ""))
                 return await self._page_summary(page)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{METADATA_NAME}] browse_click_text 失败: {e}")
@@ -3639,6 +3852,7 @@ class BrowserLLMPlugin(Star):
                 try:
                     await page.locator("input[type=range]").fill(str(target))
                     logger.info(f"[{METADATA_NAME}] 已用 fill 设置滑块值: {target}")
+                    self._vision_cache_invalidate(event, getattr(page, "url", ""))
                     return await self._page_summary(page)
                 except Exception as e:  # noqa: BLE001 — fill 失败（不可交互等）降级
                     logger.debug(f"滑块 fill 失败，降级 native setter: {e}")
@@ -3660,6 +3874,7 @@ class BrowserLLMPlugin(Star):
                 logger.info(
                     f"[{METADATA_NAME}] 已用 native setter 设置滑块值: {target}"
                 )
+                self._vision_cache_invalidate(event, getattr(page, "url", ""))
                 return await self._page_summary(page)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{METADATA_NAME}] browse_set_slider 失败: {e}")
@@ -3681,6 +3896,7 @@ class BrowserLLMPlugin(Star):
                     return f"【错误】{err}"
                 await page.select_option(selector, value)
                 logger.info(f"[{METADATA_NAME}] 已选择下拉项: {selector} = {value}")
+                self._vision_cache_invalidate(event, getattr(page, "url", ""))
                 return await self._page_summary(page)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{METADATA_NAME}] browse_select_option 失败: {e}")
@@ -3700,6 +3916,7 @@ class BrowserLLMPlugin(Star):
                     return f"【错误】{err}"
                 await page.mouse.click(int(x), int(y))
                 logger.info(f"[{METADATA_NAME}] 已点击坐标: ({x}, {y})")
+                self._vision_cache_invalidate(event, getattr(page, "url", ""))
                 return await self._page_summary(page)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{METADATA_NAME}] browse_click_coords 失败: {e}")
@@ -3740,6 +3957,8 @@ class BrowserLLMPlugin(Star):
                         )
                         return f"【错误】页面上找不到包含文本「{text}」的可悬停元素。"
                 logger.info(f"[{METADATA_NAME}] 已悬停: {text}")
+                # 悬停常触发悬浮菜单/下拉层（画面变化，URL 不变）⇒ 也失效。
+                self._vision_cache_invalidate(event, getattr(page, "url", ""))
                 return await self._page_summary(page)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{METADATA_NAME}] browse_hover 失败: {e}")
@@ -3754,35 +3973,85 @@ class BrowserLLMPlugin(Star):
                     return f"【错误】{err}"
                 await page.reload(wait_until="domcontentloaded", timeout=20000)
                 logger.info(f"[{METADATA_NAME}] 已刷新页面")
+                self._vision_cache_invalidate(event, getattr(page, "url", ""))
                 return await self._page_summary(page)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{METADATA_NAME}] browse_reload 失败: {e}")
             return f"【错误】刷新页面失败：{e}"
 
     async def browse_checkbox(
-        self, event: AstrMessageEvent, selector: str, checked: bool
+        self, event: AstrMessageEvent, selector: str, checked: bool, index: int = 0
     ) -> str:
-        """网页交互场景专用：设置复选框/单选框的选中状态。
+        """网页交互场景专用：设置复选框/单选框/按钮式选项的选中状态。
 
         Args:
-            selector(string): 复选框的 CSS 选择器。
+            selector(string): 复选框的 CSS 选择器（多匹配时用 index 指定第几个）。
             checked(boolean): 目标选中状态（true=勾选，false=取消）。
+            index(number): 多匹配时的序号，从 0 开始，默认 0（第一个匹配）。
         """
         try:
             async with self._lock_for(event):
                 page, err = await self._get_page(event)
                 if page is None:
                     return f"【错误】{err}"
+                try:
+                    idx = int(index or 0)
+                except (TypeError, ValueError):
+                    return (
+                        f"【错误】index 参数无效：{index!r}，"
+                        "应为从 0 开始的整数（0=第一个匹配）。"
+                    )
+                if idx < 0:
+                    return f"【错误】index 不能为负数（收到 {idx}），编号从 0 开始。"
                 loc = page.locator(selector)
+                total = await self._locator_count(loc)
+                if total is not None and total == 0:
+                    return (
+                        f"【错误】页面上找不到匹配「{selector}」的复选框/单选框/"
+                        "按钮式选项（候选 0 个）。请确认选择器，或先用 "
+                        "browse_get_text / browse_screenshot 看清页面元素。"
+                    )
+                if total is not None and idx >= total:
+                    return (
+                        f"【错误】index={idx} 越界：选择器「{selector}」共匹配 "
+                        f"{total} 个候选（编号 0..{total - 1}）。"
+                        "请把 index 调到该范围内重试。"
+                    )
+                # 多匹配取第 idx 个（v1.6.1）：直接 click() 会触发 Playwright
+                # 的 strict mode violation（事故里 5 个 radio 匹配直接失败，
+                # 模型拿不到任何可用的自我纠正信息）。
+                target = loc if (total is None or total <= 1) else loc.nth(idx)
                 # Playwright async API：is_checked() 是协程，必须 await；
                 # 漏 await 时 bool(coroutine) 恒为 True，会把「目标状态与
                 # 当前状态一致」误判为不一致而误点击（切换语义反转）。
-                is_checked = bool(await loc.is_checked())
-                if is_checked != bool(checked):
-                    await loc.click()
-                logger.info(
-                    f"[{METADATA_NAME}] 已设置复选状态: {selector} -> {checked}"
-                )
+                state = await self._checkbox_state(target)
+                if state is None:
+                    # 按钮式选项（<button aria-pressed> / role=radio 等）：
+                    # 无可读选中状态。要求「选中」时点一次（选中幂等）；
+                    # 要求「取消」时明确报错而不是盲点（盲点可能反而选中）。
+                    if not checked:
+                        return (
+                            f"【错误】「{selector}」[index={idx}] 不是复选框/"
+                            "单选框且没有可读的选中状态，无法执行「取消选中」。"
+                            "如需切换请改用 browse_click_text 按文本点击。"
+                        )
+                    await target.click()
+                    logger.info(
+                        f"[{METADATA_NAME}] 已按按钮式选项点击（无可读状态）: "
+                        f"{selector}[{idx}]"
+                    )
+                elif state != bool(checked):
+                    await target.click()
+                    logger.info(
+                        f"[{METADATA_NAME}] 已设置选中状态: "
+                        f"{selector}[{idx}] -> {checked}"
+                    )
+                else:
+                    logger.info(
+                        f"[{METADATA_NAME}] 选中状态已符合目标，未点击: "
+                        f"{selector}[{idx}] -> {checked}"
+                    )
+                self._vision_cache_invalidate(event, getattr(page, "url", ""))
                 return await self._page_summary(page)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{METADATA_NAME}] browse_checkbox 失败: {e}")
@@ -3828,8 +4097,14 @@ class BrowserLLMPlugin(Star):
                     f"[{METADATA_NAME}] 已裁剪截图 ({cx},{cy},{cw}x{ch}) -> {save_path}"
                 )
                 # 识图该区域（配置了 vision_provider_id 才执行）。
+                # kind + 裁剪参数进缓存键（v1.6.1）：裁剪结果与 browse_screenshot
+                # 的全图结果不再互相命中（事故里 crop 的描述被当成全图描述返回）。
                 desc = await self._describe_screenshot(
-                    save_path, event, page_url=getattr(page, "url", None)
+                    save_path,
+                    event,
+                    page_url=getattr(page, "url", None),
+                    kind="zoom_crop",
+                    crop=(cx, cy, cw, ch),
                 )
                 if desc:
                     # 内容安全（v1.3.3）：识图结果与页面正文同口径过禁词
@@ -4113,13 +4388,50 @@ class BrowserLLMPlugin(Star):
             url = url[:-1]
         return url
 
-    def _vision_cache_key(
-        self, page_url: str | None, event: AstrMessageEvent | None
-    ) -> tuple[str, str] | None:
-        """构造识图缓存键：(umo, 规范化URL)；缺 URL 或会话时返回 None。
+    @staticmethod
+    def _vision_image_hash(image_path: str) -> str:
+        """图像内容哈希：sha256(截图文件**字节**) 十六进制前 32 位（v1.6.1）。
 
-        None 表示本次调用不参与缓存（不读不写），例如调用方未提供页面
-        URL、或事件无法确定会话（单测/非会话场景）。
+        这是识图缓存键的主成分，必须是真实图片字节——时间戳、序号、文件
+        路径都不能代替它（事故里同一 URL 连续截图的路径各不相同但画面高度
+        相关，用路径/序号做键仍会错配或互相覆盖）。文件不可读（不存在、
+        无权限、非本地路径如 data: URI）时返回空串，调用方据此跳过缓存
+        （fail-closed：宁可多调一次识图，也不返回可能过期的描述）。
+        """
+        if not image_path:
+            return ""
+        try:
+            with open(image_path, "rb") as fp:
+                digest = hashlib.sha256(fp.read()).hexdigest()
+        except (OSError, TypeError, ValueError):
+            return ""
+        return digest[:_VISION_IMAGE_HASH_LEN]
+
+    def _vision_cache_key(
+        self,
+        page_url: str | None,
+        event: AstrMessageEvent | None,
+        image_path: str = "",
+        kind: str = "screenshot",
+        crop: tuple[int, int, int, int] | None = None,
+        prompt: str = "",
+        provider_id: str = "",
+    ) -> tuple | None:
+        """构造识图缓存键（v1.6.1 七元组）；缺任一必需成分时返回 None。
+
+        键 = ``(umo, 规范化URL, 工具种类, 裁剪参数, 图像内容哈希,
+        提示词哈希, provider_id)``：
+
+        - ``umo`` + ``规范化URL``：会话与页面隔离（v1.3.0 语义保留），也是
+          交互后按 ``(umo, URL)`` 前缀失效的依据（见 _vision_cache_invalidate）；
+        - ``工具种类``（screenshot / zoom_crop）+ ``裁剪参数``：全图与局部
+          裁剪不再互相串号（事故里 crop 的描述被当成 screenshot 的结果）；
+        - ``图像内容哈希``：**画面一变就不命中**，这是事故主因的正面修复；
+        - ``提示词哈希`` + ``provider_id``：运营方改 vision_prompt 或换识图
+          provider 后，旧描述不再命中（否则会按旧口径复用旧描述）。
+
+        None 表示本次调用不参与缓存（不读不写）：缺页面 URL、缺会话、
+        或读不到图像字节（见 _vision_image_hash）。
         """
         url = self._normalize_vision_cache_url(page_url or "")
         if not url:
@@ -4127,9 +4439,68 @@ class BrowserLLMPlugin(Star):
         umo = self._umo_of(event) if event is not None else ""
         if not umo:
             return None
-        return (umo, url)
+        image_hash = self._vision_image_hash(image_path)
+        if not image_hash:
+            return None
+        variant = "" if crop is None else ",".join(str(int(v)) for v in crop)
+        prompt_hash = hashlib.sha256(
+            (prompt or "").encode("utf-8")
+        ).hexdigest()[:_VISION_PROMPT_HASH_LEN]
+        return (
+            umo,
+            url,
+            str(kind or "screenshot"),
+            variant,
+            image_hash,
+            prompt_hash,
+            str(provider_id or ""),
+        )
 
-    def _vision_cache_put(self, key: tuple[str, str] | None, text: str) -> None:
+    def _vision_cache_invalidate(
+        self, event: AstrMessageEvent | None, page_url: str | None
+    ) -> int:
+        """交互后失效：删除该 ``(umo, 规范化URL)`` 下的全部识图缓存条目。
+
+        精确键规则（v1.6.1）：键的前两位就是 ``(umo, 规范化URL)``，因此
+        「按前两位前缀删除」只清掉**本会话本页面**的条目 —— 其它会话
+        （不同 umo）与其它页面（不同规范化 URL，含其它标签页）的条目一律
+        不动，不存在跨标签页/跨 URL 误删。
+
+        内容哈希已能在正确性上覆盖「画面变了」，本失效是纵深防御：交互后
+        连字节都完全相同（画面真没变）时强制重新识图，避免任何依赖「字节
+        相同 ⇒ 语义相同」的残余假设。
+
+        Args:
+            event: 消息事件（取会话标识），可为 None。
+            page_url: 交互发生时页面的 URL（**交互前**的 URL，导航类原语
+                须在动作之前取值），可为 None。
+
+        Returns:
+            int: 实际删除的条目数（0 表示无可删/键不成立）。
+        """
+        cache = getattr(self, "_vision_cache", None)
+        if not isinstance(cache, dict) or not cache:
+            return 0
+        url = self._normalize_vision_cache_url(page_url or "")
+        if not url:
+            return 0
+        umo = self._umo_of(event) if event is not None else ""
+        if not umo:
+            return 0
+        doomed = [
+            k
+            for k in cache
+            if isinstance(k, tuple) and len(k) >= 2 and k[0] == umo and k[1] == url
+        ]
+        for k in doomed:
+            del cache[k]
+        if doomed:
+            logger.debug(
+                f"[{METADATA_NAME}] 交互后失效识图缓存 {len(doomed)} 条: {page_url}"
+            )
+        return len(doomed)
+
+    def _vision_cache_put(self, key: tuple | None, text: str) -> None:
         """写入识图缓存（附带过期项清理，防长期运行内存膨胀）。
 
         超过 _VISION_CACHE_MAX_ENTRIES 条时惰性清理全部过期项；条目
@@ -4153,6 +4524,8 @@ class BrowserLLMPlugin(Star):
         image_path: str,
         event: AstrMessageEvent | None = None,
         page_url: str | None = None,
+        kind: str = "screenshot",
+        crop: tuple[int, int, int, int] | None = None,
     ) -> str:
         """用多模态模型描述截图（配置了 vision_provider_id 才执行）。
 
@@ -4161,42 +4534,57 @@ class BrowserLLMPlugin(Star):
         模型返回拒识文案（纯文本模型不支持图片，如 "[Unsupported Image]"）
         时记警告日志并返回明确提示文案，不把拒识文本误当视觉描述。
         双通道降级：contexts（ImageURLPart）失败后回退 image_urls。
-        识图短时缓存（v1.3.0）：提供 page_url 且 vision_cache_ttl>0 时，
-        同 URL（去 fragment/尾斜杠规范化）+ 同会话在 TTL 内重复识图直接
-        复用上次结果（返回文本带 [缓存] 前缀，另记 debug 日志）；缓存按
-        URL+会话隔离，terminate 时整体清空。
+        识图短时缓存（v1.3.0 起；v1.6.1 换键）：提供 page_url 且
+        vision_cache_ttl>0 时，按 _vision_cache_key 的七元组（含**图像内容
+        哈希**、工具种类/裁剪参数、提示词哈希、provider）在 TTL 内复用上次
+        结果（返回文本带 [缓存] 前缀，另记 debug 日志）。画面一变即不命中，
+        全图与裁剪不再串号；terminate 时整体清空。
 
         Args:
-            image_path: 截图本地路径。
+            image_path: 截图本地路径（缓存键的图像字节来源）。
             event: 消息事件（失效回退时确定会话），可为 None。
             page_url: 截图对应页面的 URL（缓存键来源），可为 None 表示
                 不参与缓存。
+            kind: 产出该图的工具种类（screenshot / zoom_crop），进缓存键。
+            crop: zoom_crop 的裁剪参数 (x, y, w, h)，进缓存键；全图传 None。
 
         Returns:
             str: 识图描述文本；未配置或调用失败返回空串；拒识时返回提示
             文案（均不抛异常）。
         """
-        # 识图短时缓存命中检查（TTL=0 或缺少 URL/会话键时不启用）。
+        # 先解析 provider 与提示词：两者都进缓存键（改配置 ⇒ 旧描述不命中）。
+        provider_id = await self._resolve_vision_provider_id(event)
+        if not provider_id:
+            return ""
+        # 识图提示词：优先用用户配置的 vision_prompt（实时读取），空则回退
+        # 默认提示词。
+        prompt = self._live_vision_prompt() or _DEFAULT_VISION_PROMPT
+        # 识图短时缓存命中检查（TTL=0 或键成分不全时不启用）。
         ttl = int(getattr(self, "vision_cache_ttl", 0) or 0)
-        cache_key = self._vision_cache_key(page_url, event) if ttl > 0 else None
+        cache_key = (
+            self._vision_cache_key(
+                page_url,
+                event,
+                image_path,
+                kind=kind,
+                crop=crop,
+                prompt=prompt,
+                provider_id=provider_id,
+            )
+            if ttl > 0
+            else None
+        )
         if cache_key is not None:
             hit = self._vision_cache.get(cache_key)
             if hit is not None:
                 ts, cached_text = hit
                 if time.time() - ts <= ttl:
                     logger.debug(
-                        f"[{self.metadata_name}] 识图缓存命中（TTL={ttl}s）: {page_url}"
+                        f"[{self.metadata_name}] 识图缓存命中（TTL={ttl}s，"
+                        f"kind={kind}）: {page_url}"
                     )
                     return f"[缓存] {cached_text}"
                 del self._vision_cache[cache_key]
-        provider_id = await self._resolve_vision_provider_id(event)
-        if not provider_id:
-            return ""
-        # 识图提示词：优先用用户配置的 vision_prompt（实时读取），空则回退
-        # 默认提示词。
-        prompt = self._live_vision_prompt() or (
-            "请用中文描述这张网页截图的重点内容，包括主要文字、按钮、链接和页面结构。"
-        )
         try:
             # 延迟导入：沙箱/无 astrbot 包环境不触发。
             from astrbot.core.agent.message import (  # noqa: PLC0415

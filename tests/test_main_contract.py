@@ -83,7 +83,7 @@ EXPECTED_PARAMS = {
     "browse_click_coords": {"x": True, "y": True},
     "browse_hover": {"text": True},
     "browse_reload": {},
-    "browse_checkbox": {"selector": True, "checked": True},
+    "browse_checkbox": {"selector": True, "checked": True, "index": False},
     "browse_zoom_crop": {"x": True, "y": True, "width": True, "height": True},
     "browse_sniff_media": {"media_type": False, "max_items": False},
 }
