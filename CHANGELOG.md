@@ -61,14 +61,14 @@
   `PermissionError`）：`os.link` 优先（零拷贝）、失败回退 `shutil.copy2`、再失败
   返回原始路径并附"转发可能被拒绝"的提示。发布副本并入 `_cleanup_cache()`，随
   `limits.cache_days` 过期，不在 `data/temp` 无限增长。媒体块最多列 5 条路径。
-- **测试 E1–E9**：新增 `tests/test_background_engine.py`（36 条）覆盖默认 `off × plugin`
+- **测试 E1–E9**：新增 `tests/test_background_engine.py`（45 条）覆盖默认 `off × plugin`
   与 v1.5.0 逐字节一致、置标志矩阵、重载重放、探测三分支 fail-closed（含伪造"原始
   True / 包装 False"的两个变体）、互斥三条判据、C 返回体治理（前缀/截断/媒体块顺序、
   JSON 类工具永不进 C 执行体）、配置五方一致（45 叶）、媒体边界 A（发布根注入、
   `event.send` 零调用、发布失败回落、清理覆盖发布根）。同时同步既有 9 处断言与计数：
   叶数 `44 → 45`、`KEY_MAP` 的 `None` 映射 `19 → 20`、`V5_ONLY_PATHS` `3 → 4`、
   `tools` 组 `3 → 4` 叶、`TOOLS_KEYS` 补第 4 项，以及三处 docstring 里的键数。
-  门禁 **720 → 756 passed**（33 个测试文件），ruff clean。
+  门禁 **720 → 765 passed**（33 个测试文件），ruff clean。
 
 ### 前置条件与回滚（v1.6.0 必读）
 
@@ -78,7 +78,7 @@
 - 默认仍是 `background_mode=off` + `background_engine=plugin`，**行为与 v1.5.0 一致**。
 - 核心未修时 `engine=core` **自动拒绝并降级到 `plugin`，不会静默前台执行**。
 - **回滚两条路径，都不需要重启/重载**：①`tools.background_engine` 改回 `plugin`
-  （下一次工具调用生效，`browse_web` 回到插件引擎）；②`tools.background_mode` 改回
+  （下一次工具调用起生效，`browse_web` 回到插件引擎；**跨着切换那一刻的那次调用是不确定窗口**，可能一次重复投递，见「已知边界」）；②`tools.background_mode` 改回
   `off`（三工具全前台同步、标志清空）。可选止血：Dashboard 重载插件（新对象标志默认
   `False`，C 引擎立即失效；但在跑的核心后台任务不会被取消，重载前先 `/停止`）。
 - **核心修复上线前，生产不得把 `background_engine` 置 `core`**：未修时置 `core` 只会
@@ -93,7 +93,13 @@
 - 插件重载**不取消**核心持有的后台任务，也不补终态消息（止血用 `/停止` 或改回 `off`）；
 - 每完成一个任务**多一轮完整主模型调用**（结果进上下文 + 人格化交付的代价）；
 - 返回值是**摘录**（截断 + 固定不可信前缀），需要全文请走前台；
-- 媒体**不自动发**，模型不调 `send_message_to_user` 用户就收不到。
+- 媒体**不自动发**，模型不调 `send_message_to_user` 用户就收不到；
+- **引擎双向切换有不确定窗口**：核心按**旧** flag 提交的那一次调用，进入 handler 时
+  可能已读到新配置 ⇒ `core → plugin` 时该次调用会返回 `【已受理】` 并被唤醒轮当成
+  结果，同时插件另发一条终态消息（**两条消息，其中一条不是结果**）。面板保存插件配置
+  会重载插件（`astrbot/dashboard/services/config_service.py:1134-1135`）⇒ 窗口只跨
+  「保存那一刻在飞」的那次调用；规避：先 `mode=off` 走过一次调用窗口再改 `engine`，
+  或接受一次可能的重复投递并盯日志。
 
 ### 交付说明
 

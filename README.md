@@ -148,10 +148,10 @@ provider 模板字段（每份 7 个）：`enabled`（默认 true）、`name`（
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `tools.background_mode` | off | 三取值：`off`（三个工具都前台同步，与 v1.4.0 行为一致）/ `browse_only`（只把 `browse_web` 后台化）/ `all`（三个工具都后台化，**不推荐**）。写错的值按 `off` 处理并记一条 warning（fail-closed，不会让拼错的值变成后台） |
+| `tools.background_mode` | off | 三取值：`off`（三个工具都前台同步，与 v1.4.0 行为一致）/ `browse_only`（只把 `browse_web` 后台化）/ `all`（三个工具都后台化，**不推荐**）。**非空且不在上面三个取值里**的值按 `off` 处理并记一条 warning（fail-closed，不会让拼错的值变成后台）；留空（缺键 / `null` / 空串）视为未设置 ⇒ 按默认 `off`，**不告警** |
 | `tools.background_timeout` | 240 | 后台任务的**整任务**硬预算（秒，钳 30-900）。用满则中断并发一条「【后台任务超时】」终态消息（没有半成品时会明说「本次没有可用结果。」）；已在跑的任务用提交时快照，改配置不会把它中途掐断 |
 | `tools.background_max_chars` | 1500 | 终态消息正文的截断长度（字符，钳 200-8000），超出部分标注「…（完整结果已省略 N 字）」；媒体附件与消息头部不计入 |
-| `tools.background_engine` | plugin | 后台**机制**（v1.6.0，与 `background_mode` 正交）。`plugin`（默认）= v1.5.0 路线 D：插件自管任务、任务结束由插件单独发一条消息；`core` = 平台原生后台任务：只把 `browse_web` 的 `is_background_task` 置真，由核心派发、核心完成后唤醒一轮主 LLM 交付。写错的值按 `plugin` 处理并记一条 warning（fail-closed）。`core` **必须**先有核心一行修复 + 重启 `astrbot.service` + 运营方批准；核心未修时插件自动拒绝 `core`、记 ERROR 并回落 `plugin`（绝不静默前台）。`engine=core` 且 `background_mode=off` 时不探测、不告警（机制无关）。回滚把 `engine` 改回 `plugin`，止血把 `mode` 改回 `off`；`core` 只对 `browse_web` 生效（`browse_local_page` 与 `browser_web_search` 在 `core` 下仍前台同步，想让它们也后台化请把 `engine` 改回 `plugin`） |
+| `tools.background_engine` | plugin | 后台**机制**（v1.6.0，与 `background_mode` 正交）。`plugin`（默认）= v1.5.0 路线 D：插件自管任务、任务结束由插件单独发一条消息；`core` = 平台原生后台任务：只把 `browse_web` 的 `is_background_task` 置真，由核心派发、核心完成后唤醒一轮主 LLM 交付。取值大小写与首尾空白不敏感（` CORE ` → `core`，不告警）；**非空且不在 `plugin` / `core` 里**的值按 `plugin` 处理并记一条 warning（fail-closed）；留空（缺键 / `null` / 空串）视为未设置 ⇒ 按默认 `plugin`，**不告警**。`core` **必须**先有核心一行修复 + 重启 `astrbot.service` + 运营方批准；核心未修时插件自动拒绝 `core`、记 ERROR 并回落 `plugin`（绝不静默前台）。`engine=core` 且 `background_mode=off` 时不探测、不告警（机制无关）。回滚把 `engine` 改回 `plugin`，止血把 `mode` 改回 `off`；`core` 只对 `browse_web` 生效（`browse_local_page` 与 `browser_web_search` 在 `core` 下仍前台同步，想让它们也后台化请把 `engine` 改回 `plugin`） |
 
 > **不需要跑迁移器**：核心加载插件配置时会按 schema 自动补齐缺失的组/叶
 > （`Config key missing; added default.`），覆盖安装后配置里自动长出 `tools` 组
@@ -259,9 +259,11 @@ title + url + 摘要片段 ≤120 字）/ 其余条数的省略提示 / `备注�
 ### 回滚：把 `tools.background_mode` 改回 `off` 即回退（**无需重启、无需重载**）
 
 `off` 是默认值，也是**行为级回滚**：三个工具恢复前台同步，返回体与 v1.4.0 逐字节
-一致。每个工具入口第一行都会重读配置，所以面板改回 `off` 后**下一次工具调用**即
-生效，**不需要重载插件、不需要重启 AstrBot**；唯一残留是当时在跑的那个任务会照常
-跑完并按四态发一条终态消息。
+一致。每个工具入口第一行都会重读配置，所以改回 `off` 后**下一次工具调用**即
+生效，**不需要重启 AstrBot**；唯一残留是当时在跑的那个任务会照常跑完并按四态发一条
+终态消息。（面板保存插件配置本身会触发一次插件重载 —— 核心
+`astrbot/dashboard/services/config_service.py:1134-1135`；这里说的是「即使不重载也
+成立」的机制。切 `engine` 时的窗口见「热更新窗口」。）
 
 代码级回滚（把插件目录退回 v1.4.0）时，**配置与代码成对回退**：v1.4.0 不认识
 `tools` 组，核心会把这 4 个键当未知键删掉（`Config key removed`）—— 这是**预期
@@ -437,8 +439,8 @@ grep -c "【后台任务失败】\|【后台任务超时】\|【后台任务已�
 
 | 路径 | 操作 | 生效延迟 | 回滚后行为 |
 |---|---|---|---|
-| **R1** | `tools.background_engine` 改回 **`plugin`** | 下一次工具调用（窗口 = 1 次调用） | `browse_web` 回到插件引擎（`mode=browse_only`/`all` 时仍后台，但恢复"插件保证交付 + 结果不进上下文"） |
-| **R2** | `tools.background_mode` 改回 **`off`** | 同上 | 三个工具全前台同步（v1.4.0 行为），后台标志随之清空 |
+| **R1** | `tools.background_engine` 改回 **`plugin`** | 下一次工具调用起；**跨着改配置那一刻的那次调用是不确定窗口**（可能一次重复投递，见「热更新窗口」） | `browse_web` 回到插件引擎（`mode=browse_only`/`all` 时仍后台，但恢复"插件保证交付 + 结果不进上下文"） |
+| **R2** | `tools.background_mode` 改回 **`off`** | 同上（窗口内那次仍按旧值派发，但交付只有一条：真实结果） | 三个工具全前台同步（v1.4.0 行为），后台标志随之清空 |
 
 两条都**不需要重启、不需要重载插件**：每个工具入口第一行重读配置。
 **R3（可选止血）**：Dashboard 重载插件 ⇒ 新注册对象的 `is_background_task` 默认
@@ -470,13 +472,48 @@ grep -c "【后台任务失败】\|【后台任务超时】\|【后台任务已�
 6. **媒体不自动发**：模型不调 `send_message_to_user`，用户就收不到媒体（日志只有一条
    `nothing was sent to the user` 的 WARNING，属框架行为，不是投递失败）。
 
-### 热更新窗口：改 `engine`/`mode` 只保证「下一次调用起」生效
+### 热更新窗口：跨着改配置那一刻的那次调用，可能仍按旧值派发
 
 核心在调用 handler **之前**读 `tool.is_background_task`（`astr_agent_tool_exec.py:171`），
-而标志是插件在**上一次**调用入口改的 ⇒ 改配置后的**那一次**调用仍可能按旧值派发；
-从**下一次**调用起才稳定。刚置 `core` 的那一次若按前台派发，执行体在前台跑完并返回
-"前缀 + 截断正文"（不发媒体、不发 `【已受理】`）—— 这是热更新的固有延迟，不是静默降级。
-要更硬的止血：Dashboard 重载插件（新对象默认 `False`），或 `/停止`。
+而标志是插件在**上一次**调用入口改的 ⇒ 改配置后的**那一次**调用仍可能按旧值派发。
+两个方向的后果**不对称**，切换前要知道：
+
+**方向一（`plugin → core`）**：刚置 `core` 的那次若按前台派发，执行体在前台跑完并返回
+"不可信前缀 + 截断正文"（不发媒体、不发 `【已受理】`）—— 只是"延迟一次调用才真正后台"，
+不会多出消息。
+
+**方向二（`core → plugin`，回滚 R1 走的就是这条）**：后果比"延迟一次"明显。核心已经按
+**旧** flag 把任务提交了、并回了「已提交」回执；而 handler 进入时读到的是**新**配置
+（`engine=plugin`）：
+
+- `mode` 仍不是 `off`（`browse_only` / `all`）时：handler 走**插件后台**分支、返回
+  `【已受理】` + `task_id` ⇒ 这段文字成了**唤醒轮看到的工具结果**（它可能把"已受理"
+  当成结果汇报给用户）；同时插件那条后台任务若没被同一次重载取消，还会另发一条四态
+  终态消息 ⇒ **用户可能看到两条消息，其中一条不是结果**（是「已受理」）；
+- `mode=off` 时：handler 在前台跑完，把**真实结果**作为工具结果交给唤醒轮（只有一条
+  消息），但那一次调用实际上**仍然走了核心后台**（你以为切回前台了，其实那次是后台交付）。
+
+`<TODO>`：上面两个分支的**运行期**表现未在真实会话里实测（需核心一行补丁上线后另单
+采证）；下面"为什么窗口窄"是按核心源码判读的，不是实测。
+
+**为什么窗口窄**：面板保存**插件**配置会触发一次插件重载 —— 核心
+`astrbot/dashboard/services/config_service.py:1134-1135` 在 `save_config()` 之后立刻
+`plugin_manager.reload(<插件名>)`（同一段 `:1145` 的接口返回文案即「机器人正在热重载插件。」）⇒
+重载会 `terminate()`（取消插件自己在跑的任务）、新注册对象的 `is_background_task`
+默认 `False`、再由 `initialize()` 按新配置强探重放。所以不确定窗口只覆盖
+**工具集已在保存前装配、handler 在保存后才进入**的那一次调用。
+`<TODO>`：面板保存瞬间是否恰好有并发在跑的任务，未实测。
+
+**规避（按顺序做最省事）**：
+
+1. 要切换引擎时，**先把 `mode` 调成 `off`**，等一次调用窗口（或等重载完成）再改
+   `engine` —— 这样越过窗口的那次调用既不会产生插件终态消息，也不会把「已受理」
+   交给唤醒轮；
+2. 或者接受一次可能的重复投递：改完盯两条日志
+   （`后台引擎=core（原生后台任务）` / `tools.background_engine=core 拒绝启用`），并看
+   用户侧有没有出现「【已受理】…」式的回复 —— 出现了就是撞上窗口，属**预期**，不是 bug；
+3. 最硬的止血：先 `/停止` 取消该会话在跑的任务，再改配置；需要新对象立即生效时，
+   Dashboard 重载插件（新对象默认 `False`，C 引擎立即失效）。
 
 ### 日志判据（只看两条）
 
@@ -660,10 +697,10 @@ text_image）。全文本子代理（前端/测试/工程等）读取本地 HTML
 
 ```bash
 cd astrbot_plugin_browser_llm
-PYTHONDONTWRITEBYTECODE=1 python -m pytest tests/ -q -p no:cacheprovider   # 756 passed（2026-10-25）
+PYTHONDONTWRITEBYTECODE=1 python -m pytest tests/ -q -p no:cacheprovider   # 765 passed（2026-10-25）
 ```
 
-测试覆盖（33 个文件 / 756 条）：
+测试覆盖（33 个文件 / 765 条）：
 
 - **工具契约**：`browse_web` / `browse_local_page` / `browser_web_search` 的 docstring
   与注册一致性、参数类型、入口装饰器白名单（`test_main_contract.py`、
@@ -683,7 +720,7 @@ PYTHONDONTWRITEBYTECODE=1 python -m pytest tests/ -q -p no:cacheprovider   # 756
   搜索工具黑名单会话）、搜索终态的人读化与 `status` 映射（H1/H2）、`artifact_sink`
   只允许出现在任务体内的 AST 守卫、投递异常后仍能再次提交（R7）；另有受理/拒绝/终态
   文案、六前缀互斥、截断、登记表纯单测。
-- **双引擎链路**（v1.6.0 新增 `test_background_engine.py`，36 条）：E1 默认 `off × plugin`
+- **双引擎链路**（v1.6.0 新增 `test_background_engine.py`，45 条）：E1 默认 `off × plugin`
   与 v1.5.0 逐字节一致 + `resolve_effective_engine` 真值表；E2 置标志矩阵
   （`engine=core` 下只有 `browse_web` 置真，`all × core` 也不放开 L/S；`off`/`plugin`
   从不探测）；E3 重载重放（`func_list` 重建后新对象仍置真、入口触发的置位、同签名
