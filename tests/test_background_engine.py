@@ -752,7 +752,7 @@ def test_e6_render_c_media_block_is_bounded():
 ENGINE_PATH = "tools.background_engine"
 
 
-def test_e7_config_five_way_consistency_45_leaves():
+def test_e7_config_five_way_consistency_54_leaves():
     """schema ⇄ KEY_MAP ⇄ 读取点 ⇄ 迁移器 ⇄ V5_ONLY_PATHS 五方一致。"""
     leaf = SCHEMA["tools"]["items"]["background_engine"]
     assert set(SCHEMA["tools"]["items"]) == {
@@ -771,9 +771,9 @@ def test_e7_config_five_way_consistency_45_leaves():
     assert "browser_web_search" in leaf["hint"]
     assert "只对 browse_web 生效" in SCHEMA["tools"]["hint"]
 
-    # 叶数 44 → 45
-    assert len(schema_paths()) == 45
-    assert len(KEY_MAP) == 45
+    # 叶数 44 → 45 → 54（v1.7.0 配置结构 v5：+search.mode +agent 组 8 叶）
+    assert len(schema_paths()) == 54
+    assert len(KEY_MAP) == 54
     assert schema_paths() == set(KEY_MAP)
     assert len(V5_ONLY_PATHS) == 4
     assert ENGINE_PATH in V5_ONLY_PATHS

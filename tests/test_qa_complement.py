@@ -220,6 +220,29 @@ def test_max_chars_invalid_str_breaks_tool():
     assert "【错误】" in result
 
 
+#: **T3 引入、T4 收口的读取点缺口**（只允许这一个组，且只能缩小）。
+#: v1.7.0 配置结构 v5 新增 ``agent`` 组，读取点由 T4 在 ``_load_config`` 里补
+#: （``self.agent_provider_id`` 等 8 个属性 + ``search.mode``）；T3 的边界是
+#: "只写 schema / config_map / 迁移器，不写 main.py"，因此这里显式登记缺口。
+#: ``test_pending_read_groups_is_a_shrinking_allowlist`` 钉住它不许变成垃圾桶：
+#: 一旦 T4 补上读取点，这条会红，届时把集合清空即可。
+PENDING_READ_GROUPS: set[str] = {"agent"}
+
+
+def test_pending_read_groups_is_a_shrinking_allowlist():
+    """缺口集合只能是 schema 里真实存在、且零读取点的组（不许顺手塞别的）。"""
+    from core.config_map import GROUPS
+
+    schema_path = Path(__file__).resolve().parent.parent / "_conf_schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    assert PENDING_READ_GROUPS <= set(GROUPS), "缺口必须是已声明的组"
+    assert PENDING_READ_GROUPS <= set(schema), "缺口必须真的在 schema 里"
+    assert PENDING_READ_GROUPS == {"agent"}, (
+        "缺口集合只允许 {agent}（T4 收口）；新增缺口说明有人在 schema 里"
+        "加了没人读的组"
+    )
+
+
 def test_conf_schema_keys_match_load_config():
     """_conf_schema.json 的**顶层组名**与 _load_config 读取的组双向一致。
 
@@ -242,9 +265,11 @@ def test_conf_schema_keys_match_load_config():
     dotted |= set(re.findall(r'view\.lookup\(\s*"([^"]+)"', load_section))
     code_groups = {path.split(".", 1)[0] for path in dotted if "." in path}
 
-    assert schema_keys == code_groups, (
-        f"schema 顶层组与代码读取组不一致。仅 schema 有: {schema_keys - code_groups}；"
-        f"仅代码读: {code_groups - schema_keys}"
+    assert schema_keys == code_groups | PENDING_READ_GROUPS, (
+        f"schema 顶层组与代码读取组不一致。仅 schema 有: "
+        f"{schema_keys - code_groups - PENDING_READ_GROUPS}；"
+        f"仅代码读: {code_groups - schema_keys}；"
+        f"已登记待补(T4): {PENDING_READ_GROUPS}"
     )
 
 

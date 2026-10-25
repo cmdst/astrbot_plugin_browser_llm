@@ -167,7 +167,7 @@
   "perception": {
     "type": "object",
     "description": "页面感知与识图",
-    "hint": "截图、识图模型、感知方式与会话级规则。",
+    "hint": "截图、识图模型、感知方式与会话级规则。**v1.7.0 起语义收窄**：截图默认以原生图片直达内层多模态模型（见「内嵌多模态子代理」组），本组的 vision_provider_id / vision_prompt / vision_cache_ttl 三项只在「内层模型不支持图片」时的 caption 兜底路径生效——它们仍然有用（文本模型也能「看图」），但不再是截图进入模型的唯一通道。",
     "items": {
       "enable_screenshot": {
         "type": "bool",
@@ -229,13 +229,13 @@
         "options": [
           ""
         ],
-        "hint": "下拉选择多模态模型对截图做识图总结；留空则截图仅发用户不做识图。下拉选项自动同步 AstrBot 已配置的聊天模型 Provider（插件启动时与每次识图调用时刷新，无需手动编辑本文件）；若列表中没有你的识图模型，请先在 AstrBot 模型配置中添加对应 Provider。",
+        "hint": "**v1.7.0 语义收窄**：默认情况下截图以**原生图片**直达内层多模态模型（等效于内层模型自己「看」），本项只在**内层模型不支持图片**时作为 caption 兜底——先把截图识别成文字描述，再喂给内层模型。留空 = 不做兜底（此时截图仅发给用户，不进模型）。下拉选项自动同步 AstrBot 已配置的聊天模型 Provider（插件启动时与每次识图调用时刷新，无需手动编辑本文件）；若列表中没有你的识图模型，请先在 AstrBot 模型配置中添加对应 Provider。",
         "default": ""
       },
       "vision_prompt": {
         "type": "string",
         "description": "识图提示词模板",
-        "hint": "发给多模态模型的识图提示词，可自定义以提升识图准确性。留空使用默认提示词",
+        "hint": "caption 兜底路径（见上一条 vision_provider_id：只在「内层模型不支持图片」时生效）发给多模态模型的识图提示词。想提升兜底准确率就改这里；留空使用默认提示词。",
         "editor_mode": true,
         "editor_language": "text",
         "editor_theme": "vs-light",
@@ -244,7 +244,7 @@
       "vision_cache_ttl": {
         "type": "int",
         "description": "识图缓存时间（秒）",
-        "hint": "同一 URL 页面在缓存时间内重复截图识图直接复用上次结果（省识图耗时与 token，返回文本带 [缓存] 前缀）；0 表示关闭缓存。缓存键 = 规范化 URL（去 fragment/尾斜杠）+ 会话 UMO，插件重载/禁用时清空",
+        "hint": "caption 兜底结果的缓存时间（秒）；0 = 关闭缓存（不读也不写）。v1.6.1 起缓存键 = 会话 UMO + 截图**图像内容哈希** + 工具种类 + 裁剪参数 + 提示词哈希 + Provider id，因此同一 URL 下的不同画面（以及局部裁剪与整屏截图）不会互相串号——这是 2026-10-26 那次「识图结果张冠李戴」事故的修复。v1.7.0 的影像原生路径不产生 caption，天然不受本项影响。插件重载/禁用时清空。",
         "default": 60
       }
     }
@@ -596,6 +596,16 @@
         "description": "搜索与抓取代理",
         "hint": "搜索 API 请求与结果正文抓取使用的代理，如 http://127.0.0.1:7890；留空直连。与「浏览器基础」里的浏览器代理相互独立（后者只给 Playwright）。",
         "default": ""
+      },
+      "mode": {
+        "type": "string",
+        "description": "搜索挂载层级（v1.7.0）",
+        "options": [
+          "external",
+          "internal"
+        ],
+        "hint": "external=池搜索挂在外层工具 browser_web_search，主 LLM 直接调用（默认，与 v1.6.0 行为逐字节一致；内层子代理只有打开引擎结果页的 browse_search）；internal=池搜索挂在内层工具 browse_web_search，由内层子代理调用，外层 browser_web_search 强制停用（模型看不到它），主 LLM 只能通过 browse_web 委派。两档互斥，不做「同时都有」：同时有会让主 LLM 与内层都去搜、结果重复、token 翻倍，还多一个「该用哪个」的决策面。两种模式共用同一个搜索服务实例（冷却与结果缓存跨模式共享）。写错的值按 external 处理并记 warning（fail-closed）。本项与「工具执行方式」的后台两键正交：后台两键管外层工具怎么跑，本项管搜索工具挂在哪一层。",
+        "default": "external"
       }
     }
   },
@@ -636,6 +646,69 @@
         ],
         "default": "plugin",
         "hint": "plugin=插件自管后台（v1.5.0 路线 D：工具入口立刻返回【已受理】，任务跑完由插件单独发一条消息；交付确定，但结果不进主模型上下文）。core=平台原生后台任务（工具标 is_background_task，由核心派发、核心在完成后唤醒一轮主 LLM 交付；结果进上下文，但依赖模型调 send_message_to_user，且需要核心修复 + 重启）。core 只对 browse_web 生效：browse_local_page 永久排除（路径校验是安全相关，必须同步拒绝）、browser_web_search 排除（1-3 秒的任务后台化净亏一轮模型调用）。engine=core 但核心未修（包装器不镜像 is_background_task）时自动拒绝 core、记一条 ERROR 并回落到 plugin；绝不静默前台。engine=core 且 background_mode=off 时不探测、不告警（机制无关）。默认 plugin ⇒ 与 v1.5.0 行为一致；回滚把 engine 改回 plugin（下一次工具调用生效，无需重启/重载），止血把 background_mode 改回 off。"
+      }
+    }
+  },
+  "agent": {
+    "type": "object",
+    "description": "内嵌多模态子代理（v1.7.0）",
+    "hint": "本组配置的是 browse_web 内部那个跑「工具调用循环」的子代理（内层模型），不是主 LLM。v1.7.0 起主 LLM 只做委派：把任务连同 URL 交给 browse_web，由内层模型自己开页面、点元素、读正文、识图，最终把结论交回。默认值保证行为与 v1.6.0 逐字节一致：provider_id 留空=继承当前会话的模型，persona_mode=default=内层只有工具提示词。注意本组多数键是「下次调用生效」（面板保存即热更新），不需要重启。",
+    "items": {
+      "provider_id": {
+        "type": "string",
+        "description": "内层子代理模型 Provider ID",
+        "options": [
+          ""
+        ],
+        "hint": "留空=继承当前会话的模型（等于 v1.6.0 行为；这种方式下无法挑模型）。下拉只列 AstrBot 已配置、且声明了「多模态 + 支持工具调用」的聊天 Provider，插件会在启动后若干秒内与每次识图同类时机刷新，无需手改本文件；列表里没有目标模型就先去 AstrBot 模型配置里添加。内层子代理需要函数调用能力：所选模型声明了 modalities 却不含 tool_use 时插件会【错误】拒绝执行（核心会静默清空工具集，表现为「我无法浏览」，属最坏的静默失败）。所选模型只支持文本时走「页面感知与识图」组的 vision_provider_id 做 caption 兜底，返回体首行会加【注意】。显式指定却未加载（被删/禁用/改名）时同样【错误】拒绝，**不会**静默换成别的模型。",
+        "default": ""
+      },
+      "persona_mode": {
+        "type": "string",
+        "description": "内层人格档位",
+        "options": [
+          "default",
+          "current",
+          "custom"
+        ],
+        "hint": "default=内层只有工具提示词，不含任何人格（默认，与 v1.6.0 行为逐字节一致）；current=把当前会话生效人格的提示词（截断到 2000 字符）注入内层，让子代理说话像当前人格，但不继承该人格的工具/技能白名单；custom=使用下面的「内层自定义人格提示词」（≤4000 字符）。三档只影响语气与表达风格，不改变红线、工具清单与输出契约——分层顺序把红线放在最前并声明不可覆盖，人格层无法插入自己的工具说明来改写工具清单。写错的值按 default 处理并记 warning（fail-closed）。",
+        "default": "default"
+      },
+      "persona_prompt": {
+        "type": "text",
+        "description": "内层自定义人格提示词（custom 档专用）",
+        "hint": "仅 persona_mode=custom 时生效；≤4000 字符，超出按 4000 截断。default / current 两档忽略本项。写角色口吻、措辞习惯、报告风格即可——不要在这里写工具清单或安全规则（那些由插件固定的工具层与红线层负责，本项改不动它们）。",
+        "default": ""
+      },
+      "task_timeout": {
+        "type": "int",
+        "description": "内层整任务硬上限（秒）",
+        "hint": "60-1800，默认 600。整个内层任务（含全部多步工具调用）的硬上限，到点中止并返回【错误】…（已完成 k 步，见台账）。三层超时互不替代：单步上限是「资源与步数限制」组的 agent_tool_timeout（核心抛一条工具超时错误，内层循环继续、模型可自救）；内层整任务上限是本项；后台整任务是「工具执行方式」组的 background_timeout（后台模式下若它比本项小，则后台先中止并发终态消息，这是预期行为）。按「单步耗时 × 预计步数」估：多步表单/连续翻页建议 600-900。",
+        "default": 600
+      },
+      "image_max_side": {
+        "type": "int",
+        "description": "截图交给内层模型的最长边（像素）",
+        "hint": "320-2048，默认 1280。截图/裁剪交给内层模型前按最长边等比缩放。越小越省 token，越大越能看清小字与图标；识别密集文字的区域时，请改用 browse_zoom_crop 放大局部而不是一味调大本项。",
+        "default": 1280
+      },
+      "image_quality": {
+        "type": "int",
+        "description": "截图 JPEG 质量（40-95）",
+        "hint": "40-95，默认 80。与「最长边」共同决定图片体积。单图 base64 超过 1,500,000 字符（约 1.1 MB 原图）时会再压一半；仍超则丢弃该图片，并在文本里注明「图片过大已省略，请用 browse_get_text 或缩小裁剪区域」。",
+        "default": 80
+      },
+      "result_max_chars": {
+        "type": "int",
+        "description": "单个工具结果返回内层模型的文本上限（字符）",
+        "hint": "500-20000，默认 3000。内层每个工具返回给内层模型的文本上限，超出按此截断并标注「…（已截断 N 字）」，图片不受本项限制。累计返回超过 limits.agent_max_steps × 本项（默认 70×3000=210,000 字符）后，后续结果压缩到 800 字符并加【预算】前缀，防止一次长任务把上下文吃满。",
+        "default": 3000
+      },
+      "ledger_max_lines": {
+        "type": "int",
+        "description": "执行台账最大行数（0=不附）",
+        "hint": "0-60，默认 24；0 表示不附台账。执行台账是本次任务「调了哪些工具、参数是什么、结果如何」的确定性清单，由插件按实际调用顺序生成、附在 browse_web 返回值末尾（不依赖模型自述）。它的用途是避免收尾失真：模型说「我点了提交」但台账里没有对应的 click 行时，一眼就能看出来。行数按最近 N 步截断。",
+        "default": 24
       }
     }
   }

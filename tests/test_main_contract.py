@@ -418,7 +418,7 @@ def test_new_configs_in_schema():
     import json
     schema = json.loads((_ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
     assert set(schema) == {
-        "browser", "limits", "security", "perception", "search", "tools"}
+        "browser", "limits", "security", "perception", "search", "tools", "agent"}
     for group in schema.values():
         assert group["type"] == "object"
 
@@ -441,10 +441,12 @@ def test_new_configs_in_schema():
     assert perception["vision_cache_ttl"]["type"] == "int"
     assert perception["vision_cache_ttl"]["default"] == 60
 
-    # ---- v4：search 组（16 键 + 5 provider 模板） ----
+    # ---- v4：search 组（16 键 + 5 provider 模板）；v1.7.0 追加 mode => 17 ----
     search = schema["search"]
     assert search["type"] == "object"
-    assert len(search["items"]) == 16, sorted(search["items"])
+    assert len(search["items"]) == 17, sorted(search["items"])
+    assert search["items"]["mode"]["options"] == ["external", "internal"]
+    assert search["items"]["mode"]["default"] == "external"
     providers = search["items"]["providers"]
     assert providers["type"] == "template_list"
     assert providers["default"] == []
