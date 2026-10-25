@@ -29,6 +29,7 @@ import asyncio
 import importlib.util
 import json
 import re
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -931,3 +932,326 @@ def test_e9_cleanup_cache_covers_publish_root(monkeypatch, tmp_path):
     assert plugin._cleanup_cache() == 1
     assert not stale.exists()
     assert not sub.exists(), "清空的发布分目录应一并删除"
+
+
+# ====================================================================
+# t7 返工（review F3/F4 + t4 弱覆盖 ②⑤⑥）：变异可证的分支覆盖
+# ====================================================================
+#
+# 为什么单独一段：F3/F4 是 t5 用变异测试证明过的覆盖洞——把对应代码改坏，整仓
+# 仍然全绿。这里的每条用例都对应一处**具体分支**，把该分支改成 fail-open /
+# 删掉那道闸，用例就会红（t7 的提交信息里附了变异证据）。
+#
+# 覆盖对照：
+#   F3-a  get_full_tool_set() 抛异常           → tool_set_raises
+#   F3-b  包装对象缺 is_background_task 属性    → wrapper_without_flag
+#         _wrapped 指向别人的对象（同名冲突）    → wrapper_wrapping_foreign_object
+#   F3-c  get_llm_tool_manager() 取不到/Return None → no_tool_manager / manager_returns_none
+#   F3-d  同名工具属别人（clash，只 warning 一次） → clashing_tool_from_other_plugin
+#   F3-1  func_list 里没有自家工具（C-1）        → raw_tool_missing
+#   F4    all×core 下 L/S 入口级前台 + plugin×all 反向对照
+#   ②     C 模式真实 asyncio.wait_for 超时       → c_mode_budget_timeout
+
+
+class NoAttributeWrapper:
+    """包装器**缺** ``is_background_task`` 属性（更旧/被替换的核心实现）。"""
+
+    def __init__(self, tool):
+        self.name = tool.name
+        self._wrapped = tool
+        self.active = True
+
+
+class ImpostorWrapper:
+    """``_wrapped`` 指向**别人**的同名对象 ⇒ 必须判"同名冲突"（不能当自家工具）。"""
+
+    def __init__(self, tool):
+        self.name = tool.name
+        self._wrapped = FakeRawTool(tool.name, module="other_plugin.main")
+        # 故意给 True：若实现跳过身份校验，就会误判成"可用"（正是 fail-open 形状）
+        self.is_background_task = True
+
+
+class RaisingToolSetManager(FakeToolManager):
+    """``get_full_tool_set()`` 抛异常（核心实现被替换/初始化未完成）。"""
+
+    def get_full_tool_set(self):
+        self.calls += 1
+        raise RuntimeError("get_full_tool_set 炸了")
+
+
+class NoneToolManagerContext(FakeContext):
+    """``get_llm_tool_manager()`` 存在但返回 ``None``（桩/半初始化）。"""
+
+    def get_llm_tool_manager(self):
+        return None
+
+
+def assert_failclosed(plugin, ctx, tools, logger_recorder) -> None:
+    """四个探测失败分支共用断言：拒绝 core + ERROR + 清 flag + 回落 plugin 后台。
+
+    "回落 plugin" 的可观测形状（规格 §3.5 第 2 级，**不是**静默前台）：
+    返回体是【已受理】+ 插件登记表有 1 项，而不是子代理真实浏览结果。
+    """
+    assert plugin.background_engine_effective == "plugin"
+    assert not any(flags_of(tools)), f"降级后不得留下任何 flag：{flags_of(tools)}"
+    assert _BG_ENGINE_REFUSED in "\n".join(logger_recorder.lines("error"))
+
+    async def flow():
+        ret = await plugin.browse_web(FakeEvent(), "任务")
+        assert ret != ctx.reply, "拒绝 core 后不得静默前台跑出真实浏览结果"
+        assert ret.startswith(ACCEPTED_HEADER), f"必须回落 plugin 后台：{ret[:80]}"
+        assert len(plugin._background) == 1
+        match = re.search(r"task_id=(bg-\d+)", ret)
+        await plugin._background.task_of(match.group(1))
+
+    run(flow())
+
+
+def test_e4_raw_tool_missing_is_unusable(monkeypatch, logger_recorder):
+    """C-1：``func_list`` 里找不到自家原始工具（注册未完成 / 被别人顶掉）。"""
+    install_func_list(monkeypatch, [])
+    ctx = FakeContextWithTools(FakeToolManager([], MirrorsFlagWrapper))
+    plugin = make_plugin(config("browse_only", "core"), ctx)
+
+    assert plugin._sync_background_engine(force_probe=True) == "plugin"
+    assert "找不到本插件的原始工具" in plugin._bg_probe_reason
+    assert _BROWSE_WEB_TOOL_NAME in plugin._bg_probe_reason
+    assert_failclosed(plugin, ctx, [], logger_recorder)
+
+
+def test_e4_tool_set_raises_is_unusable(monkeypatch, logger_recorder):
+    """C-3：``get_full_tool_set()`` 抛异常 ⇒ 不可用（**不得** fail-open 成可用）。"""
+    tools = fake_tools()
+    tmgr = RaisingToolSetManager(tools, MirrorsFlagWrapper)
+    install_func_list(monkeypatch, tools)
+    ctx = FakeContextWithTools(tmgr)
+    plugin = make_plugin(config("browse_only", "core"), ctx)
+
+    assert plugin._sync_background_engine(force_probe=True) == "plugin"
+    assert "get_full_tool_set() 抛错" in plugin._bg_probe_reason
+    assert tmgr.calls == 1
+    assert_failclosed(plugin, ctx, tools, logger_recorder)
+
+
+def test_e4_wrapper_without_flag_is_unusable(monkeypatch, logger_recorder):
+    """C-4：包装对象**没有** ``is_background_task`` 属性 ⇒ 不可用。"""
+    tools = fake_tools()
+    tmgr = FakeToolManager(tools, NoAttributeWrapper)
+    install_func_list(monkeypatch, tools)
+    ctx = FakeContextWithTools(tmgr)
+    plugin = make_plugin(config("browse_only", "core"), ctx)
+
+    assert plugin._sync_background_engine(force_probe=True) == "plugin"
+    assert "没有 is_background_task 属性" in plugin._bg_probe_reason
+    assert_failclosed(plugin, ctx, tools, logger_recorder)
+
+
+def test_e4_wrapper_wrapping_foreign_object_is_unusable(monkeypatch, logger_recorder):
+    """``_wrapped`` 不是本插件的原始对象 ⇒ 同名冲突 ⇒ 不可用（即使 flag 是 True）。"""
+    tools = fake_tools()
+    tmgr = FakeToolManager(tools, ImpostorWrapper)
+    install_func_list(monkeypatch, tools)
+    ctx = FakeContextWithTools(tmgr)
+    plugin = make_plugin(config("browse_only", "core"), ctx)
+
+    assert plugin._sync_background_engine(force_probe=True) == "plugin"
+    assert "同名冲突" in plugin._bg_probe_reason
+    assert_failclosed(plugin, ctx, tools, logger_recorder)
+
+
+def test_e4_manager_returns_none_is_unusable(monkeypatch, logger_recorder):
+    """``get_llm_tool_manager()`` 返回 ``None``（存在但没初始化）⇒ 不可用。"""
+    tools = fake_tools()
+    install_func_list(monkeypatch, tools)
+    ctx = NoneToolManagerContext()
+    plugin = make_plugin(config("browse_only", "core"), ctx)
+
+    assert plugin._sync_background_engine(force_probe=True) == "plugin"
+    assert "返回 None" in plugin._bg_probe_reason
+    assert_failclosed(plugin, ctx, tools, logger_recorder)
+
+
+def test_e4_clashing_tool_from_other_plugin_is_skipped(monkeypatch, logger_recorder):
+    """同名工具**属于别人**：跳过且只 warning 一次，绝不碰别人的对象。"""
+    foreign = FakeRawTool(_BROWSE_WEB_TOOL_NAME, module="other_plugin.main")
+    own_local, own_search = FakeRawTool(_LOCAL_PAGE_TOOL_NAME), FakeRawTool(
+        _SEARCH_TOOL_NAME
+    )
+    tools = [foreign, own_local, own_search]
+    install_func_list(monkeypatch, tools)
+    ctx = FakeContextWithTools(FakeToolManager(tools, MirrorsFlagWrapper))
+    plugin = make_plugin(config("browse_only", "core"), ctx)
+
+    assert plugin._sync_background_engine(force_probe=True) == "plugin"
+    assert "找不到本插件的原始工具" in plugin._bg_probe_reason
+    assert foreign.is_background_task is False, "绝不置位别人的对象"
+
+    clash_warnings = [
+        line
+        for line in logger_recorder.lines("warning")
+        if "不属于本插件" in line and _BROWSE_WEB_TOOL_NAME in line
+    ]
+    assert len(clash_warnings) == 1, clash_warnings
+    # 热路径会反复扫 func_list：同名冲突的 warning 必须只记一次（不刷屏）
+    plugin._own_llm_tools()
+    plugin._own_llm_tools()
+    assert (
+        len(
+            [
+                line
+                for line in logger_recorder.lines("warning")
+                if "不属于本插件" in line
+            ]
+        )
+        == 1
+    )
+    assert_failclosed(plugin, ctx, tools, logger_recorder)
+
+
+# --------------------------------------------------------------------
+# F4：all×core 下 L/S 的**入口级**行为（唯一让"两引擎不同时生效"成真的那道闸）
+# --------------------------------------------------------------------
+
+
+def _all_core_plugin(monkeypatch, logger_recorder):
+    tools = fake_tools()
+    tmgr = FakeToolManager(tools, MirrorsFlagWrapper)
+    install_func_list(monkeypatch, tools)
+    cfg = config("all", "core")
+    cfg["search"] = {"enabled": True}
+    plugin = make_plugin(cfg, FakeContextWithTools(tmgr))
+    assert plugin._sync_background_engine(force_probe=True) == "core"
+    return plugin, tools
+
+
+def test_f4_all_core_local_page_and_search_stay_foreground(
+    monkeypatch, logger_recorder, tmp_path
+):
+    """``all × core``：L/S **走前台**——无【已受理】、无四态前缀、登记表恒空。
+
+    这道闸就是 ``_background_enabled_for`` 的第一条（core ⇒ 恒 False）。删掉它，
+    L/S 会回落 plugin 后台、返回【已受理】，本用例立刻红。
+    """
+    plugin, tools = _all_core_plugin(monkeypatch, logger_recorder)
+
+    submit_calls: list[dict] = []
+
+    async def spy(**kwargs):
+        submit_calls.append(kwargs)
+        raise AssertionError("core 生效时不得走 plugin 后台（两引擎互斥）")
+
+    plugin._submit_background = spy  # type: ignore[assignment]
+
+    target = tmp_path / "page.html"
+    target.write_text("<html><body>hi</body></html>", encoding="utf-8")
+    monkeypatch.setattr(plugin, "_resolve_local_page_target", lambda path: (target, ""))
+
+    async def fake_render(event, tgt, full_page, wait_ms, mode, progress=None):
+        return "本地页渲染结果：示例标题"
+
+    async def fake_search(event, **kwargs):
+        return json.dumps(
+            {"status": "ok", "query": "q", "results": [], "attempts": []},
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr(plugin, "_local_page_render", fake_render)
+    monkeypatch.setattr(plugin, "_run_browser_web_search", fake_search)
+
+    async def flow():
+        local = await plugin.browse_local_page(FakeEvent(), path=str(target))
+        search = await plugin.browser_web_search(FakeEvent(), query="测试")
+        assert len(plugin._background) == 0, "core 生效时登记表必须恒空"
+        assert plugin._background.active_job(UMO) is None
+        return local, search
+
+    local, search = run(flow())
+    assert submit_calls == [], "L/S 都不得调用 _submit_background"
+    assert local == "本地页渲染结果：示例标题", "L 必须返回前台真实结果"
+    assert ACCEPTED_HEADER not in local
+    assert all(header not in local for header in HEADERS.values())
+    payload = json.loads(search)
+    assert payload["status"] == "ok", "S 仍是前台 JSON 契约（不是【已受理】）"
+    assert ACCEPTED_HEADER not in search
+    assert flags_of(tools) == [True, False, False], "只有 browse_web 置真，L/S 恒假"
+
+
+def test_f4_plugin_all_still_backgrounds_local_page_and_search(
+    monkeypatch, logger_recorder, tmp_path
+):
+    """反向对照（防过度抑制）：``all × plugin`` 下 L/S **会**返回【已受理】。"""
+    tools = fake_tools()
+    install_func_list(monkeypatch, tools)
+    cfg = config("all", "plugin")
+    cfg["search"] = {"enabled": True}
+    plugin = make_plugin(cfg, FakeContextWithTools(FakeToolManager(tools)))
+
+    target = tmp_path / "page.html"
+    target.write_text("<html></html>", encoding="utf-8")
+    monkeypatch.setattr(plugin, "_resolve_local_page_target", lambda path: (target, ""))
+
+    local_event = FakeEvent()
+    local_event.unified_msg_origin = "aiocqhttp:GroupMessage:100001"
+    search_event = FakeEvent()
+    search_event.unified_msg_origin = "aiocqhttp:GroupMessage:100002"
+
+    async def flow():
+        # 用一道闸把两个后台任务卡在"在跑"状态，才能可靠断言登记表有 2 项
+        # （任务跑完就出表，task_of 会返回 None）。
+        gate = asyncio.Event()
+
+        async def gated_render(event, tgt, full_page, wait_ms, mode, progress=None):
+            await gate.wait()
+            return "后台渲染结果"
+
+        async def gated_search(event, **kwargs):
+            await gate.wait()
+            return json.dumps({"status": "ok", "query": "q", "results": []})
+
+        monkeypatch.setattr(plugin, "_local_page_render", gated_render)
+        monkeypatch.setattr(plugin, "_run_browser_web_search", gated_search)
+
+        local = await plugin.browse_local_page(local_event, path=str(target))
+        search = await plugin.browser_web_search(search_event, query="测试")
+        assert len(plugin._background) == 2, "plugin×all 下两个工具都该登记"
+        tasks = [job.task for job in plugin._background.running()]
+        gate.set()
+        await asyncio.gather(*tasks)
+        return local, search
+
+    local, search = run(flow())
+    assert local.startswith(ACCEPTED_HEADER), local
+    assert search.startswith(ACCEPTED_HEADER), search
+    assert flags_of(tools) == [False, False, False], "plugin 引擎从不写 flag"
+
+
+# --------------------------------------------------------------------
+# t4 弱覆盖 ②：C 模式的真实 asyncio.wait_for 超时（预算内中断，返回【错误】）
+# --------------------------------------------------------------------
+
+
+def test_e9_c_mode_budget_timeout_returns_error_text(
+    monkeypatch, logger_recorder, tmp_path
+):
+    """C 模式自有预算真的会中断（核心那层是 3600s 硬编码，插件必须自带上限）。"""
+    monkeypatch.setattr(main_module, "_c_media_public_root", lambda: tmp_path / "cmedia")
+    plugin = c_plugin(monkeypatch, config("browse_only", "core"))
+    # 停掉热更新，否则入口第一行会把 30s 下限刷回来（同 v1.5.0 的 freeze_budget）
+    plugin._refresh_config = lambda: None  # type: ignore[assignment]
+    plugin.background_timeout = 0.05
+
+    async def slow(*_a, **_k):
+        await asyncio.sleep(5)
+        return "不该返回的长结果"
+
+    plugin._browse_web_run = slow  # type: ignore[assignment]
+
+    began = time.monotonic()
+    ret = run(plugin.browse_web(FakeEvent(), "看页面"))
+    elapsed = time.monotonic() - began
+    assert elapsed < 2.0, f"必须在预算内中断（实测 {elapsed:.2f}s）"
+    assert ret.startswith("【错误】浏览超过"), ret
+    assert "C 模式" in ret and "没有中断前的部分结果" in ret
+    assert C_UNTRUSTED_PREFIX not in ret, "错误文本是我们自己的可信文本，不加前缀"
+    assert len(plugin._background) == 0

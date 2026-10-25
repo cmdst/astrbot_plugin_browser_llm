@@ -1379,42 +1379,56 @@ class BrowserLLMPlugin(Star):
     def _cleanup_cache(self) -> int:
         """清理超过 cache_days 天的媒体/截图缓存文件，返回删除数。
 
-        遍历 data/media/ 与 data/screenshots/ 下的文件，删除 mtime
-        早于 (now - cache_days) 的旧文件；目录本身保留。
-        cache_days <= 0 表示「不清理」（与 vision_cache_ttl=0 关闭缓存
-        的语义一致），直接返回 0——避免 0 被误当作「立即清理全部」。
+        两段，遍历口径**刻意不同**：
+
+        1. 既有基目录 ``data/media/`` 与 ``data/screenshots/``：只看**顶层
+           文件**（``iterdir``，与 v1.5.0 逐字一致）。这两处只有本插件自己写的
+           平铺文件，把删除语义悄悄改成"递归"会误删运维手工放进子目录的东西，
+           也超出 v1.6.0 的落点范围（规格 §6.5/§10 只要求"遍历基目录加入发布
+           根"）；
+        2. v1.6.0 的 C 模式**发布根** ``data/temp/browser_llm_c_media/``：它
+           按 ``<umo8>/`` 分目录，因此必须 ``rglob`` 递归；删完过期文件后把
+           空的分目录也回收（否则 data/temp 会剩一堆空目录）。
+
+        目录本身保留；``cache_days <= 0`` 表示「不清理」（与
+        ``vision_cache_ttl=0`` 关闭缓存的语义一致），直接返回 0——避免 0 被
+        误当作「立即清理全部」。
         """
         if self.cache_days <= 0:
             return 0
         cutoff = time.time() - self.cache_days * 86400
         removed = 0
-        # C 模式（v1.6.0）的媒体**发布副本**也随 cache_days 过期：它落在
-        # ``data/temp/browser_llm_c_media/<umo8>/`` 下，不清理就会无限增长
-        # （data/temp 是核心的临时目录，没人替我们收）。
-        publish_root = _c_media_public_root()
+        # ① 既有基目录：保持 v1.5.0 的"只删顶层文件"语义（不递归）。
         for base in (
             getattr(self, "_media_dir", None),
             getattr(self, "_screenshot_dir", None),
-            publish_root,
         ):
             if base is None or not base.is_dir():
                 continue
-            for f in sorted(base.rglob("*")):
+            for f in base.iterdir():
                 try:
                     if f.is_file() and f.stat().st_mtime < cutoff:
                         f.unlink()
                         removed += 1
                 except Exception as e:  # noqa: BLE001 — 单文件失败不影响其余
                     logger.debug(f"清理缓存文件失败 {f}: {e}")
-            if base == publish_root:
-                # 发布根按 <umo8> 分子目录：文件清空后把空目录也删掉。
-                for child in sorted(base.iterdir()):
-                    if not child.is_dir():
-                        continue
-                    try:
-                        child.rmdir()
-                    except OSError:  # 非空/竞态：下一轮再收
-                        continue
+        # ② C 模式发布根：按 <umo8> 分目录，必须递归；清空后回收空分目录。
+        publish_root = _c_media_public_root()
+        if publish_root is not None and publish_root.is_dir():
+            for f in sorted(publish_root.rglob("*")):
+                try:
+                    if f.is_file() and f.stat().st_mtime < cutoff:
+                        f.unlink()
+                        removed += 1
+                except Exception as e:  # noqa: BLE001 — 单文件失败不影响其余
+                    logger.debug(f"清理缓存文件失败 {f}: {e}")
+            for child in sorted(publish_root.iterdir()):
+                if not child.is_dir():
+                    continue
+                try:
+                    child.rmdir()
+                except OSError:  # 非空/竞态：下一轮再收
+                    continue
         if removed:
             logger.info(
                 f"[{self.metadata_name}] 缓存清理完成，删除 {removed} 个过期文件"
