@@ -1,201 +1,163 @@
 {
-  "browser": {
+  "resources": {
     "type": "object",
-    "description": "浏览器基础",
-    "hint": "浏览器引擎、起始页、代理与视口等基础设置。",
+    "description": "资源部署与限制",
+    "hint": "浏览器部署面（引擎 / 无头模式 / 分辨率 / 代理）与运行限制（标签页、空闲回收、正文与链接预算、并发、整任务墙钟预算、两级超时）**合并重做**——v5 的「浏览器基础」与「资源与步数限制」两组在这里合一。分辨率统一为一条 resolution 复合叶（宽/高/DPR），总操作超时统一为 resources.total_budget_s，单步定位与动作等待用 action_timeout_s。",
     "items": {
-      "type": {
+      "engine": {
         "type": "string",
-        "description": "浏览器引擎类型",
+        "description": "浏览器内核",
+        "hint": "驱动网页浏览使用的 Playwright 内核：chromium 兼容性最好，firefox / webkit 视环境支持情况选择。**重载插件后生效**（只在加载配置时读取）。v5 的 browser.type 改名而来。",
+        "default": "chromium",
         "options": [
           "chromium",
           "firefox",
           "webkit"
-        ],
-        "hint": "驱动网页浏览使用的 Playwright 浏览器内核。chromium 兼容性最好，firefox/webkit 视环境支持情况选择。",
-        "default": "chromium"
+        ]
       },
-      "default_url": {
+      "headless": {
         "type": "string",
-        "description": "默认起始页",
-        "hint": "会话首次打开浏览器时加载的地址；Agent 通常会根据用户问题导航到目标页，此地址仅作兜底。",
-        "default": "https://www.baidu.com"
-      },
-      "default_search_engine": {
-        "type": "string",
-        "description": "默认搜索引擎（浏览器 SERP 模板）",
+        "description": "无头模式",
+        "hint": "new=无头新模式（channel=chromium 的新 headless，兼容性与有头最接近，默认）；headful=有头模式（需要 xvfb/DISPLAY，没有显示环境时自动回落 new 并记一条 WARN）；shell=旧的 headless shell（体积小、对现代站点兼容性差，仅排障用）。**重载插件后生效**。",
+        "default": "new",
         "options": [
-          "必应搜索",
-          "百度搜索",
-          "谷歌搜索",
-          "B站搜索"
-        ],
-        "hint": "browse_search 子代理工具打开搜索页时使用的引擎模板；与「搜索 API」配置组无关——后者是 browser_web_search 的 HTTP provider 池。",
-        "default": "必应搜索"
-      },
-      "proxy": {
-        "type": "string",
-        "description": "浏览器代理地址",
-        "hint": "Playwright 浏览器使用的代理，如 http://127.0.0.1:7890。留空表示直连；搜索 API 的代理请用「搜索」组的 proxy（两者独立）。",
-        "default": ""
+          "new",
+          "headful",
+          "shell"
+        ]
       },
       "viewport": {
-        "description": "浏览器视口尺寸",
         "type": "object",
-        "hint": "浏览器窗口视口大小，宽高单位为像素。",
+        "description": "分辨率（宽 / 高 / 设备像素比）",
+        "hint": "页面视口、截图 PNG、Set-of-Mark 标注与 CDP 点击坐标**共用这一套 CSS 像素坐标系**：PNG 像素 = CSS 像素 × device_scale_factor。v5 只有宽/高且 DPR 恒为 1，v1.7.5 显式化。注意：「模型与人格」组的 image_max_side 只压缩**发给模型的图片最长边**，不改页面，两件事不要混。**重载插件后生效**。",
+        "default": {
+          "width": 1280,
+          "height": 800,
+          "device_scale_factor": 1
+        },
         "items": {
           "width": {
             "type": "int",
-            "description": "视口宽度",
-            "hint": "影响页面渲染与截图宽度",
+            "description": "视口宽度（CSS 像素）",
+            "hint": "影响页面渲染与截图宽度，默认 1280。",
             "default": 1280
           },
           "height": {
             "type": "int",
-            "description": "视口高度",
-            "hint": "影响页面渲染与截图高度",
+            "description": "视口高度（CSS 像素）",
+            "hint": "影响页面渲染与截图高度，默认 800。",
             "default": 800
+          },
+          "device_scale_factor": {
+            "type": "int",
+            "description": "设备像素比（DPR）",
+            "hint": "截图 PNG 像素 = CSS 像素 × DPR（默认 1，与 v5 行为一致）；高分屏排障可设 2 让截图更清晰。它同时决定 SoM 标注与 CDP 点击坐标的换算系数。",
+            "default": 1
           }
         }
       },
-      "timeout": {
-        "type": "int",
-        "description": "页面操作超时（秒）",
-        "hint": "页面加载、点击、搜索等单次浏览器操作的超时时间。",
-        "default": 30
-      }
-    }
-  },
-  "limits": {
-    "type": "object",
-    "description": "资源与步数限制",
-    "hint": "正文/链接提取上限、页数、空闲回收、媒体缓存与子代理步数控制。",
-    "items": {
-      "max_chars": {
-        "type": "int",
-        "description": "单页正文提取上限（字符）",
-        "hint": "每次提取网页正文时最多返回的字符数，超长内容按此截断，控制注入 token 消耗。",
-        "default": 4000
+      "proxy": {
+        "type": "string",
+        "description": "浏览器代理（插件内统一）",
+        "hint": "浏览器 context 与池内非搜索 HTTP 请求统一走这个代理，如 http://127.0.0.1:7890；留空直连。**搜索工具是单独配置的例外**（见「搜索 API 与搜索引擎」组的 proxy：很多搜索API 需要固定出口 IP/地区，与浏览代理不同）。**重载插件后生效**。",
+        "default": ""
       },
-      "max_links": {
+      "max_tabs": {
         "type": "int",
-        "description": "单页链接提取上限",
-        "hint": "每次提取网页时最多返回多少条链接供 Agent 选择点击。",
-        "default": 20
-      },
-      "max_pages": {
-        "type": "int",
-        "description": "所有会话标签页总数上限",
-        "hint": "所有浏览会话合计最多可同时打开的标签页数量（全局上限），达到上限后新标签/新会话将被拒绝，防止 Agent 无限开标签消耗资源。",
+        "description": "标签页总数上限",
+        "hint": "所有浏览会话合计最多同时打开的标签页数（全局上限）；达到上限后新标签/新会话被拒绝，防止无限开标签消耗资源。范围 1-20，默认 5。**下次调用生效**。v5 的 limits.max_pages 改名。",
         "default": 5
       },
-      "idle_timeout": {
+      "idle_timeout_s": {
         "type": "int",
-        "description": "会话空闲回收时间（秒）",
-        "hint": "浏览会话闲置超过该秒数后自动关闭，释放浏览器资源。",
+        "description": "会话空闲回收（秒）",
+        "hint": "浏览会话闲置超过该秒数后自动关闭并释放浏览器资源。范围 60-86400，默认 1800。**下次调用生效**。v5 的 limits.idle_timeout 改名（单位入名）。",
         "default": 1800
       },
       "cache_days": {
         "type": "int",
         "description": "媒体缓存保留天数",
-        "hint": "下载的图片/视频等媒体缓存超过该天数后自动清理，节省磁盘；0 或负值 = 不清理",
+        "hint": "下载的图片/视频等媒体缓存超过该天数后自动清理；0 = 不清理。范围 0-30，默认 3。**下次调用生效**。",
         "default": 3
       },
-      "agent_max_steps": {
+      "max_text_chars": {
         "type": "int",
-        "description": "浏览器子代理最大工具调用步数",
-        "hint": "浏览器子代理（browser_agent）在一次委托任务中最多执行的工具调用次数，防止无限循环消耗资源。复杂长任务（多步表单、连续翻页）建议 60-80。",
-        "default": 70
+        "description": "单页正文提取上限（字符）",
+        "hint": "每次提取网页正文最多返回的字符数，超长按此截断，控制注入 token 消耗。范围 200-50000，默认 4000。**下次调用生效**。v5 的 limits.max_chars 改名。",
+        "default": 4000
       },
-      "agent_tool_timeout": {
+      "max_links": {
         "type": "int",
-        "description": "浏览器子代理单次工具调用超时（秒）",
-        "hint": "浏览器子代理执行单个 browse_* 工具的超时上限；完成一整套长任务（多步表单、连续翻页）时此值会叠加，建议保持 300-600。若超长任务仍被中断，请同步调大 AstrBot 全局“工具调用超时”（WebUI 模型设置）。",
-        "default": 1200
-      }
-    }
-  },
-  "security": {
-    "type": "object",
-    "description": "安全与内容审核",
-    "hint": "禁词过滤、内网拦截与会话黑白名单。搜索工具复用同一套禁词/SSRF/会话规则。",
-    "items": {
-      "banned_words": {
-        "type": "list",
-        "description": "内容禁词列表",
-        "hint": "命中这些关键词的网页内容 / 搜索结果会被安全过滤拦截，禁止返回给 LLM 与用户。搜索工具的检索词命中则整单拒绝，结果标题/摘要命中则只丢弃该条。",
-        "default": [
-          "pornhub",
-          "色情",
-          "成人",
-          "赌博",
-          "暴力",
-          "政治",
-          "反动",
-          "恐怖",
-          "谣言",
-          "诈骗",
-          "病毒"
-        ]
+        "description": "单页链接提取上限",
+        "hint": "每次提取网页时最多返回多少条链接供模型选择。范围 1-200，默认 20。**下次调用生效**。v5 的 limits.max_links 改名。",
+        "default": 20
       },
-      "enable_banned_filter": {
-        "type": "bool",
-        "description": "启用内容审核（禁词过滤）",
-        "hint": "内容审核总开关。开启时命中 banned_words 的网页正文/标题/搜索词/URL/识图结果会被拦截；关闭后不再因禁词拦截内容，适合论坛等敏感词密集站点（避免整页被拒）。不影响内网拦截、本地页路径白名单等安全边界。",
-        "default": true
+      "max_parallel": {
+        "type": "int",
+        "description": "后台任务并发上限",
+        "hint": "同时运行的后台任务个数上限；达到上限时新提交立刻回【拒绝】并提示不要重试。范围 1-16，默认 4（v5 时代这是模块常量 _BG_MAX_CONCURRENT=4，v1.7.5 提为配置）。**下次调用生效**。",
+        "default": 4
       },
-      "block_internal_ip": {
-        "type": "bool",
-        "description": "拦截内网地址",
-        "hint": "开启后拒绝访问内网/本机地址（如 127.0.0.1、192.168.x.x），防止 SSRF 风险。搜索工具用它校验 provider 端点与结果链接。关闭后不拦截内网地址（不推荐）。",
-        "default": true
+      "total_budget_s": {
+        "type": "int",
+        "description": "整任务墙钟预算（秒）",
+        "hint": "**总操作超时统一到这一个键**：整个任务最多花多久（前台 = 整条内层链；后台 = 整条链含终态投递），超时由看门狗发一条终态消息。范围 60-1800，默认 300。它取代 v5 的 browser.timeout（30s 页面默认）、limits.agent_tool_timeout（1200s 单步）、agent.task_timeout（600s 内层）、tools.background_timeout（240s 后台）；**超时是墙钟，不是步数**。**下次调用生效**。",
+        "default": 300
       },
-      "session_whitelist": {
-        "type": "list",
-        "description": "会话白名单",
-        "hint": "仅允许在这些会话中使用浏览能力。每个条目可以是完整 UMO（用 /sid 获取）或群号/用户 ID。匹配为精确匹配（按 : 或 | 切分后逐字段比对，或与完整 UMO 整体相等），黑名单如 '123' 不会误伤群 '1234'。留空表示允许全部会话",
-        "default": []
+      "goto_timeout_s": {
+        "type": "int",
+        "description": "导航超时（秒）",
+        "hint": "navigate/back/forward/reload 单次导航的超时；不再依赖 Playwright 默认的 30s。范围 5-120，默认 15。超时后先取已渲染内容：有正文回【超时但有内容】，0 正文再重试一次。**下次调用生效**。v5 的 browser.timeout 拆到这里。",
+        "default": 15
       },
-      "session_blacklist": {
-        "type": "list",
-        "description": "会话黑名单",
-        "hint": "禁止在这些会话中使用浏览能力。格式同白名单（完整 UMO 或群号/用户 ID，精确匹配）。黑名单优先级高于白名单",
-        "default": []
+      "action_timeout_s": {
+        "type": "int",
+        "description": "单步动作超时（秒）",
+        "hint": "单个动作（定位 + 点击/输入/选择/滚动等待）的上限，也用于操作后验证的等待。范围 2-60，默认 10。**下次调用生效**。v5 的 browser.timeout 拆到这里。",
+        "default": 10
       }
     }
   },
   "perception": {
     "type": "object",
-    "description": "页面感知与识图",
-    "hint": "截图、识图模型、感知方式与会话级规则。**v1.7.0 起语义收窄**：截图默认以原生图片直达内层多模态模型（见「内嵌多模态子代理」组），本组的 vision_provider_id / vision_prompt / vision_cache_ttl 三项只在「内层模型不支持图片」时的 caption 兜底路径生效——它们仍然有用（文本模型也能「看图」），但不再是截图进入模型的唯一通道。",
+    "description": "页面感知（A11y 树 + 文本 + 截图兜底）",
+    "hint": "**v1.7.5 重做**：页面感知的流水线固定为「CDP Accessibility 全树裁剪 + 正文（按需）」，截图只作兜底（Canvas/WebGL、纯图片按钮、验证码、结果验证），并且**必须**带 Set-of-Mark 标签（模型回标签 ID，不回像素坐标）。本组只留感知预算与截图策略；识图模型已并入「模型与人格」组，caption 兜底链整体删除。",
     "items": {
-      "enable_screenshot": {
+      "a11y_max_nodes": {
+        "type": "int",
+        "description": "A11y 树节点预算",
+        "hint": "交给模型的 CDP Accessibility 快照最多保留多少个节点（按可交互与可见性优先裁剪）。范围 50-1000，默认 300。**下次调用生效**。",
+        "default": 300
+      },
+      "a11y_max_name_chars": {
+        "type": "int",
+        "description": "单节点名称截断（字符）",
+        "hint": "A11y 快照里每个节点的 name/value 最多保留多少字符，防止超长 alt/aria-label 吃掉预算。范围 20-500，默认 120。**下次调用生效**。",
+        "default": 120
+      },
+      "screenshot_fallback": {
         "type": "bool",
-        "description": "启用页面截图",
-        "hint": "开启后浏览网页时截取页面截图返回给用户；关闭后仅返回文字内容。",
+        "description": "允许截图兜底",
+        "hint": "**截图仅兜底的唯一总闸**：开启（默认）时，A11y 树表达不了的场景（Canvas/WebGL、纯图片按钮、验证码、结果验证）可调用 browse_screenshot 拿带 Set-of-Mark 标签的截图；关闭后完全不截图，模型只看 A11y 结构 + 正文（也意味着看不到图）。**下次调用生效**。v5 的 perception.enable_screenshot 语义收窄后改名。",
         "default": true
       },
-      "silent_mode": {
+      "som_max_marks": {
+        "type": "int",
+        "description": "Set-of-Mark 标签上限",
+        "hint": "一张兜底截图最多打多少个编号标签（模型只回标签 ID，不回像素坐标，避免坐标漂移）。范围 5-200，默认 60。**下次调用生效**。",
+        "default": 60
+      },
+      "screenshot_to_chat": {
         "type": "bool",
-        "description": "静默模式",
-        "hint": "开启后浏览截图仅内部识图，不发送到群聊（减少刷屏）；关闭后截图会发送给用户",
-        "default": true
+        "description": "截图发到会话",
+        "hint": "截图是否作为图片消息发到当前会话（与模型看不看得到无关，模型侧由 screenshot_fallback 决定）。默认 false = 只给模型看、不刷屏；开启后用户也能看到截图。**下次调用生效**。v5 的 perception.silent_mode（静默模式）**取反**后改名。",
+        "default": false
       },
-      "page_perception": {
-        "type": "string",
-        "description": "页面感知方式",
-        "options": [
-          "text",
-          "text_image",
-          "image"
-        ],
-        "hint": "text=仅文字读取（最快，不用截图识图）；text_image=文字为主+必要时截图识图（平衡，推荐）；image=以截图识图为主",
-        "default": "text_image"
-      },
-      "perception_rules": {
+      "rules": {
         "type": "list",
-        "description": "会话级页面感知规则",
-        "hint": "按会话（UMO 子串匹配，不区分大小写）指定页面感知方式默认值，命中第一条生效。优先级：browse_web 参数前缀 perception= 显式指定 > 本规则 > 全局 page_perception。每条规则含 match（匹配字符串，与 UMO 做子串匹配）、perception（text/text_image/image）、note（可选备注）。示例：[{\"match\": \"tester\", \"perception\": \"text\", \"note\": \"测试子代理只需正文\"}]",
+        "description": "会话级感知规则",
+        "hint": "按会话（UMO 子串匹配，不区分大小写）覆盖截图策略，命中第一条生效。每项含 match（匹配字符串）、perception（text / text_image / image，分别解释为截图策略 never / auto / always）、note（可选备注）。留空 = 全部走全局默认。**下次调用生效**。v5 的 perception.perception_rules 改名（元素结构不变，三值重解释）。",
+        "default": [],
         "items": {
           "match": {
             "type": "string",
@@ -211,7 +173,7 @@
               "text_image",
               "image"
             ],
-            "hint": "text=仅文字；text_image=文字为主+截图辅助；image=截图为主",
+            "hint": "text=不截图（只给 A11y + 文本）；text_image=按需截图兜底（默认）；image=优先截图。v1.7.5 起这三个值被解释为截图策略 never / auto / always。",
             "default": "text_image"
           },
           "note": {
@@ -220,50 +182,127 @@
             "hint": "该规则用途说明，仅作可读性",
             "default": ""
           }
-        },
-        "default": []
-      },
-      "vision_provider_id": {
+        }
+      }
+    }
+  },
+  "model": {
+    "type": "object",
+    "description": "模型与人格",
+    "hint": "**视觉模型与子代理模型合并后的唯一模型组**：v5 的 perception.vision_provider_id 与 agent.provider_id 合成一条 model.provider_id；子代理的人格三档、图片压缩与结果截断也都收在这一组。v1.7.5 不再有「另找一个模型把截图描述给我听」的兜底链——内层模型能看图就原生看，不能看就只给 A11y + 文本。",
+    "items": {
+      "provider_id": {
         "type": "string",
-        "description": "多模态识图模型 Provider ID",
+        "description": "模型 Provider ID（视觉与子代理共用）",
+        "hint": "**视觉模型与子代理模型合并后的唯一模型**：内层子代理与截图理解都用它。留空 = 继承当前会话模型。下拉选项自动同步 AstrBot 已配置、且声明了「多模态 + 支持工具调用」的聊天 Provider（插件启动后与每次工具调用前刷新，无需手改本文件）。所选模型不支持图片时插件只给 A11y + 文本（不再另找模型做 caption 兜底）；声明了 modalities 却不含 tool_use 时插件会【错误】拒绝执行（否则核心会静默清空工具集，表现为「我无法浏览」）。**下次调用生效**。由 v5 的 agent.provider_id 与 perception.vision_provider_id 合并而来（前者优先）。",
+        "default": "",
         "options": [
           ""
-        ],
-        "hint": "**v1.7.0 语义收窄**：默认情况下截图以**原生图片**直达内层多模态模型（等效于内层模型自己「看」），本项只在**内层模型不支持图片**时作为 caption 兜底——先把截图识别成文字描述，再喂给内层模型。留空 = 不做兜底（此时截图仅发给用户，不进模型）。下拉选项自动同步 AstrBot 已配置的聊天模型 Provider（插件启动时与每次识图调用时刷新，无需手动编辑本文件）；若列表中没有你的识图模型，请先在 AstrBot 模型配置中添加对应 Provider。",
-        "default": ""
+        ]
       },
-      "vision_prompt": {
+      "persona_mode": {
         "type": "string",
-        "description": "识图提示词模板",
-        "hint": "caption 兜底路径（见上一条 vision_provider_id：只在「内层模型不支持图片」时生效）发给多模态模型的识图提示词。想提升兜底准确率就改这里；留空使用默认提示词。",
+        "description": "内层人格档位",
+        "hint": "default=内层只有工具提示词，不含任何人格（默认）；current=把当前会话生效人格的提示词（截断 2000 字符）注入内层；custom=使用下面的自定义人格提示词。三档只影响语气与表达风格，不改变红线、工具清单与输出契约。写错的值按 default 处理并记 warning（fail-closed）。**下次调用生效**。",
+        "default": "default",
+        "options": [
+          "default",
+          "current",
+          "custom"
+        ]
+      },
+      "persona_prompt": {
+        "type": "text",
+        "description": "内层自定义人格提示词（custom 档专用）",
+        "hint": "仅 persona_mode=custom 时生效，≤4000 字符（超出截断）。写角色口吻、措辞习惯、报告风格即可——不要在这里写工具清单或安全规则（那些由插件固定的工具层与红线层负责）。**下次调用生效**。",
+        "default": "",
         "editor_mode": true,
         "editor_language": "text",
-        "editor_theme": "vs-light",
-        "default": "请用中文描述这张网页截图的重点内容，包括主要文字、按钮、链接和页面结构。"
+        "editor_theme": "vs-light"
       },
-      "vision_cache_ttl": {
+      "image_max_side": {
         "type": "int",
-        "description": "识图缓存时间（秒）",
-        "hint": "caption 兜底结果的缓存时间（秒）；0 = 关闭缓存（不读也不写）。v1.6.1 起缓存键 = 会话 UMO + 截图**图像内容哈希** + 工具种类 + 裁剪参数 + 提示词哈希 + Provider id，因此同一 URL 下的不同画面（以及局部裁剪与整屏截图）不会互相串号——这是 2026-10-26 那次「识图结果张冠李戴」事故的修复。v1.7.0 的影像原生路径不产生 caption，天然不受本项影响。插件重载/禁用时清空。",
-        "default": 60
+        "description": "发给模型的图片最长边（像素）",
+        "hint": "截图/裁剪交给模型前按最长边等比缩放。范围 320-2048，默认 1280。越小越省 token，越大越能看清小字；识别密集文字区域请用局部放大工具而不是一味调大本项。它只改「发给模型的图片」，**不改页面分辨率**（那是 resources.viewport）。**下次调用生效**。",
+        "default": 1280
+      },
+      "image_quality": {
+        "type": "int",
+        "description": "截图 JPEG 质量",
+        "hint": "与「最长边」共同决定图片体积。范围 40-95，默认 80。单图 base64 超过 1,500,000 字符（约 1.1 MB 原图）时会再压一半；仍超则丢弃并在文本里注明「图片过大已省略」。**下次调用生效**。",
+        "default": 80
+      },
+      "result_max_chars": {
+        "type": "int",
+        "description": "单个工具结果返回模型的文本上限（字符）",
+        "hint": "每个内层工具返回给模型的文本上限，超出按此截断并标注「…（已截断 N 字）」，图片不受本项限制。范围 500-20000，默认 3000。**下次调用生效**。",
+        "default": 3000
+      },
+      "ledger_max_lines": {
+        "type": "int",
+        "description": "执行台账最大行数（0=不附）",
+        "hint": "0-60，默认 24；0 表示不附台账。执行台账是本次任务「调了哪些动作、目标是什么、结果如何」的确定性清单，由插件按实际调用顺序生成并附在结果末尾（不依赖模型自述），用来发现「模型说点了但台账里没有」这类收尾失真。行数按最近 N 步截断。**下次调用生效**。",
+        "default": 24
+      }
+    }
+  },
+  "actions": {
+    "type": "object",
+    "description": "结构化动作与操作后验证",
+    "hint": "**v1.7.5 新增组**：模型输出结构化动作（如 {action:'click', target:{role:'button', name:'提交'}}），执行层用 Playwright locator 定位；需要受信任事件时走 CDP Input.*；动作执行后用 locator 等待或 DOM 状态验证结果，并把「无变化」显式回给模型。本组控制受信任事件、验证开关、定位重试与重复动作守卫。",
+    "items": {
+      "trusted_events": {
+        "type": "bool",
+        "description": "使用受信任事件（CDP Input.*）",
+        "hint": "开启（默认）时，需要真实用户事件语义的动作（点击、按键、输入）走 CDP Input.dispatch*，让依赖 isTrusted 的站点也能正常响应；关闭后一律用 locator 原生事件（排障对照用）。**下次调用生效**。",
+        "default": true
+      },
+      "verify": {
+        "type": "bool",
+        "description": "操作后验证",
+        "hint": "开启（默认）时，每个动作执行后用 locator 等待或 DOM 状态读回验证结果，并把「无变化」显式回给模型（而不是只说「已点击」）；关闭后只回执不判定，仅供排障。**下次调用生效**。",
+        "default": true
+      },
+      "max_retries": {
+        "type": "int",
+        "description": "定位失败重试次数",
+        "hint": "0-3，默认 1（不含首次）。定位失败时先重取 A11y 快照再重试，仍失败则给候选清单。**下次调用生效**。",
+        "default": 1
+      },
+      "repeat_guard": {
+        "type": "int",
+        "description": "重复动作守卫（连续无变化即拒绝）",
+        "hint": "0-10，默认 3；0 = 关闭。同一个（动作, 目标）连续 N 次都没有引起页面变化时直接拒绝，并回传候选，避免「连点 4 次都回已点击但页面没动」。**下次调用生效**。",
+        "default": 3
       }
     }
   },
   "search": {
     "type": "object",
-    "description": "搜索 API（browser_web_search）",
-    "hint": "本组配置的是 browser_web_search 工具使用的「搜索 API provider 池」：多个搜索后端并行检索、合并去重后返回结构化结果。它与 AstrBot 内置的 web_search_<provider> 工具互相独立（各自用自己的 key，不会互相降级）；也与「默认搜索引擎」（浏览器 SERP 模板，供 browse_search 用）是两条链路。默认关闭（enabled=false）⇒ 主 LLM 看不到该工具，行为与旧版一致。",
+    "description": "搜索 API 与搜索引擎",
+    "hint": "两条链路各管一件事：**搜索 API 池**（browser_web_search 的 HTTP provider 池，多个后端并行检索后合并去重）与**搜索引擎**（browse_search 动作打开的结果页模板）。**v1.7.5 精简**：搜索引擎选项 4 → 3（去掉 B站 站内搜索）、删除 search.mode（内外层搜索不再互斥，也不再写全局 inactivated_llm_tools）；本组的 proxy 是**搜索专用**代理，与「资源部署与限制」组的浏览器代理相互独立。",
     "items": {
       "enabled": {
         "type": "bool",
-        "description": "启用搜索工具",
-        "hint": "总开关。开启且池内至少有一个已填 api_key 的 provider 时，主 LLM 才能看到并调用 browser_web_search；关闭（默认）或池内无可用 provider 时，工具对模型不可见（自动闸门，插件会记 search tool inactive 日志）。",
+        "description": "启用搜索 API 池",
+        "hint": "总开关。开启且池内至少有一个已填 api_key 的 provider 时，模型才能调用 browser_web_search；关闭（默认）或池内无可用 provider 时该工具对模型不可见（自动闸门，插件会记 search tool inactive 日志）。**下次调用生效**。",
         "default": false
+      },
+      "engine": {
+        "type": "string",
+        "description": "默认搜索引擎（结果页模板）",
+        "hint": "browse_search 动作打开搜索页时用的引擎模板：必应 / 百度 / 谷歌。v1.7.5 起只有 3 个选项——B站 是站内搜索、不是搜索引擎，留在枚举里会让模型以为能搜全网。它与「搜索 API 池」是两条链路（后者是 HTTP provider）。**下次调用生效**。由 v5 的 browser.default_search_engine 移组而来（起始页已移除，搜索引擎归搜索组）。",
+        "default": "必应搜索",
+        "options": [
+          "必应搜索",
+          "百度搜索",
+          "谷歌搜索"
+        ]
       },
       "providers": {
         "type": "template_list",
         "description": "搜索 API provider 池",
-        "hint": "点「添加」选模板（brave / bocha / firecrawl / tavily / exa）后填 api_key。数组顺序即默认优先级；同时并行检索的个数由 max_parallel 控制，权重（weight）只影响合并排序。api_key 属敏感信息：不要在截图、日志、工单里暴露；本插件只从本配置读取密钥，不读核心 provider_settings 的 websearch_*_key，也不读其他插件。",
+        "hint": "点「添加」选模板（brave / bocha / firecrawl / tavily / exa）后填 api_key。数组顺序即默认优先级；同时并行检索的个数由 max_parallel 控制，权重（weight）只影响合并排序。**整值不透明搬运**：v1.7.5 迁移不会展开也不会改写池内任何字段（api_key 原样保留）。api_key 属敏感信息：不要在截图、日志、工单里暴露；本插件只从本配置读取密钥，不读核心 provider_settings 的 websearch_*_key，也不读其他插件。",
         "templates": {
           "brave": {
             "name": "Brave Search API",
@@ -508,207 +547,191 @@
         },
         "default": []
       },
+      "proxy": {
+        "type": "string",
+        "description": "搜索专用代理（例外项）",
+        "hint": "搜索 API 请求与结果正文抓取使用的代理，如 http://127.0.0.1:7890；留空直连。**它是「插件内代理统一」的单独例外**：很多搜索 API 需要固定出口 IP/地区，与浏览器代理（resources.proxy）不同，因此两处独立配置。**下次调用生效**。",
+        "default": ""
+      },
       "max_parallel": {
         "type": "int",
         "description": "单波并发上限",
-        "hint": "同一时刻并行发起的 provider 个数（1-10，默认 3）。波次数由 max_rounds 控制，故一次调用最多尝试 min(可用池, max_parallel × max_rounds) 个 provider。",
+        "hint": "同一时刻并行发起的 provider 个数（1-10，默认 3）。波次数由 max_rounds 控制，故一次调用最多尝试 min(可用池, max_parallel × max_rounds) 个 provider。**下次调用生效**。",
         "default": 3
       },
       "max_results": {
         "type": "int",
         "description": "返回结果条数上限",
-        "hint": "合并去重后最多返回多少条（1-50，默认 8）；同时作为单源默认请求量。",
+        "hint": "合并去重后最多返回多少条（1-50，默认 8）；同时作为单源默认请求量。**下次调用生效**。",
         "default": 8
       },
       "max_rounds": {
         "type": "int",
-        "description": "搜索步数（波次上限）",
-        "hint": "1-5，默认 2。一轮 = 从「尚未尝试且可用」的 provider 里按序取至多 max_parallel 个并行检索；结果够 max_results 会提前结束。注意它不是「每次对话最多调用几次工具」。",
+        "description": "搜索波次上限",
+        "hint": "1-5，默认 2。一轮 = 从「尚未尝试且可用」的 provider 里按序取至多 max_parallel 个并行检索；结果够 max_results 会提前结束。注意它不是「每次对话最多调用几次工具」。**下次调用生效**。",
         "default": 2
       },
-      "provider_timeout": {
+      "provider_timeout_s": {
         "type": "int",
         "description": "单源超时（秒）",
-        "hint": "3-60，默认 15。每个 provider 的检索超时；provider 模板里的 timeout 可覆盖它。单源超时只影响自己，同波其他源照常返回。",
+        "hint": "3-60，默认 15。每个 provider 的检索超时；provider 模板里的 timeout 可覆盖它。单源超时只影响自己，同波其他源照常返回。**下次调用生效**。v5 的 search.provider_timeout 改名（单位入名）。",
         "default": 15
       },
-      "total_timeout": {
+      "total_timeout_s": {
         "type": "int",
-        "description": "单次调用总预算（秒）",
-        "hint": "5-300，默认 60。一次 browser_web_search 的总耗时上限（含抓正文阶段）；到点保留已有结果并记 total_timeout。",
+        "description": "单次搜索总预算（秒）",
+        "hint": "5-300，默认 60。一次 browser_web_search 的总耗时上限（含抓正文阶段）；到点保留已有结果并记 total_timeout。它小于整任务预算（resources.total_budget_s），是搜索内部的自限。**下次调用生效**。v5 的 search.total_timeout 改名。",
         "default": 60
       },
-      "cooldown_seconds": {
+      "cooldown_s": {
         "type": "int",
         "description": "失败源冷却（秒）",
-        "hint": "0-3600，默认 60。provider 返回 401/403/429 后进入冷却，冷却期内直接跳过（记 cooldown）不再发请求，避免持续撞限流；0 表示不冷却。",
+        "hint": "0-3600，默认 60。provider 返回 401/403/429 后进入冷却，冷却期内直接跳过（记 cooldown）不再发请求，避免持续撞限流；0 = 不冷却。**下次调用生效**。v5 的 search.cooldown_seconds 改名。",
         "default": 60
       },
-      "cache_ttl": {
+      "cache_ttl_s": {
         "type": "int",
         "description": "结果缓存时间（秒）",
-        "hint": "0-3600，默认 120。相同检索词与参数在 TTL 内直接复用上次结果（返回体 cache=hit）；0 表示关闭缓存。插件重载/禁用时清空。",
+        "hint": "0-3600，默认 120。相同检索词与参数在 TTL 内直接复用上次结果（返回体 cache=hit）；0 = 关闭缓存。插件重载/禁用时清空。**下次调用生效**。v5 的 search.cache_ttl 改名。",
         "default": 120
       },
       "fetch_pages": {
         "type": "bool",
         "description": "抓取结果正文",
-        "hint": "默认关闭。开启后对排序靠前的 fetch_top_n 条结果抓取正文（纯 HTTP，不启浏览器、不执行 JS），正文逐条过 SSRF 校验与禁词过滤。工具参数 fetch_pages 只能在此开关开启时生效（取「与」）。",
+        "hint": "默认关闭。开启后对排序靠前的 fetch_top_n 条结果抓取正文（纯 HTTP，不启浏览器、不执行 JS），正文逐条过 SSRF 校验与禁词过滤。工具参数 fetch_pages 只能在此开关开启时生效（取「与」）。**下次调用生效**。",
         "default": false
       },
       "fetch_top_n": {
         "type": "int",
         "description": "抓取条数（0-5）",
-        "hint": "默认 3。抓取排序前 N 条的正文；0 等价于不抓（即使 fetch_pages 已开启）。",
+        "hint": "默认 3。抓取排序前 N 条的正文；0 等价于不抓（即使 fetch_pages 已开启）。**下次调用生效**。",
         "default": 3
       },
-      "fetch_timeout": {
+      "fetch_timeout_s": {
         "type": "int",
         "description": "单条抓取超时（秒）",
-        "hint": "3-60，默认 12。逐条抓取的超时；超时的那条 fetched.ok=false、code=fetch_timeout，不影响其它结果。",
+        "hint": "3-60，默认 12。逐条抓取的超时；超时那条 fetched.ok=false、code=fetch_timeout，不影响其它结果。**下次调用生效**。v5 的 search.fetch_timeout 改名。",
         "default": 12
       },
       "fetch_max_chars": {
         "type": "int",
         "description": "抓取正文长度上限（字符）",
-        "hint": "200-20000，默认 2000。抓取到的正文按此截断（与「资源与步数限制」里的单页正文上限是两个口径）；返回体整体还有 24KB 体积上限。",
+        "hint": "200-20000，默认 2000。抓取到的正文按此截断（与 resources.max_text_chars 是两个口径：一个管搜索结果正文，一个管浏览页正文）；返回体整体还有 24KB 体积上限。**下次调用生效**。",
         "default": 2000
       },
       "region": {
         "type": "string",
         "description": "地区（仅 brave）",
-        "hint": "ISO-3166-1 alpha-2 国家码（如 CN / US），留空表示不限。目前只有 brave 消费（country + search_lang）；其余 provider 忽略并在返回体 notes 里记 region_unsupported。",
+        "hint": "ISO-3166-1 alpha-2 国家码（如 CN / US），留空不限。目前只有 brave 消费（country + search_lang）；其余 provider 忽略并在返回体 notes 里记 region_unsupported。**下次调用生效**。",
         "default": ""
       },
       "safesearch": {
         "type": "string",
         "description": "安全搜索（仅 brave）",
+        "hint": "off / moderate / strict，默认 moderate。目前只有 brave 消费；其余 provider 使用各自默认值。**下次调用生效**。",
+        "default": "moderate",
         "options": [
           "off",
           "moderate",
           "strict"
-        ],
-        "hint": "off / moderate / strict，默认 moderate。目前只有 brave 消费；其余 provider 使用各自默认值。",
-        "default": "moderate"
+        ]
+      }
+    }
+  },
+  "security": {
+    "type": "object",
+    "description": "安全与内容审核",
+    "hint": "禁词过滤、内网拦截与会话黑白名单（与 v5 逐键相同，不改名不搬家）。搜索工具复用同一套禁词 / SSRF / 会话规则。",
+    "items": {
+      "banned_words": {
+        "type": "list",
+        "description": "内容禁词列表",
+        "hint": "命中这些关键词的网页正文/标题/搜索词/URL/识图结果会被拦截，禁止返回给模型与用户。搜索工具的检索词命中则整单拒绝，结果标题/摘要命中则只丢弃该条。**下次调用生效**。",
+        "default": [
+          "pornhub",
+          "色情",
+          "成人",
+          "赌博",
+          "暴力",
+          "政治",
+          "反动",
+          "恐怖",
+          "谣言",
+          "诈骗",
+          "病毒"
+        ]
       },
-      "proxy": {
-        "type": "string",
-        "description": "搜索与抓取代理",
-        "hint": "搜索 API 请求与结果正文抓取使用的代理，如 http://127.0.0.1:7890；留空直连。与「浏览器基础」里的浏览器代理相互独立（后者只给 Playwright）。",
-        "default": ""
+      "enable_banned_filter": {
+        "type": "bool",
+        "description": "启用内容审核（禁词过滤）",
+        "hint": "内容审核总开关。关闭后不再因禁词拦截内容，适合论坛等敏感词密集站点（避免整页被拒）；不影响内网拦截、本地页路径白名单等安全边界。**下次调用生效**。",
+        "default": true
       },
-      "mode": {
-        "type": "string",
-        "description": "搜索挂载层级（v1.7.0）",
-        "options": [
-          "external",
-          "internal"
-        ],
-        "hint": "external=池搜索挂在外层工具 browser_web_search，主 LLM 直接调用（默认，与 v1.6.0 行为逐字节一致；内层子代理只有打开引擎结果页的 browse_search）；internal=池搜索挂在内层工具 browse_web_search，由内层子代理调用，外层 browser_web_search 强制停用（模型看不到它），主 LLM 只能通过 browse_web 委派。两档互斥，不做「同时都有」：同时有会让主 LLM 与内层都去搜、结果重复、token 翻倍，还多一个「该用哪个」的决策面。两种模式共用同一个搜索服务实例（冷却与结果缓存跨模式共享）。写错的值按 external 处理并记 warning（fail-closed）。本项与「工具执行方式」的后台两键正交：后台两键管外层工具怎么跑，本项管搜索工具挂在哪一层。",
-        "default": "external"
+      "block_internal_ip": {
+        "type": "bool",
+        "description": "拦截内网地址",
+        "hint": "开启后拒绝访问内网/本机地址（如 127.0.0.1、192.168.x.x），防止 SSRF；搜索工具用它校验 provider 端点与结果链接。关闭后不拦截（不推荐）。**只对之后新建的浏览器会话生效**（已装的拦截不摘除——安全方向不因关开关而后退）。",
+        "default": true
+      },
+      "session_whitelist": {
+        "type": "list",
+        "description": "会话白名单",
+        "hint": "仅允许在这些会话中使用浏览能力。条目可以是完整 UMO（用 /sid 获取）或群号/用户 ID；精确匹配（按 : 或 | 切分后逐字段比对，或与完整 UMO 整体相等），黑名单里的 '123' 不会误伤群 '1234'。留空 = 允许全部会话。**下次调用生效**。",
+        "default": []
+      },
+      "session_blacklist": {
+        "type": "list",
+        "description": "会话黑名单",
+        "hint": "禁止在这些会话中使用浏览能力。格式同白名单（完整 UMO 或群号/用户 ID，精确匹配）。黑名单优先级高于白名单。**下次调用生效**。",
+        "default": []
       }
     }
   },
   "tools": {
     "type": "object",
-    "description": "工具执行方式（后台任务）",
-    "hint": "三个 LLM 工具（browse_web / browse_local_page / browser_web_search）默认是前台同步执行：主模型要等到工具返回才继续回复，长任务会把该会话的回复卡住（实测 browse_web 可达 68 秒）。打开本组后，工具入口改为立刻返回「【已受理】+ task_id」，真正的执行转到后台任务，结果由插件**单独发一条消息**到本会话，消息首行按四态区分：「【后台任务完成】」/「【后台任务失败】」/「【后台任务超时】」/「【后台任务已取消】」。并发两条闸：同会话同时最多 1 个后台任务（单飞）、全进程最多 4 个（模块常量，不是配置键），超出的提交**同步**返回「【拒绝】」且不占 task_id。部分结果：browse_local_page / browser_web_search 超时会附「已得部分结果」，browse_web 超时**没有**结果（子代理只在终局返回）；超时且没有任何半成品时会明说「本次没有可用结果。」。搜索结果在终态消息里是**人读摘要**（检索词 / 命中条数 / 前几条 title+url / 后端摘要），不是 JSON；可预期失败（空检索词 / 会话被拒 / 禁词 / 无可用后端 / total_timeout / 内部异常）按失败或超时呈现，**不会算成完成**。代价：后台结果不进入主模型上下文——用户追问时模型不知道结果。默认 off ⇒ 行为与 v1.4.0 完全一致；把 mode 改回 off 即回退（下一次工具调用生效，不需要重载插件、不需要重启），也不需要降版本。【v1.6.0 双引擎】本组还多一个 background_engine（plugin / core，默认 plugin）。注意 core 只对 browse_web 生效：即使 background_mode=all，browse_local_page 与 browser_web_search 在 engine=core 下仍然按**前台同步**执行（不会回落 plugin 后台）——想让这两个工具也后台化，请把 background_engine 改回 plugin。core 依赖核心修复 + 重启 astrbot.service；核心未修时插件自动拒绝 core、记一条 ERROR 并回落到 plugin。",
+    "description": "工具执行方式与后台治理",
+    "hint": "后台任务（v1.5.0 起的路线 D：工具入口立刻返回【已受理】，任务跑完由插件单独投递）的模式与截断，加上 v1.7.5 的群聊治理四项：单次投递（deliver_once）、提交去重（dedupe_window_s）、后台链上下文隔离（isolate_context）、内层/后台工具集收窄（narrow_tools）。core 后台引擎已移除（其四项缺陷的根因都在核心侧，插件不可闭环）。",
     "items": {
       "background_mode": {
         "type": "string",
         "description": "后台模式",
+        "hint": "off=全部前台同步（默认）；browse_only=只把整套多步浏览任务后台化（它是一次调用跑几十秒的长任务）；all=三个入口都后台化（短任务后台化等于多一次投递，通常没必要）。写错的值按 off 处理并记 warning（fail-closed）。**下次调用生效**。",
+        "default": "off",
         "options": [
           "off",
           "browse_only",
           "all"
-        ],
-        "hint": "off=三个工具都前台同步（默认，与 v1.4.0 一致）；browse_only=只把 browse_web 后台化（它是一次调用跑整套多步浏览的长任务，68 秒量级）；all=三个工具都后台化（browser_web_search 常态 1-3 秒，后台化等于多一次投递，通常没必要）。写错的值按 off 处理并记 warning（fail-closed）。",
-        "default": "off"
-      },
-      "background_timeout": {
-        "type": "int",
-        "description": "后台任务整任务硬预算（秒）",
-        "hint": "30-900，默认 240。后台模式下单个任务的整任务硬预算，超时后中断并发一条「【后台任务超时】」终态消息：browse_local_page / browser_web_search 会附「已得部分结果」并截断，**browse_web 超时没有结果**（子代理只在终局返回，不是结果丢了）；没有任何半成品时会明说「本次没有可用结果。」，工具自报的超时（如搜索的 total_timeout）另给一行「原因：」。核心的工具调用超时（生产 1000 秒）太宽，后台任务必须自带上限，否则一次异常会长期占住该会话的单飞名额。",
-        "default": 240
+        ]
       },
       "background_max_chars": {
         "type": "int",
         "description": "后台结果截断长度（字符）",
-        "hint": "200-8000，默认 1500。后台任务结束把结果发到会话时按此长度截断（browse_web 的文本可能几千字，直接发会刷屏），超出部分标注「…（完整结果已省略 N 字）」；媒体附件与消息头部不计入此上限。",
+        "hint": "200-8000，默认 1500。后台任务结束把结果发到会话时按此长度截断，超出标注「…（完整结果已省略 N 字）」；媒体附件与消息头部不计入此上限。**下次调用生效**。",
         "default": 1500
       },
-      "background_engine": {
-        "type": "string",
-        "description": "后台任务引擎",
-        "options": [
-          "plugin",
-          "core"
-        ],
-        "default": "plugin",
-        "hint": "plugin=插件自管后台（v1.5.0 路线 D：工具入口立刻返回【已受理】，任务跑完由插件单独发一条消息；交付确定，但结果不进主模型上下文）。core=平台原生后台任务（工具标 is_background_task，由核心派发、核心在完成后唤醒一轮主 LLM 交付；结果进上下文，但依赖模型调 send_message_to_user，且需要核心修复 + 重启）。core 只对 browse_web 生效：browse_local_page 永久排除（路径校验是安全相关，必须同步拒绝）、browser_web_search 排除（1-3 秒的任务后台化净亏一轮模型调用）。engine=core 但核心未修（包装器不镜像 is_background_task）时自动拒绝 core、记一条 ERROR 并回落到 plugin；绝不静默前台。engine=core 且 background_mode=off 时不探测、不告警（机制无关）。默认 plugin ⇒ 与 v1.5.0 行为一致；回滚把 engine 改回 plugin（下一次工具调用生效，无需重启/重载），止血把 background_mode 改回 off。"
-      }
-    }
-  },
-  "agent": {
-    "type": "object",
-    "description": "内嵌多模态子代理（v1.7.0）",
-    "hint": "本组配置的是 browse_web 内部那个跑「工具调用循环」的子代理（内层模型），不是主 LLM。v1.7.0 起主 LLM 只做委派：把任务连同 URL 交给 browse_web，由内层模型自己开页面、点元素、读正文、识图，最终把结论交回。默认值保证行为与 v1.6.0 逐字节一致：provider_id 留空=继承当前会话的模型，persona_mode=default=内层只有工具提示词。注意本组多数键是「下次调用生效」（面板保存即热更新），不需要重启。",
-    "items": {
-      "provider_id": {
-        "type": "string",
-        "description": "内层子代理模型 Provider ID",
-        "options": [
-          ""
-        ],
-        "hint": "留空=继承当前会话的模型（等于 v1.6.0 行为；这种方式下无法挑模型）。下拉只列 AstrBot 已配置、且声明了「多模态 + 支持工具调用」的聊天 Provider，插件会在启动后若干秒内与每次识图同类时机刷新，无需手改本文件；列表里没有目标模型就先去 AstrBot 模型配置里添加。内层子代理需要函数调用能力：所选模型声明了 modalities 却不含 tool_use 时插件会【错误】拒绝执行（核心会静默清空工具集，表现为「我无法浏览」，属最坏的静默失败）。所选模型只支持文本时走「页面感知与识图」组的 vision_provider_id 做 caption 兜底，返回体首行会加【注意】。显式指定却未加载（被删/禁用/改名）时同样【错误】拒绝，**不会**静默换成别的模型。",
-        "default": ""
+      "deliver_once": {
+        "type": "bool",
+        "description": "每个任务只投递一次",
+        "hint": "开启（默认）时，同一个后台任务最多只主动发一条终态消息（超时、失败、成功都算），避免一次任务产出 6 条口径不一的「结果」；关闭仅排障用。**下次调用生效**。",
+        "default": true
       },
-      "persona_mode": {
-        "type": "string",
-        "description": "内层人格档位",
-        "options": [
-          "default",
-          "current",
-          "custom"
-        ],
-        "hint": "default=内层只有工具提示词，不含任何人格（默认，与 v1.6.0 行为逐字节一致）；current=把当前会话生效人格的提示词（截断到 2000 字符）注入内层，让子代理说话像当前人格，但不继承该人格的工具/技能白名单；custom=使用下面的「内层自定义人格提示词」（≤4000 字符）。三档只影响语气与表达风格，不改变红线、工具清单与输出契约——分层顺序把红线放在最前并声明不可覆盖，人格层无法插入自己的工具说明来改写工具清单。写错的值按 default 处理并记 warning（fail-closed）。",
-        "default": "default"
-      },
-      "persona_prompt": {
-        "type": "text",
-        "description": "内层自定义人格提示词（custom 档专用）",
-        "hint": "仅 persona_mode=custom 时生效；≤4000 字符，超出按 4000 截断。default / current 两档忽略本项。写角色口吻、措辞习惯、报告风格即可——不要在这里写工具清单或安全规则（那些由插件固定的工具层与红线层负责，本项改不动它们）。",
-        "default": ""
-      },
-      "task_timeout": {
+      "dedupe_window_s": {
         "type": "int",
-        "description": "内层整任务硬上限（秒）",
-        "hint": "60-1800，默认 600。整个内层任务（含全部多步工具调用）的硬上限，到点中止并返回【错误】…（已完成 k 步，见台账）。三层超时互不替代：单步上限是「资源与步数限制」组的 agent_tool_timeout（核心抛一条工具超时错误，内层循环继续、模型可自救）；内层整任务上限是本项；后台整任务是「工具执行方式」组的 background_timeout（后台模式下若它比本项小，则后台先中止并发终态消息，这是预期行为）。按「单步耗时 × 预计步数」估：多步表单/连续翻页建议 600-900。",
+        "description": "重复提交去重窗口（秒）",
+        "hint": "0-3600，默认 600；0 = 关闭去重。同（会话, 工具, 规范化任务文本）在窗口内重复提交时直接回【重复请求】并附已完成结果，不再起第二个任务。**下次调用生效**。",
         "default": 600
       },
-      "image_max_side": {
-        "type": "int",
-        "description": "截图交给内层模型的最长边（像素）",
-        "hint": "320-2048，默认 1280。截图/裁剪交给内层模型前按最长边等比缩放。越小越省 token，越大越能看清小字与图标；识别密集文字的区域时，请改用 browse_zoom_crop 放大局部而不是一味调大本项。",
-        "default": 1280
+      "isolate_context": {
+        "type": "bool",
+        "description": "后台链上下文隔离",
+        "hint": "开启（默认）时，后台链只带本次任务的输入与结果，不读写会话历史——避免两条后台链互相串上下文（曾经把测试站点的内容当成另一件事的答案）。**下次调用生效**。",
+        "default": true
       },
-      "image_quality": {
-        "type": "int",
-        "description": "截图 JPEG 质量（40-95）",
-        "hint": "40-95，默认 80。与「最长边」共同决定图片体积。单图 base64 超过 1,500,000 字符（约 1.1 MB 原图）时会再压一半；仍超则丢弃该图片，并在文本里注明「图片过大已省略，请用 browse_get_text 或缩小裁剪区域」。",
-        "default": 80
-      },
-      "result_max_chars": {
-        "type": "int",
-        "description": "单个工具结果返回内层模型的文本上限（字符）",
-        "hint": "500-20000，默认 3000。内层每个工具返回给内层模型的文本上限，超出按此截断并标注「…（已截断 N 字）」，图片不受本项限制。累计返回超过 limits.agent_max_steps × 本项（默认 70×3000=210,000 字符）后，后续结果压缩到 800 字符并加【预算】前缀，防止一次长任务把上下文吃满。",
-        "default": 3000
-      },
-      "ledger_max_lines": {
-        "type": "int",
-        "description": "执行台账最大行数（0=不附）",
-        "hint": "0-60，默认 24；0 表示不附台账。执行台账是本次任务「调了哪些工具、参数是什么、结果如何」的确定性清单，由插件按实际调用顺序生成、附在 browse_web 返回值末尾（不依赖模型自述）。它的用途是避免收尾失真：模型说「我点了提交」但台账里没有对应的 click 行时，一眼就能看出来。行数按最近 N 步截断。",
-        "default": 24
+      "narrow_tools": {
+        "type": "bool",
+        "description": "内层/后台工具集收窄",
+        "hint": "开启（默认）时，内层与后台链的工具集闭合为**只有本插件自己的工具**（构造断言 + 运行期过滤 + WARN），不再继承人格的全量工具集——避免后台链去调群里没启用的插件工具。**下次调用生效**。",
+        "default": true
       }
     }
   }
