@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import base64
+import re
 from collections.abc import Iterable
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -399,7 +400,7 @@ def truncate_call_result(result, limit: int):
         else:
             out.append(item)
     if dropped_image:
-        note = "（图片过大已省略，请用 browse_get_text 或缩小裁剪区域）"
+        note = "（图片过大已省略：用 browse_observe 取结构文本，或缩小截图区域）"
         for idx in range(len(out) - 1, -1, -1):
             if isinstance(out[idx], _mcp_types.TextContent):
                 out[idx] = _mcp_types.TextContent(
@@ -580,6 +581,9 @@ def _first_line(text: str) -> str:
             return line
     return ""
 
+#: 台账抹掉 URL query 用的正则（保留 origin+path）。
+_URL_QUERY_RE = re.compile(r"(https?://[^\s?)]+)\?[^\s)]*")
+
 
 def _render_args(args: dict, *, redact=None) -> str:
     """台账参数串：``k=v`` 逗号分隔，值截断到 ``LEDGER_ARG_MAX``。"""
@@ -593,6 +597,7 @@ def _render_args(args: dict, *, redact=None) -> str:
                 text = redact(text)
             except Exception:  # noqa: BLE001 — 脱敏失败不许影响台账
                 pass
+        text = _URL_QUERY_RE.sub(r"\1?***", text)  # 台账承诺不含 URL query
         out.append(f"{key}={truncate_text(text, LEDGER_ARG_MAX)}")
     return ", ".join(out)
 

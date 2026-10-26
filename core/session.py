@@ -7,7 +7,7 @@
 
 设计说明：_pages[umo] 为该会话的标签页列表，_active[umo] 为当前
 激活标签的 0 起始索引；ensure_page 返回激活页（无会话时新建第一个标签，
-落在 default_url = ``about:blank``）。v1.7.5 起工具链走
+落在 ``about:blank``（R15：无起始页，形态与属性都已删除））。v1.7.5 起工具链走
 :meth:`claim_page`：**按任务**取页 —— 同一任务复用，换任务先关旧任务页
 （跨任务复用会带上上一任务的表单/滚动/登录态，且 mark/ref 纪元是按任务
 隔离的，页面也应隔离）。
@@ -40,7 +40,6 @@ class SessionManager:
         browser: "BrowserCore",
         max_pages: int = 5,
         idle_timeout: float = 1800,
-        default_url: str = "about:blank",
         on_page_closed: "Callable[[Any], None] | None" = None,
     ) -> None:
         """初始化会话管理器。
@@ -50,8 +49,6 @@ class SessionManager:
             max_pages: 全部会话的标签页总数上限；达到后新标签/
                 新会话被拒绝。
             idle_timeout: 会话空闲回收阈值（秒）。
-            default_url: 新会话首个标签的初始页地址（v1.7.5 恒为
-                ``about:blank``：不再有"起始页"配置，第一个动作自己 navigate）。
             on_page_closed: 页面关闭后的回调（插件用它把感知层的 CDP 会话
                 （``a11y.CdpSessionPool``）与执行层的会话缓存（``executor.drop_cdp``）
                 一起释放 —— 两者都以 ``id(page)`` 为键，不摘就是泄漏）。
@@ -59,7 +56,6 @@ class SessionManager:
         self.browser = browser
         self.max_pages = int(max_pages)
         self.idle_timeout = float(idle_timeout)
-        self.default_url = default_url
         self.on_page_closed = on_page_closed
 
         # umo -> 标签页列表；_active 为当前激活标签的 0 起始索引。
@@ -272,7 +268,8 @@ class SessionManager:
             return None
 
         # 锁外：创建并导航新页（goto 不占全局锁）。
-        page = await self._new_page_goto(self.default_url)
+        # R15：无起始页（spec §7.4-5）—— 形参与属性都删掉，写死 about:blank
+        page = await self._new_page_goto("about:blank")
         if page is None:
             return None
 

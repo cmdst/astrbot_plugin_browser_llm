@@ -119,8 +119,8 @@ class Candidate:
         bits.append("visible" if self.visible else (self.hidden_reason or "hidden"))
         if not self.enabled:
             bits.append("disabled")
-        if self.box is not None:
-            bits.append("box=" + ",".join(str(int(v)) for v in self.box))
+        # R9：候选表进**模型可见**的观测块，按 spec §5.4/§13.2-T3 绝不给像素坐标
+        # （否则等于教模型编坐标）。box 仍在 to_payload()/日志/测试里可查。
         return " ".join(bits)
 
     def to_payload(self) -> dict:

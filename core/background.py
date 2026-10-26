@@ -195,6 +195,8 @@ def render_terminal_text(
     missing_files: int = 0,
     partial: str = "",
     diagnostics: bool = False,
+    steps: int = 0,
+    ledger: str = "",
 ) -> str:
     """渲染终态正文（四态共用头部，前缀按状态分流，见 :data:`HEADERS`）。
 
@@ -208,6 +210,11 @@ def render_terminal_text(
         f"（task_id={task_id}，耗时 {elapsed_s:.1f}s）"
     )
     lines = [head]
+    # R11（spec §6.2/§6.7）：后台超时也要能看出"跑到哪了"。
+    if steps > 0:
+        lines.append(f"（已完成 {int(steps)} 步）")
+    if str(ledger or "").strip():
+        lines.append(str(ledger).strip())
     if status == STATUS_OK:
         lines.append(text.strip() or EMPTY_RESULT_NOTE)
         if artifact_count or missing_files:
@@ -347,6 +354,10 @@ class BackgroundRegistry:
         self.clock: Callable[[], float] = clock or time.monotonic
         self.max_parallel = max(1, int(max_parallel))
         self.dedupe_window_s = max(0.0, float(dedupe_window_s))
+        #: R4：``tools.deliver_once``（默认开）。关掉 = 投递闸不计数（只给对照实验
+        #: 用，会重复投递）；生产默认必须开 —— 它是"每任务恰好一条主动投递 + 一条
+        #: 终态"的唯一实现处。
+        self.deliver_once = True
 
     def next_task_id(self) -> str:
         """短 task_id（``bg-0001`` 起自增；单实例内唯一）。"""
@@ -547,6 +558,8 @@ class BackgroundRegistry:
             job = self._jobs.get(task_id) or self._done.get(task_id)
             if job is None:
                 return False
+            if not getattr(self, "deliver_once", True):
+                return True
             if channel == DELIVERY_CHANNEL_TERMINAL:
                 if job.terminal_sent >= MAX_TERMINAL_DELIVERIES:
                     logger.warning("重复终态投递被拦截 task_id=%s（终态只允许一条）", task_id)
@@ -911,6 +924,9 @@ class BudgetWatchdog:
     def _render_default(
         self, job: BackgroundJob, status: str, text: str, reason: str, partial: str
     ) -> str:
+        progress = getattr(job, "progress", None) or {}
+        steps = int(progress.get("steps") or 0)
+        ledger = str(progress.get("ledger") or "")
         return render_terminal_text(
             task_id=job.task_id,
             tool=job.tool,
@@ -921,6 +937,8 @@ class BudgetWatchdog:
             budget_s=float(job.budget_s),
             partial=truncate_result(partial, int(job.max_chars))[0],
             diagnostics=True,
+            steps=steps,
+            ledger=truncate_result(ledger, int(job.max_chars))[0] if ledger else "",
         )
 
     @staticmethod
