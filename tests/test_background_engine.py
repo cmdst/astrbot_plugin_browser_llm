@@ -867,8 +867,8 @@ def test_e8_code_side_guards():
     assert "func_tool_manager.py:228-244" in _CORE_FIX_HINT
     assert _BG_ENGINE_REFUSED == "tools.background_engine=core 拒绝启用"
 
-    # S1 的代码侧：版本兜底已到 v1.6.0（文档四方由 T3 负责）
-    assert main_module._PLUGIN_VERSION_FALLBACK == "v1.6.0"
+    # S1 的代码侧：版本兜底已到 v1.7.0（文档四处一致由 ``test_v170_docs_vs_code.py`` 钉住）
+    assert main_module._PLUGIN_VERSION_FALLBACK == "v1.7.0"
 
 
 def test_e8_no_core_switch_in_schema_defaults():
