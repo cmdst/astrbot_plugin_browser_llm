@@ -135,9 +135,15 @@ def _v175_changelog_section() -> str:
 
 
 def _readme_current_section() -> str:
-    """README 的「功能特性」之前的现行部分（版本行 + 架构节）。"""
-    end = README.find("## ✨ 功能特性")
-    return README if end < 0 else README[:end]
+    """README 的**现行**部分 = 「历史版本」标记之前的全部内容（R5）。"""
+    end = README.find("## 📜 历史版本")
+    assert end > 0, "README 缺「历史版本」分章标记（R5 要求旧内容整体归档）"
+    return README[:end]
+
+
+def _readme_history_section() -> str:
+    end = README.find("## 📜 历史版本")
+    return README[end:] if end > 0 else ""
 
 
 def test_docs_do_not_advertise_deleted_tools_as_current():
@@ -153,3 +159,53 @@ def test_docs_do_not_advertise_deleted_tools_as_current():
             assert any(
                 word in window for word in ("旧", "退役", "删除", "整条", "旧名")
             ), f"CHANGELOG v1.7.5 节把已删的 {name} 当现行能力在写：…{window}…"
+
+
+def test_readme_current_part_has_no_deleted_keys_or_tools():
+    """R5：现行部分不得把已删的键/工具/引擎当现状文档（历史章节里允许）。"""
+    current = _readme_current_section()
+    forbidden = (
+        "search.mode",
+        "browse_web_search",
+        "browser.default_url",
+        "tools.background_engine",
+        "内层工具面：26",
+        "is_background_task",
+    )
+    # 允许"点名说它已删除"的行（那是迁移说明，不是把旧键当现状）
+    retired_words = ("退役", "已删", "删除", "不再", "改为", "已取消")
+    for needle in forbidden:
+        for line in current.splitlines():
+            if needle not in line:
+                continue
+            assert any(word in line for word in retired_words), (
+                f"README 现行部分把已删的 {needle} 当现状写：{line.strip()[:120]}"
+            )
+
+
+def test_readme_current_part_documents_v175_surface():
+    """R5：现行部分必须写全六层 / 5 工具 / 58 叶 / 无起始页 / 无 core 引擎。"""
+    current = _readme_current_section()
+    for module in (
+        "core/a11y.py",
+        "core/action_model.py",
+        "core/executor.py",
+        "core/verify.py",
+        "core/background.py",
+        "core/config_map.py",
+    ):
+        assert module in current, f"README 现行部分缺六层模块 {module}"
+    for tool in ("browse_observe", "browse_act", "browse_screenshot", "browse_media", "browse_search"):
+        assert tool in current, f"README 现行部分缺内层工具 {tool}"
+    assert "配置叶 58 条" in current and "JSON 叶子键 60 个" in current
+    assert "【需要网址】" in current, "必须写清无起始页后的行为"
+    assert "退役" in current or "无 core 引擎" in current
+    # 58 叶键表：每个组都在现行部分出现
+    for group in ("resources", "perception", "model", "actions", "search", "security", "tools"):
+        assert f"`{group}`" in current, f"v6 键表缺组 {group}"
+
+
+def test_readme_history_section_is_marked_and_reachable():
+    history = _readme_history_section()
+    assert "v1.7.0 及更早" in history
+    assert "一律以前者为准" in history or "以其为准" in history

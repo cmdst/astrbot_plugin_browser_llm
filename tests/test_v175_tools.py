@@ -226,7 +226,8 @@ def test_session_has_no_start_page_and_claims_by_task():
     import inspect
 
     sig = inspect.signature(session_core.SessionManager.__init__)
-    assert sig.parameters["default_url"].default == "about:blank"
+    # R15：`default_url` 形参已按 spec §7.4-5 删除，起始页写死在 _new_page_goto 里
+    assert "default_url" not in sig.parameters
     assert hasattr(session_core.SessionManager, "claim_page")
     src = inspect.getsource(session_core.SessionManager.claim_page)
     assert "_close_all_pages" in src and "ensure_page" in src
@@ -504,7 +505,7 @@ def test_page_close_notifies_drop_hooks(tmp_path):
 
     page = object()
     mgr = session_mod.SessionManager(
-        _Browser(), default_url="about:blank", on_page_closed=dropped.append
+        _Browser(), on_page_closed=dropped.append
     )
     asyncio.run(mgr._close_page("umo", page))
     assert dropped == [page]

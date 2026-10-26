@@ -656,3 +656,89 @@ def test_restore_requires_regular_file(tmp_path, capsys):
     rc = run_cli("--restore-from", str(tmp_path / "x.json"), "--config", os.devnull)
     assert rc == 2
     capsys.readouterr()
+
+
+# ------------------------------------------------ R12：幂等不备份 + v6 基线拒校验
+
+
+def _run_cli(args, tmp_path):
+    """跑迁移器 CLI，返回 (rc, stdout, stderr)。"""
+    import subprocess
+    import sys as _sys
+
+    proc = subprocess.run(
+        [_sys.executable, str(ROOT / "tools" / "migrate_config_v6.py"), *args],
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+    )
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def _v5_config() -> dict:
+    from astrbot_plugin_browser_llm.core import config_map
+
+    out: dict = {}
+    for path in config_map.KEY_MAP_V5:
+        cursor = out
+        parts = path.split(".")
+        for part in parts[:-1]:
+            cursor = cursor.setdefault(part, {})
+        cursor[parts[-1]] = 1
+    out.setdefault("search", {})["providers"] = []
+    return out
+
+
+def test_idempotent_apply_creates_no_second_backup(tmp_path):
+    """R12：第二次 apply（幂等）不得再生成备份，否则 baseline 会挑到 v6 内容的备份。"""
+    cfg = tmp_path / "cfg.json"
+    cfg.write_text(__import__("json").dumps(_v5_config()), encoding="utf-8")
+
+    rc1, _out1, _err1 = _run_cli(["--config", str(cfg), "--apply"], tmp_path)
+    assert rc1 == 0
+    backups_after_first = sorted(tmp_path.glob("cfg.json.bak-pre-v6-*"))
+    assert backups_after_first, "第一次（有变更）必须备份"
+
+    rc2, out2, _err2 = _run_cli(["--config", str(cfg), "--apply"], tmp_path)
+    assert rc2 == 0
+    assert "idempotent=1" in out2, out2
+    backups_after_second = sorted(tmp_path.glob("cfg.json.bak-pre-v6-*"))
+    assert backups_after_second == backups_after_first, "幂等 apply 不许再生成备份"
+
+
+def test_verify_baseline_rejects_a_v6_backup(tmp_path):
+    """R12：v6 形态的基线 ⇒ rc=2 + 明确报错（而不是静默 OK）。"""
+    import json
+
+    cfg = tmp_path / "cfg.json"
+    cfg.write_text(json.dumps(_v5_config()), encoding="utf-8")
+    rc, _out, _err = _run_cli(["--config", str(cfg), "--apply"], tmp_path)
+    assert rc == 0
+    # 造一个 v6 形态的基线（模拟"旧版本留下的 v6 备份"）
+    v6_backup = tmp_path / "cfg.json.bak-pre-v6-9999999999"
+    v6_backup.write_text(cfg.read_text(encoding="utf-8"), encoding="utf-8")
+    rc2, _out2, err2 = _run_cli(
+        ["--config", str(cfg), "--verify", "--baseline", str(v6_backup)], tmp_path
+    )
+    assert rc2 == 2, (rc2, err2)
+    assert "已经是 v6 形态" in err2
+
+
+def test_verify_baseline_auto_skips_v6_shaped_backups(tmp_path):
+    """R12：`--baseline` 无参（自动挑最新）时也必须跳到 v5 形态那一份。"""
+    import json
+
+    cfg = tmp_path / "cfg.json"
+    cfg.write_text(json.dumps(_v5_config()), encoding="utf-8")
+    rc, _out, _err = _run_cli(["--config", str(cfg), "--apply"], tmp_path)
+    assert rc == 0
+    # 更晚的 v6 形态备份（时间更新）
+    import os
+    import time
+
+    newest = tmp_path / "cfg.json.bak-pre-v6-9999999999"
+    newest.write_text(cfg.read_text(encoding="utf-8"), encoding="utf-8")
+    os.utime(newest, (time.time() + 10, time.time() + 10))
+    rc2, out2, _err2 = _run_cli(["--config", str(cfg), "--verify", "--baseline"], tmp_path)
+    assert rc2 == 0, out2
+    assert "9999999999" not in out2, "自动挑选必须跳过 v6 形态的备份"

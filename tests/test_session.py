@@ -56,7 +56,7 @@ def mb() -> MockBrowser:
 
 @pytest.fixture
 def sm(mb) -> SessionManager:
-    return SessionManager(mb, max_pages=4, idle_timeout=60, default_url="https://www.baidu.com")
+    return SessionManager(mb, max_pages=4, idle_timeout=60)
 
 
 # ------------------------------------------------------------

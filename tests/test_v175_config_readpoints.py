@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import ast
+import re
 import sys
 from pathlib import Path
 
@@ -81,17 +82,29 @@ def test_dropped_v5_keys_have_no_read_point():
 
 
 def test_agent_max_steps_is_gone_from_sources():
+    """v5 的 `limits.agent_max_steps` 必须消失（步数护栏改名 `derive_max_steps` 以免误命中）。"""
+    pattern = re.compile(r"(?:^|[^\w])agent_max_steps")
     for rel, text in RUNTIME_SOURCES.items():
         if rel == "core/config_map.py":  # v5 冻结视图（迁移器要用）
             continue
-        assert "agent_max_steps" not in text, f"{rel} 仍提到已取消的 agent_max_steps"
+        hits = [
+            line for line in text.splitlines()
+            if pattern.search(line)
+        ]
+        assert not hits, f"{rel} 仍引用已取消的 v5 键：{hits[:2]}"
 
 
 def test_screenshot_to_chat_is_an_inversion_not_a_rename():
+    """R2：迁移时取反一次（`silent_mode → not silent_mode`），**读取点用真值**。
+
+    键的语义是"截图是否发到会话"，所以实现必须是 `if bool(self.screenshot_to_chat)`
+    才发群；`not bool(...)` 会把语义再翻回去（默认发群 + 开了反而静默）。
+    """
     assert "perception.screenshot_to_chat" in MAIN_SRC
     assert "silent_mode" not in MAIN_SRC, "silent_mode 只应作为历史注释存在，不能是读取点"
-    # 取反用法：不发群 = not screenshot_to_chat（_screenshot_impl 与 _media 的判定）
-    assert "not bool(self.screenshot_to_chat)" in MAIN_SRC
+    assert "if bool(self.screenshot_to_chat):" in MAIN_SRC, "发群判定必须是真值"
+    assert "not bool(self.screenshot_to_chat)" not in MAIN_SRC, "R2：这里不许再取反"
+    assert "sent_to_user=bool(self.screenshot_to_chat)" in MAIN_SRC
 
 
 def test_device_scale_factor_drives_som_and_header():
