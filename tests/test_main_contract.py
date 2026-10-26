@@ -24,10 +24,30 @@ _ROOT = Path(__file__).resolve().parent.parent
 _SRC = (_ROOT / "main.py").read_text(encoding="utf-8")
 _TREE = ast.parse(_SRC)
 
+def _bodies(*names: str) -> str:
+    """取若干函数的源码片段拼接（v1.5.0 起工具入口与实现体分家）。
+
+    为什么需要它：三个入口为了支持后台模式，把"真正的执行体"拆成了
+    ``_browse_web_run`` / ``_local_page_render`` / ``_run_browser_web_search``，
+    入口只做「前置校验 + 后台 or 前台分派」。原先这类静态守卫扫入口函数体，
+    现在必须同时扫实现体，否则守卫会因为"代码搬了家"而误报。
+    """
+    parts: list[str] = []
+    for name in names:
+        node = next(
+            (n for n in ast.walk(_TREE)
+             if isinstance(n, ast.AsyncFunctionDef) and n.name == name),
+            None,
+        )
+        if node is not None:
+            parts.append(ast.get_source_segment(_SRC, node) or "")
+    return "\n".join(parts)
+
+
 # 允许的参数类型标注（工具 parameters JSON Schema 类型）
 _ALLOWED_TYPES = {"string", "number", "object", "array", "boolean"}
 
-# 期望的 24 个浏览工具名
+# 期望的 26 个浏览工具名（v1.7.0：+browse_get_interactive / +browse_click_selector）
 EXPECTED_TOOLS = [
     "browse_search", "browse_open", "browse_current_page", "browse_get_text",
     "browse_get_links", "browse_click_link", "browse_scroll", "browse_go_back",
@@ -36,6 +56,8 @@ EXPECTED_TOOLS = [
     "browse_click_text", "browse_set_slider", "browse_select_option",
     "browse_click_coords", "browse_hover", "browse_reload", "browse_checkbox",
     "browse_zoom_crop", "browse_sniff_media",
+    # v1.7.0：交互原语两条（条件注册的第 27 个 browse_web_search 不在本表）
+    "browse_get_interactive", "browse_click_selector",
 ]
 
 # 无参工具：docstring 不应含 Args 段
@@ -57,15 +79,17 @@ EXPECTED_PARAMS = {
     "browse_close_tab": {"index": True},
     "browse_input": {"selector": True, "text": True},
     "browse_press_key": {"key": True},
-    "browse_click_text": {"text": True},
+    "browse_click_text": {"text": True, "index": False},
     "browse_set_slider": {"value": True},
     "browse_select_option": {"selector": True, "value": True},
     "browse_click_coords": {"x": True, "y": True},
     "browse_hover": {"text": True},
     "browse_reload": {},
-    "browse_checkbox": {"selector": True, "checked": True},
+    "browse_checkbox": {"selector": True, "checked": False, "index": False},
     "browse_zoom_crop": {"x": True, "y": True, "width": True, "height": True},
     "browse_sniff_media": {"media_type": False, "max_items": False},
+    "browse_get_interactive": {"max_items": False, "role_filter": False},
+    "browse_click_selector": {"selector": True, "index": False},
 }
 
 
@@ -191,9 +215,9 @@ def test_16_browse_methods_exist():
 # _BROWSER_TOOLS 配置
 # ------------------------------------------------------------
 
-def test_24_browse_tools_config():
+def test_26_browse_tools_config():
     spec = _browser_tools_spec()
-    assert len(spec) == 24, f"_BROWSER_TOOLS 应为 24 项，实际 {len(spec)}"
+    assert len(spec) == 26, f"_BROWSER_TOOLS 应为 26 项，实际 {len(spec)}"
     names = [s["name"] for s in spec]
     assert names == EXPECTED_TOOLS, f"工具名顺序不一致: {names}"
     assert len(names) == len(set(names)), "工具名不应重复"
@@ -351,13 +375,8 @@ def test_tool_loop_agent_and_toolset_present():
 
 def test_browse_web_uses_plugin_config():
     """browse_web 用 agent_max_steps / agent_tool_timeout 配置。"""
-    node = next(
-        (n for n in ast.walk(_TREE)
-         if isinstance(n, ast.AsyncFunctionDef) and n.name == "browse_web"),
-        None,
-    )
-    assert node is not None
-    body = ast.get_source_segment(_SRC, node) or ""
+    body = _bodies("browse_web", "_browse_web_run")
+    assert body, "未找到 browse_web 入口/实现体"
     assert "agent_max_steps" in body and "agent_tool_timeout" in body
 
 
@@ -402,7 +421,8 @@ def test_new_configs_in_schema():
     """
     import json
     schema = json.loads((_ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
-    assert set(schema) == {"browser", "limits", "security", "perception", "search"}
+    assert set(schema) == {
+        "browser", "limits", "security", "perception", "search", "tools", "agent"}
     for group in schema.values():
         assert group["type"] == "object"
 
@@ -425,10 +445,12 @@ def test_new_configs_in_schema():
     assert perception["vision_cache_ttl"]["type"] == "int"
     assert perception["vision_cache_ttl"]["default"] == 60
 
-    # ---- v4：search 组（16 键 + 5 provider 模板） ----
+    # ---- v4：search 组（16 键 + 5 provider 模板）；v1.7.0 追加 mode => 17 ----
     search = schema["search"]
     assert search["type"] == "object"
-    assert len(search["items"]) == 16, sorted(search["items"])
+    assert len(search["items"]) == 17, sorted(search["items"])
+    assert search["items"]["mode"]["options"] == ["external", "internal"]
+    assert search["items"]["mode"]["default"] == "external"
     providers = search["items"]["providers"]
     assert providers["type"] == "template_list"
     assert providers["default"] == []
@@ -472,13 +494,8 @@ def test_browse_web_uses_dynamic_instruction():
     全局 page_perception；system_prompt 用本次模式动态构建，而不是
     固定使用预构建的 self._browser_instruction。
     """
-    node = next(
-        (n for n in ast.walk(_TREE)
-         if isinstance(n, ast.AsyncFunctionDef) and n.name == "browse_web"),
-        None,
-    )
-    assert node is not None
-    body = ast.get_source_segment(_SRC, node) or ""
+    body = _bodies("browse_web", "_browse_web_run")
+    assert body, "未找到 browse_web 入口/实现体"
     assert "_parse_perception_prefix" in body, "应解析 input 感知模式前缀"
     assert "_resolve_perception_mode" in body, "应按优先级解析感知模式"
     assert "_build_subagent_instruction(" in body, "应按本次模式动态构造指令"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""browser_llm 配置迁移器 v4（v3 -> v4：4 组/25 叶 -> 5 组/41 叶）。
+"""browser_llm 配置迁移器（v3 -> 当前版：4 组/25 叶 -> 6 组/45 叶）。
 
 **为什么必须独立于插件运行**：核心 ``AstrBotConfig.__init__`` 会在插件
 ``__init__`` 之前按 schema 删除未知键并落盘（``astrbot_config.py:113``、
@@ -33,7 +33,7 @@
 - 任何模式都**不打印配置值**，只打印键名 / 计数 / 分组名 / 叶值哈希；
 - ``--apply`` 先备份再原子替换，文件权限 0600、保留 BOM；
 - 未知键默认拒绝写盘（``--allow-unknown`` 才保留并继续）；
-- 幂等：已是 5 组齐全的 v4 结构时 no-op（只补缺失叶子，不覆盖已有值）；
+- 幂等：已是 6 组齐全的当前结构时 no-op（只补缺失叶子，不覆盖已有值）；
 - 任何路径段数 > 2 ⇒ 拒绝写盘（退出码 2）：本迁移器只支持"组 -> 叶"两层，
   ``providers`` 整值当**不透明叶子**搬运、不展开。
 
@@ -57,7 +57,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from core.config_map import GROUPS, KEY_MAP  # noqa: E402
+from core.config_map import GROUPS, GROUPS_V4, KEY_MAP, KEY_MAP_V4  # noqa: E402
 
 BOM = "utf-8-sig"
 
@@ -92,11 +92,44 @@ SEARCH_DEFAULTS: dict[str, Any] = {
     "search.proxy": "",
 }
 
+#: v1.5.0 纯新增的 tools 组默认值 + v1.6.0 的 ``tools.background_engine``
+#: （同样无 v3 扁平旧键）。
+#: 与 ``_conf_schema.json["tools"]["items"][k]["default"]`` 逐条相等，由
+#: ``tests/test_search_migration_v4.py`` 钉住。默认 off ⇒ 迁移后的配置行为
+#: 与 v1.4.0 一致（这是"默认关闭"落在迁移产物上的那一面）。
+TOOLS_DEFAULTS: dict[str, Any] = {
+    "tools.background_mode": "off",
+    "tools.background_timeout": 240,
+    "tools.background_max_chars": 1500,
+    # v1.6.0：后台**机制**维度。默认 plugin ⇒ 迁移产物的行为与 v1.5.0 一致；
+    # core 需要核心修复 + 重启，绝不做成默认值。
+    "tools.background_engine": "plugin",
+}
+
+#: 全部"v3 没有的新键"默认值（迁移时整组补齐；设计 §1.3-⑨ 命名的
+#: ``DEFAULTED_PATHS``）。新增键只加在这里，``migrate()`` 与
+#: ``is_migrated()`` 自然跟上（不再各写一份），``V4_PATHS`` 保持
+#: ``tuple(KEY_MAP)`` 不动 —— 冻结成 41 条会让 ``is_migrated()``
+#: 对自己的产物返回 False。
+DEFAULTED_PATHS: dict[str, Any] = {**SEARCH_DEFAULTS, **TOOLS_DEFAULTS}
+
 #: 必须有值的叶集合：v3 的 25 条（迁移基线）。缺任一条 = 迁移源不完整。
 LEGACY_PATHS: tuple[str, ...] = tuple(sorted(_PATH_TO_FLAT))
 
-#: 全部 v4 路径（41 条）。
-V4_PATHS: tuple[str, ...] = tuple(KEY_MAP)
+#: v4 的 45 条路径（**冻结**，来自 ``core.config_map.KEY_MAP_V4``）。
+#:
+#: v1.7.0 起这个列表**不能再跟活 ``KEY_MAP`` 走**：活表已经 54 条（v5 新增
+#: ``search.mode`` + ``agent.*`` 9 条），跟着走会让 ``is_migrated()``
+#: 对**它自己产出的 45 叶 v4 配置**恒返回 ``False``（永远自称"还没迁移"），
+#: 于是 ``--apply`` 每次都白写一次内容等价的文件、也不再打印 already-migrated。
+V4_PATHS: tuple[str, ...] = tuple(KEY_MAP_V4)
+
+#: v4 的 6 个组（**冻结**）：``is_migrated()`` 的"组齐全"判定只用它。
+V4_GROUP_ORDER: tuple[str, ...] = tuple(GROUPS_V4)
+
+#: 活表里"v4 之后新增"的路径（v5 的 9 条）。``is_migrated()`` 对它们**不敏感**：
+#: 一份已经是 v5 的配置在 v4 意义上同样是"v4 迁移做完了"，不该被判成未迁移。
+POST_V4_PATHS: frozenset[str] = frozenset(KEY_MAP) - frozenset(KEY_MAP_V4)
 
 
 def _load_leaf_order() -> dict[str, tuple[str, ...]]:
@@ -186,7 +219,7 @@ def _ordered_leaf_paths() -> list[str]:
 
 
 def nest(canonical: dict[str, Any]) -> dict[str, Any]:
-    """``路径 -> 值`` -> 5 组嵌套结构；叶子顺序与 ``_conf_schema.json`` 对齐。
+    """``路径 -> 值`` -> 按组顺序的嵌套结构；叶子顺序与 ``_conf_schema.json`` 对齐。
 
     ``search.providers`` 原样搬运（不展开、不校验条目内部结构）。
     """
@@ -204,10 +237,12 @@ def nest(canonical: dict[str, Any]) -> dict[str, Any]:
 
 
 def migrate(config: dict, *, allow_unknown: bool = False) -> dict:
-    """v3（扁平或分组）-> v4（5 组 / 41 叶）。
+    """v3（扁平或分组）-> 当前形态（6 组 / 45 叶）。
 
     - 既有 25 条路径的**值原样搬运**（不做任何类型归一，避免改变语义）；
-    - 16 条 search 路径在源里没有 ⇒ 取 ``SEARCH_DEFAULTS``；
+    - v3 没有的新键（search 组 16 条、tools 组 4 条 = v1.5.0 的 3 条 +
+      v1.6.0 的 ``background_engine``）源里没有
+      ⇒ 取 ``DEFAULTED_PATHS``（= ``SEARCH_DEFAULTS`` + ``TOOLS_DEFAULTS``）；
     - ``search`` 组已存在时**只补缺失键，不覆盖已有值**（尤其 ``api_key``）；
     - 未知键默认拒绝；``allow_unknown=True`` 时原样保留（分组键放回组内）。
     """
@@ -217,7 +252,7 @@ def migrate(config: dict, *, allow_unknown: bool = False) -> dict:
         raise MigrationError(f"unknown keys, refusing to write: {names}")
 
     filled = dict(canonical)
-    for path, default in SEARCH_DEFAULTS.items():
+    for path, default in DEFAULTED_PATHS.items():
         if path not in filled:
             filled[path] = default
 
@@ -234,7 +269,15 @@ def migrate(config: dict, *, allow_unknown: bool = False) -> dict:
 
 
 def is_migrated(config: dict) -> bool:
-    """是否已是完整 v4 结构：无扁平旧键 + 5 组齐全 + 41 条路径全在。
+    """是否已是完整 **v4** 结构：无扁平旧键 + 6 组齐全 + 45 条路径全在。
+
+    三条判定都用**冻结**表（``V4_GROUP_ORDER`` / ``V4_PATHS``）：
+
+    - 归档边界：v4 迁移器是"历史步骤"，它的"已迁移"必须按它自己那版结构判，
+      否则（跟着活 ``KEY_MAP`` 走）它对自家产物恒 ``False``；
+    - 向前兼容：一份已经是 v5（7 组 / 54 叶）的配置在 v4 意义上**也是**
+      "v4 迁移做完了" ⇒ 多出来的 ``agent`` 组与 ``search.mode`` 不算未知键
+      （它们出现在活 ``KEY_MAP`` 里，由 ``flatten`` 归一为已知路径）。
 
     坑（audit §7.4-③）：v3 时代只要求"无扁平键 + 已存在的组是 dict"，于是
     "缺 search 组的 4 组配置"被判成已迁移、新增组永远进不了迁移。这里对
@@ -244,13 +287,15 @@ def is_migrated(config: dict) -> bool:
         return False
     if any(key in config for key in _FLAT_TO_PATH):
         return False
-    if set(GROUP_ORDER) - set(config):
+    if set(V4_GROUP_ORDER) - set(config):
         return False
-    for group in GROUP_ORDER:
+    for group in V4_GROUP_ORDER:
         value = config.get(group)
         if not isinstance(value, dict):
             return False
     canonical, unknown = flatten(config)
+    # 只对"v4 之后新增"的路径免疫；真正的未知键仍然判未迁移。
+    unknown = [item for item in unknown if item[0] not in POST_V4_PATHS]
     if unknown:
         return False
     return all(path in canonical for path in V4_PATHS)

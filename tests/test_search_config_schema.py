@@ -37,14 +37,14 @@ def schema_paths(schema: dict) -> set[str]:
 
 
 def test_schema_leaves_match_key_map():
-    """schema 的 41 个叶子 == KEY_MAP 的 41 条路径（双向）。"""
+    """schema 的 54 个叶子 == KEY_MAP 的 54 条路径（双向；v5 起 45 -> 54）。"""
     schema = load_schema()
     paths = schema_paths(schema)
     assert paths == set(KEY_MAP), (
         f"仅 schema 有: {sorted(paths - set(KEY_MAP))}；"
         f"仅 KEY_MAP 有: {sorted(set(KEY_MAP) - paths)}"
     )
-    assert len(paths) == 41
+    assert len(paths) == 54
 
 
 def test_group_names_match_groups():
@@ -52,11 +52,19 @@ def test_group_names_match_groups():
     schema = load_schema()
     used = {path.split(".", 1)[0] for path in KEY_MAP}
     assert set(schema) == set(GROUPS) == used
-    assert set(GROUPS) == {"browser", "limits", "security", "perception", "search"}
+    assert set(GROUPS) == {
+        "browser",
+        "limits",
+        "security",
+        "perception",
+        "search",
+        "tools",
+        "agent",
+    }
 
 
 def test_search_paths_are_two_segments():
-    """迁移器只支持 2 层：所有 search.* 路径必须恰好 2 段。"""
+    """迁移器只支持 2 层：所有 search.* / tools.* 路径必须恰好 2 段。"""
     assert len(V4_ONLY_PATHS) == 16
     for path in V4_ONLY_PATHS:
         parts = path.split(".")
@@ -68,12 +76,14 @@ def test_search_paths_are_two_segments():
 
 
 def test_search_group_shape():
-    """search 组：object + 16 键 + providers 是 template_list（5 模板）。"""
+    """search 组：object + 17 键（v4 的 16 + v1.7.0 的 mode）+ template_list 池。"""
     search = load_schema()["search"]
     assert search["type"] == "object"
     items = search["items"]
-    assert len(items) == 16, sorted(items)
-    assert set(items) == {path.split(".", 1)[1] for path in V4_ONLY_PATHS}
+    assert len(items) == 17, sorted(items)
+    assert set(items) == set({path.split(".", 1)[1] for path in V4_ONLY_PATHS}) | {
+        "mode"
+    }, "search 组只允许 v4 的 16 键 + v1.7.0 的 mode"
 
     providers = items["providers"]
     assert providers["type"] == "template_list"

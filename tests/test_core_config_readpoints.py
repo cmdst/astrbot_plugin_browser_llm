@@ -20,7 +20,14 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-from core.config_map import FLAT_KEYS, KEY_MAP, V4_ONLY_PATHS, ConfigView
+from core.config_map import (
+    FLAT_KEYS,
+    KEY_MAP,
+    NO_FLAT_PATHS,
+    V4_ONLY_PATHS,
+    V5_ONLY_PATHS,
+    ConfigView,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 MAIN = ROOT / "main.py"
@@ -126,25 +133,34 @@ def test_flat_only_config_resolves_every_path():
 
 
 def test_flat_only_config_keeps_v4_paths_missing():
-    """反向守卫：v4 纯新增路径**不得**从扁平键兜底（缺键 ≠ 空值）。"""
+    """反向守卫：v4 的 search.* 路径**不得**从扁平键兜底（缺键 ≠ 空值）。"""
     assert len(V4_ONLY_PATHS) == 16
     flat_cfg = {key: f"v-{key}" for key in FLAT_KEYS}
     view = ConfigView(flat_cfg)
-    for path in V4_ONLY_PATHS:
+    for path in NO_FLAT_PATHS:
+        _value, found = view.lookup(path)
+        assert found is False, f"{path} 不该被扁平兜底命中"
+
+
+def test_flat_only_config_keeps_v5_paths_missing():
+    """tools.*（v1.5.0 的 3 条 + v1.6.0 的 background_engine）同样不做扁平兜底。"""
+    assert len(V5_ONLY_PATHS) == 4
+    view = ConfigView({key: f"v-{key}" for key in FLAT_KEYS})
+    for path in V5_ONLY_PATHS:
         _value, found = view.lookup(path)
         assert found is False, f"{path} 不该被扁平兜底命中"
 
 
 def test_grouped_v4_config_resolves_search_paths():
-    """分组 v4 配置（生产迁移后的形态）：search 组 16 条必须全部读得到。"""
+    """分组配置（生产迁移后的形态）：纯新增组（search 16 + tools 3）必须读得到。"""
     from core.config_map import GROUPS
 
     cfg = {group: {} for group in GROUPS}
-    for path in V4_ONLY_PATHS:
+    for path in NO_FLAT_PATHS:
         group, leaf = path.split(".", 1)
         cfg[group][leaf] = f"v-{path}"
     view = ConfigView(cfg)
-    for path in V4_ONLY_PATHS:
+    for path in NO_FLAT_PATHS:
         value, found = view.lookup(path)
         assert found is True, path
         assert value == f"v-{path}", path

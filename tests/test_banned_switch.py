@@ -107,7 +107,9 @@ def _tool_plugin(enable_banned_filter=True, desc="正常识图描述"):
     plugin._vision_cache = {}
     plugin.vision_cache_ttl = 0
 
-    async def _fake_desc(image_path, event=None, page_url=None):
+    # 桩签名与真实 _describe_screenshot 对齐（v1.6.1 起多了 kind / crop
+    # 两个进缓存键的关键字参数，这里用 **kwargs 吞掉，只关心返回文本）。
+    async def _fake_desc(image_path, event=None, page_url=None, **kwargs):
         return desc
 
     plugin._describe_screenshot = _fake_desc

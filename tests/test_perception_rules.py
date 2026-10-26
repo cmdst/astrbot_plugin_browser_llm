@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import main as main_module
+from core.background import C_UNTRUSTED_PREFIX
 from main import BrowserLLMPlugin
 
 # ------------------------------------------------------------
@@ -293,7 +294,9 @@ def test_browse_web_prefix_text_overrides_global(monkeypatch):
         event,
         input="perception=text 打开 https://example.com 读取内容",
     ))
-    assert result == "浏览结果"
+    # v1.7.0（规格 §1.2.3）：前台返回体 = 不可信前缀 + 子代理结论。
+    assert result.startswith(C_UNTRUSTED_PREFIX)
+    assert result.endswith("浏览结果")
     prompt = captured["system_prompt"]
     assert "仅文字" in prompt, "应注入纯文字感知指引"
     assert "绝对不要使用" in prompt and "browse_screenshot" in prompt, \

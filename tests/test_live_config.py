@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api.star import Context
+from core.background import C_UNTRUSTED_PREFIX
 from core.safety import SafetyFilter
 from main import BrowserLLMPlugin, _make_browser_tool
 
@@ -116,6 +117,77 @@ def test_browse_web_entry_refreshes_config():
     result = _run(plugin.browse_web(object(), input="x"))
     assert result == "【拒绝】deny"
     assert calls == [1], "browse_web 入口应调用 _refresh_config"
+
+
+def test_browse_web_background_mode_hot_switches():
+    """F1：改 tools.background_mode 后**只调一次入口**就生效（开/关双向都要）。
+
+    为什么要有这条：入口若在 ``__init__`` 只读一次配置，Dashboard 把
+    background_mode 从 off 改到 browse_only（或改回 off）会滞后一拍；其中
+    "关不掉"比"开不了"更糟。断言形状照既有 ``test_browse_web_entry_refreshes_config``：
+    ``_refresh_config`` 用 lambda 计数 + 真跑协程。
+    """
+    plugin = _make_plugin()
+    plugin.config["tools"] = {"background_mode": "off"}
+    refreshes = []
+    real_refresh = plugin._refresh_config
+
+    def counting_refresh():
+        refreshes.append(1)
+        real_refresh()
+
+    plugin._refresh_config = counting_refresh
+    plugin._sync_vision_provider_options = lambda: None
+    plugin.context = SimpleNamespace(
+        get_current_chat_provider_id=_provider_id,
+        tool_loop_agent=_tool_loop_agent,
+        send_message=_send_message,
+    )
+    plugin._browser_toolset = SimpleNamespace(tools=[])
+
+    class _Event:
+        unified_msg_origin = "aiocqhttp:GroupMessage:1"
+
+        def get_group_id(self):
+            return "1"
+
+        def get_sender_id(self):
+            return "2"
+
+    async def flow():
+        # ① 关 → 开：只调一次入口即生效
+        foreground = await plugin.browse_web(_Event(), "第一轮")
+        plugin.config["tools"]["background_mode"] = "browse_only"
+        accepted = await plugin.browse_web(_Event(), "第二轮")
+        # 收尾：等后台任务结束，避免悬挂
+        for job in list(plugin._background.running()):
+            await plugin._background.task_of(job.task_id)
+        # ② 开 → 关：再调一次即恢复同步
+        plugin.config["tools"]["background_mode"] = "off"
+        back = await plugin.browse_web(_Event(), "第三轮")
+        return foreground, accepted, back, len(plugin._background)
+
+    foreground, accepted, back, remaining = _run(flow())
+    # v1.7.0（规格 §1.2.3）：前台返回体 = 不可信前缀 + 结论。
+    assert foreground.startswith(C_UNTRUSTED_PREFIX), "off 那一轮带不可信前缀"
+    assert "子代理完成" in foreground, "off 那一轮必须是同步真实结果"
+    assert accepted.startswith("【已受理】"), "改配置后下一次调用就必须后台化"
+    assert back.startswith(C_UNTRUSTED_PREFIX), "改回 off 后立刻恢复同步（带前缀）"
+    assert "子代理完成" in back, "改回 off 后必须立刻恢复同步（关得掉）"
+    assert remaining == 0, "任务都应出表"
+    assert refreshes, "入口必须调用过 _refresh_config"
+
+
+async def _provider_id(umo=None):
+    return "prov-1"
+
+
+async def _tool_loop_agent(**_kwargs):
+    return SimpleNamespace(completion_text="子代理完成")
+
+
+async def _send_message(_session, _chain):
+    return True
 
 
 def test_browse_local_page_entry_refreshes_config():
