@@ -141,7 +141,8 @@ def test_click_link_allows_public_target():
     plugin = _make_plugin(page, links)
     out = _run(plugin.browse_click_link(FakeEvent(), 1))
     assert "拒绝" not in out, out
-    assert "正文摘要" in out, f"应返回页面摘要（成功分支）: {out}"
+    # v1.7.0：click_link 只回 URL + 标题（规格 §1.3 #6）。
+    assert "URL: " in out and "标题: " in out, f"应返回 URL+标题（成功分支）: {out}"
     assert page.goto_urls == ["http://93.184.216.34/page"]
 
 
@@ -162,7 +163,8 @@ def test_open_allows_public_url():
     plugin = _make_plugin(page, "")
     out = _run(plugin.browse_open(FakeEvent(), "http://93.184.216.34/"))
     assert "拒绝" not in out, out
-    assert "正文摘要" in out, f"应返回页面摘要（成功分支）: {out}"
+    # v1.7.0：click_link 只回 URL + 标题（规格 §1.3 #6）。
+    assert "URL: " in out and "标题: " in out, f"应返回 URL+标题（成功分支）: {out}"
     assert page.goto_urls == ["http://93.184.216.34/"]
 
 

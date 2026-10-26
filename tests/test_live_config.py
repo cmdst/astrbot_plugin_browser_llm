@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api.star import Context
+from core.background import C_UNTRUSTED_PREFIX
 from core.safety import SafetyFilter
 from main import BrowserLLMPlugin, _make_browser_tool
 
@@ -167,9 +168,12 @@ def test_browse_web_background_mode_hot_switches():
         return foreground, accepted, back, len(plugin._background)
 
     foreground, accepted, back, remaining = _run(flow())
-    assert foreground == "子代理完成", "off 那一轮必须是同步真实结果"
+    # v1.7.0（规格 §1.2.3）：前台返回体 = 不可信前缀 + 结论。
+    assert foreground.startswith(C_UNTRUSTED_PREFIX), "off 那一轮带不可信前缀"
+    assert "子代理完成" in foreground, "off 那一轮必须是同步真实结果"
     assert accepted.startswith("【已受理】"), "改配置后下一次调用就必须后台化"
-    assert back == "子代理完成", "改回 off 后必须立刻恢复同步（关得掉）"
+    assert back.startswith(C_UNTRUSTED_PREFIX), "改回 off 后立刻恢复同步（带前缀）"
+    assert "子代理完成" in back, "改回 off 后必须立刻恢复同步（关得掉）"
     assert remaining == 0, "任务都应出表"
     assert refreshes, "入口必须调用过 _refresh_config"
 

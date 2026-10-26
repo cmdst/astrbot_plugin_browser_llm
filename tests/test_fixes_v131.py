@@ -176,11 +176,12 @@ def test_browse_current_page_blocks_banned_body():
 
 
 def test_browse_current_page_allows_normal():
-    """对照：browse_current_page 正常页面返回摘要。"""
+    """对照：browse_current_page 正常页面返回**紧凑**摘要（v1.7.0）。"""
     plugin = _make_plugin(text="正常内容")
     result = _run(plugin.browse_current_page(FakeEvent()))
     assert "【拒绝】" not in result
-    assert "正文摘要: 正常内容" in result
+    # v1.7.0（规格 §1.3 #3）：紧凑返回 = URL / 标题 / 正文前 N 字。
+    assert "正常内容" in result and "正文前" in result
 
 
 def test_browse_new_tab_blocks_banned_body():
@@ -190,13 +191,21 @@ def test_browse_new_tab_blocks_banned_body():
     assert "【拒绝】" in result and "赌博" in result
 
 
-def test_browse_click_link_summary_blocks_banned_body():
-    """browse_click_link 点击后返回的页面摘要同样过禁词。"""
+def test_browse_click_link_returns_no_body_so_banned_text_cannot_leak():
+    """v1.7.0：click_link 只回 URL + 标题（不附正文）⇒ 正文违禁内容无从泄漏。
+
+    v1.6.0 返回整页摘要，因此靠 ``_page_summary`` 的禁词过滤兜底；v1.7.0 的
+    返回体里根本没有正文（规格 §1.3 #6），泄漏面结构性消失。标题仍过禁词：
+    用违禁标题再验一次。
+    """
     links = "[1] 目标页 → https://example.com/real"
     plugin = _make_plugin(text="欢迎来到赌博网站", links_text=links)
     result = _run(plugin.browse_click_link(FakeEvent(), index=1))
-    assert "【拒绝】" in result and "赌博" in result
-    assert "欢迎来到赌博网站" not in result
+    assert "欢迎来到赌博网站" not in result, "正文不得出现在返回值里"
+    assert "URL: " in result and "标题: " in result
+    plugin2 = _make_plugin(title="赌博专区", text="正常", links_text=links)
+    result2 = _run(plugin2.browse_click_link(FakeEvent(), index=1))
+    assert result2.startswith("【拒绝】") and "赌博" in result2
 
 
 # ================================================================

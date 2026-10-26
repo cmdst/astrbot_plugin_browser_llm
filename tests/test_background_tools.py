@@ -31,6 +31,7 @@ import pytest
 import main as main_module
 from astrbot.api.message_components import Image, Plain, Video
 from core.background import (
+    C_UNTRUSTED_PREFIX,
     HEADERS,
     STATUS_CANCELLED,
     STATUS_FAILED,
@@ -221,7 +222,9 @@ def test_t1_off_browse_web_returns_real_result_synchronously():
     ctx = FakeContext()
     plugin = make_plugin(tools_config("off"), ctx)
     out = run(plugin.browse_web(FakeEvent(), "打开示例页并读标题"))
-    assert out == ctx.reply, "off 模式下必须同步返回子代理真实结果"
+    # v1.7.0（规格 §1.2.3）：前台返回体 = 不可信前缀 + 子代理结论（+ 台账）。
+    assert out.startswith(C_UNTRUSTED_PREFIX), "前台必须带不可信外部内容前缀"
+    assert ctx.reply in out, "off 模式下必须同步返回子代理真实结果"
     assert ctx.sent == [], "off 模式不得主动投递任何后台消息"
     assert len(plugin._background) == 0, "off 模式不得登记后台任务"
 
@@ -696,7 +699,9 @@ def test_f1_mode_switch_applies_on_next_single_call():
         return foreground, accepted
 
     foreground, accepted = run(flow())
-    assert foreground == ctx.reply, "off 那一轮必须是同步结果"
+    # v1.7.0：前台成功返回体带不可信前缀（规格 §1.2.3）。
+    assert foreground.startswith(C_UNTRUSTED_PREFIX), "off 那一轮必须带不可信前缀"
+    assert ctx.reply in foreground, "off 那一轮必须是同步结果"
     assert accepted.startswith("【已受理】"), "改配置后下一次调用就必须后台化"
 
 
@@ -713,7 +718,9 @@ def test_f1_mode_switch_back_to_off_applies_immediately():
 
     accepted, back = run(flow())
     assert accepted.startswith("【已受理】")
-    assert back == ctx.reply, "改回 off 后必须立刻恢复同步返回（关得掉）"
+    # v1.7.0（规格 §1.2.3）：前台返回体带不可信前缀。
+    assert back.startswith(C_UNTRUSTED_PREFIX), "改回 off 后应恢复同步（带前缀）"
+    assert ctx.reply in back, "改回 off 后必须立刻恢复同步返回（关得掉）"
 
 
 # --------------------------------------------------------------------

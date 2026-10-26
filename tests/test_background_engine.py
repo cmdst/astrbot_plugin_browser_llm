@@ -625,7 +625,9 @@ def test_e5_off_core_creates_no_registry_entry(monkeypatch, logger_recorder):
     plugin = make_plugin(config("off", "core"), ctx)
 
     ret = run(plugin.browse_web(FakeEvent(), "任务"))
-    assert ret == ctx.reply
+    # v1.7.0（规格 §1.2.3）：前台返回体带不可信外部内容前缀。
+    assert ret.startswith(C_UNTRUSTED_PREFIX)
+    assert ctx.reply in ret
     assert len(plugin._background) == 0
     assert ctx.sent == []
     assert flags_of(tools) == [False, False, False]

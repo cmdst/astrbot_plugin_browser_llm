@@ -399,13 +399,21 @@ def test_checkbox_button_style_already_pressed_no_click():
     assert loc.clicked_indices == []
 
 
-def test_checkbox_button_style_uncheck_without_state_errors():
-    """按钮式选项无可读状态 + 要求取消 ⇒ 明确报错、不盲点（不伪装成功）。"""
+def test_checkbox_button_style_uncheck_without_state_downgrades_to_click():
+    """按钮式选项无可读原生状态 + 要求取消 ⇒ **降级为点击 + 读回**（v1.7.0）。
+
+    v1.6.1 在这里直接报「无法执行取消选中」并拒绝动手；规格 §1.3 #22 明确
+    禁止这种「报 Not a checkbox 就结束」的写法：按钮式选项（aria-pressed /
+    data-state）在真实页面里非常常见，拒绝动手等于让模型无路可走。改为点击
+    一次 + 读回 aria-* / data-state，并**如实**报告读到什么。
+    """
     items = [_Element(checked=None)]
     plugin, _page, loc = _checkbox_plugin(items)
     out = _run(plugin.browse_checkbox(_Event(), "input[type=radio]", False))
-    assert "【错误】" in out and "无法执行「取消选中」" in out
-    assert loc.clicked_indices == [], "状态不可读时不得盲点"
+    assert "【错误】" not in out, out
+    assert "已降级为点击" in out, "必须明示这是降级路径（可见降级）"
+    assert "点击后状态=" in out, "必须读回状态"
+    assert len(loc.clicked_indices) == 1, "降级后应点击一次"
 
 
 def test_checkbox_index_out_of_range_reports_candidate_count():
@@ -476,7 +484,7 @@ def test_click_text_failure_returns_top5_candidates():
     ])
     out = _run(plugin.browse_click_text(_Event(), "既不赞同也不反对"))
     assert out.startswith(
-        "【错误】页面上找不到包含文本「既不赞同也不反对」的可点击元素。"
+        "【错误】页面上找不到包含文本「既不赞同也不反对」的可点击元素"
     ), "原错误语义必须保留（不伪装成功）"
     assert "相近的可点击文本（top 3，页面共采集 3 个候选）" in out
     assert "「非常同意」（button，可见）" in out
@@ -525,7 +533,10 @@ def test_click_text_no_candidates_keeps_plain_error():
     """候选采集失败（evaluate 抛错）⇒ 只回原错误，不掺假信息。"""
     plugin, _page = _candidates_plugin([], error=True)
     out = _run(plugin.browse_click_text(_Event(), "不存在"))
-    assert out == "【错误】页面上找不到包含文本「不存在」的可点击元素。"
+    # v1.7.0：错误文本追加 index（扩参后要能说清"第几个"没找到）。
+    assert out == (
+        "【错误】页面上找不到包含文本「不存在」的可点击元素（index=0）。"
+    )
 
 
 def test_click_text_success_returns_summary_without_candidates():
@@ -536,7 +547,8 @@ def test_click_text_success_returns_summary_without_candidates():
     out = _run(plugin.browse_click_text(_Event(), "开始作答"))
     assert "【错误】" not in out
     assert "相近的可点击文本" not in out
-    assert "正文摘要: 页面正文" in out
+    # v1.7.0：点击类原语返回**紧凑**摘要（URL/标题/正文前 N 字，规格 §1.3）。
+    assert "页面正文" in out and "正文前" in out
 
 
 def test_click_text_failure_logged_as_warning(monkeypatch):
@@ -660,9 +672,13 @@ def test_interaction_does_not_invalidate_other_tab_entries():
 # ============================================================
 
 def test_instruction_forbids_fabricated_option_labels():
-    """内层指令明确禁止臆造选项标签（事故缺陷③的提示词侧兜底）。"""
-    assert "选项标签必须来自页面实际文本" in _BROWSER_AGENT_INSTRUCTION
-    assert "禁止臆造" in _BROWSER_AGENT_INSTRUCTION
+    """内层指令含**逐字**红线「标签必须逐字取自页面」（规格 §1.3 判据 3）。
+
+    v1.7.0 把这句提到与 L0 红线同措辞（``_BROWSER_AGENT_INSTRUCTION`` 里也保留），
+    这样无论从工具层还是红线层读，口径都是同一句。
+    """
+    assert "标签必须逐字取自页面" in _BROWSER_AGENT_INSTRUCTION
+    assert "臆造" in _BROWSER_AGENT_INSTRUCTION
 
 
 def test_instruction_mentions_checkbox_index():
@@ -670,11 +686,17 @@ def test_instruction_mentions_checkbox_index():
     assert "index 指定第几个" in _BROWSER_AGENT_INSTRUCTION
 
 
-def test_checkbox_tool_spec_exposes_optional_index():
-    """工具 schema 暴露 index（可选），否则内层模型永远传不了它。"""
+def test_checkbox_tool_spec_exposes_optional_index_and_checked():
+    """工具 schema 暴露 index 与 checked，且**两者都可选**（v1.7.0）。
+
+    v1.6.1 里 ``checked`` 是必填；规格 §1.3 #22 要求它变可选（默认 true），
+    否则旧调用（只传 selector 表达"选中它"）会先被 schema 挡在校验层。
+    """
     spec = next(s for s in _BROWSER_TOOLS if s["name"] == "browse_checkbox")
     params = spec["parameters"]
     assert "index" in params["properties"]
     assert params["properties"]["index"]["type"] == "number"
     assert "index" not in params["required"]
-    assert set(params["required"]) == {"selector", "checked"}
+    assert "checked" in params["properties"]
+    assert "checked" not in params["required"], "checked 必须可选（默认 true）"
+    assert set(params["required"]) == {"selector"}

@@ -47,7 +47,7 @@ def _bodies(*names: str) -> str:
 # 允许的参数类型标注（工具 parameters JSON Schema 类型）
 _ALLOWED_TYPES = {"string", "number", "object", "array", "boolean"}
 
-# 期望的 24 个浏览工具名
+# 期望的 26 个浏览工具名（v1.7.0：+browse_get_interactive / +browse_click_selector）
 EXPECTED_TOOLS = [
     "browse_search", "browse_open", "browse_current_page", "browse_get_text",
     "browse_get_links", "browse_click_link", "browse_scroll", "browse_go_back",
@@ -56,6 +56,8 @@ EXPECTED_TOOLS = [
     "browse_click_text", "browse_set_slider", "browse_select_option",
     "browse_click_coords", "browse_hover", "browse_reload", "browse_checkbox",
     "browse_zoom_crop", "browse_sniff_media",
+    # v1.7.0：交互原语两条（条件注册的第 27 个 browse_web_search 不在本表）
+    "browse_get_interactive", "browse_click_selector",
 ]
 
 # 无参工具：docstring 不应含 Args 段
@@ -77,15 +79,17 @@ EXPECTED_PARAMS = {
     "browse_close_tab": {"index": True},
     "browse_input": {"selector": True, "text": True},
     "browse_press_key": {"key": True},
-    "browse_click_text": {"text": True},
+    "browse_click_text": {"text": True, "index": False},
     "browse_set_slider": {"value": True},
     "browse_select_option": {"selector": True, "value": True},
     "browse_click_coords": {"x": True, "y": True},
     "browse_hover": {"text": True},
     "browse_reload": {},
-    "browse_checkbox": {"selector": True, "checked": True, "index": False},
+    "browse_checkbox": {"selector": True, "checked": False, "index": False},
     "browse_zoom_crop": {"x": True, "y": True, "width": True, "height": True},
     "browse_sniff_media": {"media_type": False, "max_items": False},
+    "browse_get_interactive": {"max_items": False, "role_filter": False},
+    "browse_click_selector": {"selector": True, "index": False},
 }
 
 
@@ -211,9 +215,9 @@ def test_16_browse_methods_exist():
 # _BROWSER_TOOLS 配置
 # ------------------------------------------------------------
 
-def test_24_browse_tools_config():
+def test_26_browse_tools_config():
     spec = _browser_tools_spec()
-    assert len(spec) == 24, f"_BROWSER_TOOLS 应为 24 项，实际 {len(spec)}"
+    assert len(spec) == 26, f"_BROWSER_TOOLS 应为 26 项，实际 {len(spec)}"
     names = [s["name"] for s in spec]
     assert names == EXPECTED_TOOLS, f"工具名顺序不一致: {names}"
     assert len(names) == len(set(names)), "工具名不应重复"

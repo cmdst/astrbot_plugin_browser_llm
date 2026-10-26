@@ -1,20 +1,36 @@
 """
-astrbot_plugin_browser_llm — LLM 浏览器插件（Agent 驱动的网页浏览）
+astrbot_plugin_browser_llm — LLM 浏览器插件（内嵌多模态子代理）
 
-架构：工具化子代理（tool-based subagent）+ 独立搜索池。
+架构（v1.7.0）：**主 LLM 只做委派，插件内置一个多模态子代理干活**。
 
-对外暴露 **3 个 LLM 工具**：``browse_web``（网页浏览入口）、
-``browse_local_page``（本地 HTML 自检入口）、``browser_web_search``
-（v1.4.0 新增，直接调搜索 API 池，返回结构化 JSON）。24 个 ``browse_*``
-浏览工具**不**直接暴露给主 LLM，而是作为「浏览器子代理」的工具集：主 LLM
-调 ``browse_web`` 后由子代理（tool_loop_agent + 24 个 FunctionTool）自主
-完成真实网页交互。配置为 6 个分组 / 45 个叶键（含 v1.4.0 的 `search` 组 16 键、
-v1.5.0 的 `tools` 组 3 键与 v1.6.0 的 `tools.background_engine`），见 ``_conf_schema.json``。
+- 外层 **3 个 LLM 工具**（名字一律不改，生产有 6 条人格按名硬白名单）：
+  ``browse_web``（唯一委派入口）、``browse_local_page``（本地 HTML 渲染预览，
+  不进子代理）、``browser_web_search``（v1.4.0 的搜索 API 池；``search.mode=
+  external`` 时作为外层工具存在，``internal`` 时强制停用、改由内层
+  ``browse_web_search`` 承载）。
+- 内层 **26 个 ``browse_*`` 工具**（``_BROWSER_TOOLS``，``search.mode=internal``
+  时 +1 = 27）只进 ``self._browser_toolset``，直接作为 ``tools=`` 传给
+  ``context.tool_loop_agent``；它们**不在** ``func_list`` 里 ⇒ 不受人格白名单 /
+  ``inactivated_llm_tools`` / ``_PermissionGuardedTool`` 影响。
+- 内层模型可由 ``agent.provider_id`` 指定（只列"多模态 + 支持 tool_use"的
+  候选；留空 = 继承当前会话）。它**原生看图**：``browse_screenshot`` /
+  ``browse_zoom_crop`` 返回 ``mcp.types.CallToolResult``（TextContent +
+  ImageContent），图片由核心缓存后在下一轮塞进内层上下文；纯文本内层模型
+  则走 ``perception.vision_provider_id`` 的 caption 兜底。
+- 内层人格三档（``agent.persona_mode``）：``default``（只有工具提示词）/
+  ``current``（当前会话人格，截断 2000 字）/ ``custom``（配置文本）。分层顺序
+  固定为 **L0 红线 → L1 人格 → L2 工具 → L3 感知 → L4 输出契约**：人格被
+  **包裹**，改不动红线与工具清单。
+- **执行台账**（``【执行台账】``）由插件按实际工具调用确定性生成、附在结论
+  之后：内层模型改不了它，主 LLM 因此有一个不可伪造的旁证（关闭"收尾失真"）。
+- 配置为 **7 个分组 / 54 个叶键**（``_conf_schema.json`` / ``core/config_map.
+  KEY_MAP``：``browser``6 / ``limits``7 / ``security``5 / ``perception``7 /
+  ``search``17 / ``tools``4 / ``agent``8），由 ``tools/migrate_config_v5.py``
+  从 v3/v4 形态迁移（**先迁配置、再换代码**）。
 
-核心组件在 initialize() 中组装：BrowserCore（浏览器驱动）、
-SessionManager（会话隔离与回收）、ContentExtractor（内容提取）、
-SafetyFilter（禁词过滤与 SSRF 防护），以及 24 个 FunctionTool 构建
-的 ToolSet（子代理工具集）。
+分层落点：本文件 = 入口 + 后台分派 + 结果合成；``core/agent.py`` = 内层子代理
+执行体（provider 决策 / 人格分层 / 工具集装配 / 预算与台账 / 结果归类）；
+``core/*`` 其余模块 = 浏览器驱动、会话、提取、安全、搜索、配置映射。
 """
 
 import asyncio
@@ -40,6 +56,7 @@ from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 
 from .core import as_bool, as_float, as_int
+from .core import agent as agent_core
 from .core.background import (
     _BG_MAX_CONCURRENT,
     _BG_BUSY_TEXT,
@@ -63,6 +80,7 @@ from .core.delivery import artifact_sink, collect_artifact
 from .core.extract import ContentExtractor
 from .core.safety import SafetyFilter, check_url_literal
 from .core.search import (
+    PAYLOAD_MAX_BYTES,
     SearchService,
     redact_secrets,
     render_payload,
@@ -338,6 +356,105 @@ _DEFAULT_VISION_PROMPT = (
 _CLICK_TEXT_CANDIDATE_SCAN_LIMIT = 400
 _CLICK_TEXT_CANDIDATE_TOP_N = 5
 _CLICK_TEXT_CANDIDATE_MAX_LEN = 40
+
+#: ``persona_mode=current`` 的人格缓存 TTL（秒，v1.7.0）。超时视为未命中，
+#: 重新走 persona_manager 次路径 —— 人格可能在会话里被切换，缓存太久会用旧人格。
+_PERSONA_CACHE_TTL = 30 * 60
+
+#: 影像原生失败且没有可用的 caption 兜底时的**明确**文案（逐字，规格 §2.3
+#: 第 3 行）：**不许**静默返回空串让内层模型瞎猜页面长什么样。
+_IMAGE_UNAVAILABLE_TEXT = (
+    "【不可用】内层模型不支持图片，且未配置可用的识图兜底模型"
+    "（perception.vision_provider_id）。请改用 perception=text 或 "
+    "browse_get_text 完成任务。"
+)
+
+#: ``browse_get_interactive`` 的元素枚举脚本（v1.7.0，规格 §1.3 #25）。
+#:
+#: 安全边界（规格 §9.3）：**只做 DOM 枚举**——不发网络请求、不读 innerHTML
+#: 全文、不执行任何页面给的字符串。返回的 ``selector`` 由注入 JS 计算的 CSS
+#: 路径（``#id`` 优先，否则 ``tag:nth-of-type`` 链），可直接喂给
+#: ``browse_click_selector``：这条"枚举 → 确定性落点"的链路正是关闭事故
+#: 根因②（交互原语太粗、模型只能猜文本）的关键。
+_INTERACTIVE_JS = r"""(maxItems, roleFilter) => {
+  const sel = [
+    'a', 'button', 'input', 'select', 'textarea', 'summary', 'label',
+    '[role=button]', '[role=link]', '[role=checkbox]', '[role=radio]',
+    '[role=tab]', '[role=menuitem]', '[role=option]', '[role=switch]',
+    '[role=combobox]', '[onclick]', '[tabindex]',
+  ].join(',');
+  const path = (el) => {
+    if (el.id) return '#' + CSS.escape(el.id);
+    const parts = [];
+    let node = el;
+    while (node && node.nodeType === 1 && parts.length < 6) {
+      let part = node.tagName.toLowerCase();
+      const parent = node.parentElement;
+      if (parent) {
+        const same = Array.from(parent.children).filter(
+          (c) => c.tagName === node.tagName
+        );
+        if (same.length > 1) part += ':nth-of-type(' + (same.indexOf(node) + 1) + ')';
+      }
+      parts.unshift(part);
+      if (node.id) { parts[0] = '#' + CSS.escape(node.id); break; }
+      node = parent;
+    }
+    return parts.join(' > ');
+  };
+  const stateOf = (el) => {
+    for (const attr of ['aria-checked', 'aria-pressed', 'aria-selected']) {
+      const v = el.getAttribute(attr);
+      if (v === 'true' || v === 'false') return v;
+    }
+    if (el.type === 'checkbox' || el.type === 'radio') {
+      return el.checked ? 'true' : 'false';
+    }
+    return '';
+  };
+  const out = [];
+  const seen = new Set();
+  for (const el of Array.from(document.querySelectorAll(sel))) {
+    const role = (el.getAttribute('role') || el.tagName.toLowerCase()).toLowerCase();
+    if (roleFilter && role !== String(roleFilter).toLowerCase()) continue;
+    const name = String(
+      el.innerText || el.value || el.getAttribute('aria-label')
+      || el.getAttribute('title') || el.getAttribute('name') || ''
+    ).replace(/\s+/g, ' ').trim();
+    const r = el.getBoundingClientRect();
+    const cs = window.getComputedStyle(el);
+    const visible = r.width > 0 && r.height > 0
+      && cs.visibility !== 'hidden' && cs.display !== 'none' && cs.opacity !== '0';
+    const selector = path(el);
+    const key = selector + '|' + name;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      role: role,
+      name: name.slice(0, 60),
+      type: (el.getAttribute('type') || el.tagName.toLowerCase()).toLowerCase(),
+      state: stateOf(el),
+      disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true',
+      selector: selector,
+      x: Math.round(r.left + r.width / 2),
+      y: Math.round(r.top + r.height / 2),
+      visible: visible,
+    });
+    if (out.length >= Math.max(1, Math.min(200, maxItems || 40))) break;
+  }
+  return out;
+}"""
+
+#: ``browse_click_coords`` 读回"点到了什么"的脚本（v1.7.0，规格 §1.3 #19）：
+#: ``elementsFromPoint`` 的第一个元素标签（用于坐标点击后的自我纠正）。
+_POINT_ELEMENT_JS = r"""(x, y) => {
+  const el = document.elementFromPoint(x, y);
+  if (!el) return '';
+  const name = String(el.innerText || el.getAttribute('aria-label') || '')
+    .replace(/\s+/g, ' ').trim().slice(0, 40);
+  const role = el.getAttribute('role') || el.tagName.toLowerCase();
+  return name ? role + '「' + name + '」' : role;
+}"""
 
 # ---------------------------------------------------------------
 # 识图拒识检测：纯文本模型拒识文案识别
@@ -747,9 +864,15 @@ _BROWSER_TOOLS = [
     },
     {
         "name": "browse_click_text",
-        "description": "网页交互场景专用：按文本内容精准点击页面元素（如按钮、选项），用于非链接的 JS 元素。",
+        "description": "网页交互场景专用：按文本内容精准点击页面元素（如按钮、选项），用于非链接的 JS 元素；多个元素含同一文本时用 index 指定第几个。",
         "parameters": _params(
             {"text": ("要点击的元素包含的文本，如确认并继续", "string")},
+            {
+                "index": (
+                    "多个元素包含同一文本时的序号，从 0 开始，默认 0（第一个）",
+                    "number",
+                )
+            },
         ),
         "method": "browse_click_text",
     },
@@ -801,15 +924,16 @@ _BROWSER_TOOLS = [
         "name": "browse_checkbox",
         "description": "网页交互场景专用：设置复选框/单选框/按钮式选项的选中状态（多匹配时用 index 指定第几个）。",
         "parameters": _params(
+            {"selector": ("复选框的 CSS 选择器", "string")},
             {
-                "selector": ("复选框的 CSS 选择器", "string"),
-                "checked": ("目标选中状态（true=勾选，false=取消）", "boolean"),
-            },
-            {
+                "checked": (
+                    "目标选中状态（true=勾选，false=取消），默认 true",
+                    "boolean",
+                ),
                 "index": (
                     "多个元素匹配同一选择器时的序号，从 0 开始，默认 0（第一个）",
                     "number",
-                )
+                ),
             },
         ),
         "method": "browse_checkbox",
@@ -839,31 +963,107 @@ _BROWSER_TOOLS = [
         ),
         "method": "browse_sniff_media",
     },
+    {
+        "name": "browse_get_interactive",
+        "description": "列出当前页面上**真实存在**的可交互元素（按钮/链接/选项/输入框等），带可直接点击的 selector 与中心坐标。交互类任务的推荐起手式：先看清单再动手，避免臆造标签。",
+        "parameters": _params(
+            {},
+            {
+                "max_items": ("最多返回多少个元素，默认 40", "number"),
+                "role_filter": (
+                    "只列该 role 的元素（如 button/link/checkbox/radio/tab），留空=全部",
+                    "string",
+                ),
+            },
+        ),
+        "method": "browse_get_interactive",
+    },
+    {
+        "name": "browse_click_selector",
+        "description": "按 CSS 选择器点击元素（browse_get_interactive 给出的 selector 可直接用；多匹配用 index 指定第几个）。点击后读回 aria-checked/aria-pressed 状态。",
+        "parameters": _params(
+            {"selector": ("CSS 选择器，通常直接取自 browse_get_interactive", "string")},
+            {
+                "index": (
+                    "多个元素匹配同一选择器时的序号，从 0 开始，默认 0（第一个）",
+                    "number",
+                )
+            },
+        ),
+        "method": "browse_click_selector",
+    },
 ]
+
+#: 内层池搜索工具名（``search.mode=internal`` 时追加的第 27 个内层工具）。
+#:
+#: 三个名字刻意互不相同，且都与核心内置 ``web_search_*`` 族不同名
+#: （``web_search_tools.py`` 会在请求装配时**后加入并覆盖**同名项 —— 见
+#: ``main.py`` 顶部 ``_SEARCH_TOOL_NAME`` 的历史教训注释）：
+#: - ``browser_web_search``：外层工具（主 LLM 直调）；
+#: - ``browse_web_search``：内层工具（子代理调用）；
+#: - ``browse_search``：打开搜索引擎结果页（内层，始终存在）。
+_INNER_SEARCH_TOOL_NAME = "browse_web_search"
+
+#: 内层搜索返回体上限（字节，规格 §4.3：比外层 24KB 更紧）。
+_INNER_SEARCH_MAX_BYTES = 6000
+
+#: 内层池搜索工具定义（参数 = 外层去掉 ``providers``：不让内层模型覆盖
+#: provider 顺序，那是运营配置）。
+_INNER_SEARCH_TOOL_SPEC = {
+    "name": _INNER_SEARCH_TOOL_NAME,
+    "description": (
+        "网页搜索（本插件自有搜索 API 池，返回结构化结果，无需开页面）。"
+        "适合：事实问答、需要来源链接、只需摘要无需页面交互的检索。"
+        "不适合：需要登录/点击/翻页/表单的真实页面交互（那用 browse_open / "
+        "browse_get_interactive 等）。返回 JSON 字符串：status（ok/partial/"
+        "failed/disabled）、results[]（rank/title/url/snippet/fetched）、"
+        "error_codes、notes；回答时依据 results[].snippet 或 fetched.text 并给出链接。"
+    ),
+    "parameters": _params(
+        {"query": ("检索词。必填，空串会被拒绝。", "string")},
+        {
+            "max_results": ("返回条数上限（1-50）。0 表示用插件配置值。", "number"),
+            "rounds": ("搜索步数 = 并行波次上限（1-5）。0 表示用插件配置值。", "number"),
+            "timeout": ("本次调用总预算秒数（5-300，且不超过内层单步超时）。0 表示用插件配置值。", "number"),
+            "fetch_pages": ("是否抓取结果正文（需插件配置 search.fetch_pages 已开启）。", "boolean"),
+            "fetch_top_n": ("抓取前 N 条（0-5）。0 表示用插件配置值。", "number"),
+        },
+    ),
+}
 
 
 def _make_browser_tool(plugin: "BrowserLLMPlugin", spec: dict):
     """工厂：为一条 _BROWSER_TOOLS 配置生成 FunctionTool 实例。
 
-    使用 handler 字段（官方一等公民）：执行器以 handler(event, **kwargs)
-    调用，等效于 task 描述的子类覆写 call 方案，且避免 pydantic dataclass
-    子类化的兼容风险。handler 绑定插件实例方法，签名与内部 browse_*
-    方法一致（self, event, **kwargs）。
+    使用 handler 字段（官方一等公民）：执行器以 ``handler(event, *args, **kwargs)``
+    调用（``astr_agent_tool_exec.py:794-814``），等效于 task 描述的子类覆写
+    ``call`` 方案，且避免 pydantic dataclass 子类化的兼容风险。handler 绑定
+    插件实例方法，签名与内部 browse_* 方法一致（self, event, **kwargs）。
 
-    v1.2.0：handler 外层包一层配置热更新（_refresh_config），使 Dashboard
-    修改的配置（黑名单、截图开关、内网拦截等）在子代理工具调用时即生效，
-    无需重启；开销为若干次 dict 读取，可忽略。
+    包装三层（顺序即正确性，规格 §8.3）：
+
+    1. ``_refresh_config()``：配置热更新（v1.2.0），使 Dashboard 改的黑名单/
+       截图开关/内网拦截在**下一次**子代理工具调用时即生效；
+    2. ``agent_core.record_and_truncate``：**先**记台账（拿到的是原始结果）、
+       再按 ``agent.result_max_chars`` 截断文本、超累计预算时压实到 800 字符。
+       台账必须在截断**之前**记，否则台账里的 ``brief`` 会带上截断尾巴；
+    3. 返回值原样透传：``str`` 或 ``mcp.types.CallToolResult``（影像原生）。
+       执行器自己区分两者（``astr_agent_tool_exec.py:744-756``）。
     """
-    from astrbot.core.agent.tool import FunctionTool  # noqa: PLC0415 — 延迟导入
-
     method = getattr(plugin, spec["method"])
 
     async def _handler(event, **kwargs):
         # 工具入口轻量热更新配置（重读共享 config dict）。
         plugin._refresh_config()
-        return await method(event, **kwargs)
+        raw = await method(event, **kwargs)
+        return agent_core.record_and_truncate(
+            raw,
+            tool=spec["name"],
+            args=kwargs,
+            run=agent_core.current_run(),
+        )
 
-    return FunctionTool(
+    return agent_core.build_function_tool(
         name=spec["name"],
         description=spec["description"],
         parameters=spec["parameters"],
@@ -881,6 +1081,10 @@ _BROWSER_AGENT_INSTRUCTION = (
     "- browse_current_page / browse_get_text / browse_get_links：查看当前"
     "页面、提取正文与链接列表；\n"
     "- browse_click_link：按编号点击链接继续浏览；\n"
+    "- browse_get_interactive：列出页面上**真实存在**的可交互元素（角色/名称/"
+    "选中态/是否禁用/可直接点击的 selector/中心坐标）——交互类任务先看它；\n"
+    "- browse_click_selector：按 browse_get_interactive 给出的 selector 点击"
+    "（多匹配用 index 指定第几个）；\n"
     "- browse_click_text：按文本内容精准点击元素（按钮/选项）；\n"
     "- browse_set_slider / browse_select_option / browse_checkbox：滑块/"
     "下拉框/复选框设置（browse_checkbox 多匹配时用 index 指定第几个，"
@@ -917,11 +1121,15 @@ _BROWSER_AGENT_INSTRUCTION = (
     "通过：遇到时立即停止操作，不要尝试点击、刷新、重试或盲猜坐标；"
     "如实报告『遇到图形验证码，需要用户手动处理』并返回当前页面状态；\n"
     "8. 浏览失败时根据错误信息调整策略，必要时更换搜索词或链接；\n"
-    "9. 选项标签必须来自页面实际文本，禁止臆造：点击/选择任何选项前，"
-    "其文本必须能在 browse_get_text / browse_current_page 的返回里找到原文；"
-    "不要用近义词、同义改写或凭印象编造的标签（臆造标签必然点击失败并"
-    "浪费等待时间）。工具返回「相近可点击文本」时，只能从中挑选重试；\n"
-    "10. 完成后用简洁中文总结浏览结果（URL、关键内容），不要暴露工具调用"
+    "9. 标签必须逐字取自页面：点击/选择任何选项前，其文本必须能在 "
+    "browse_get_interactive / browse_get_text / browse_current_page 的返回里"
+    "找到**原文字符串**；不要用近义词、同义改写或凭印象编造的标签（臆造标签"
+    "必然点击失败并浪费等待时间）。工具返回「相近可点击文本」时，只能从中"
+    "挑选重试；\n"
+    "10. 交互类任务的标准动线：先 browse_get_interactive 看清有哪些元素 ⇒ "
+    "用 browse_click_selector（或 browse_click_text）点 ⇒ 用 browse_get_text "
+    "读回结果确认状态；不要靠猜坐标或猜文本硬点；\n"
+    "11. 完成后用简洁中文总结浏览结果（URL、关键内容），不要暴露工具调用"
     "过程细节。\n\n"
     "提交后等待结果（重要）：\n"
     "- 点击生成/提交类按钮后，不要刷新页面、不要重新开始、不要后退，"
@@ -1076,21 +1284,44 @@ class BrowserLLMPlugin(Star):
         self._bg_probe_sig = None
         self._bg_clash_warned: set[str] = set()
 
+        # 内层子代理（v1.7.0）：
+        # - ``_browser_tools`` / ``_browser_toolset``：26（internal 搜索时 27）
+        #   个 FunctionTool 与它们的 ToolSet，由 ``_rebuild_browser_toolset()``
+        #   按 ``(search.mode, 池可用性)`` 签名重建；
+        # - ``_toolset_sig``：上一次构建用的签名（签名不变就不重建——否则每次
+        #   工具调用都要重建 26 个 FunctionTool）；
+        # - ``_persona_cache``：umo -> (monotonic 时间, persona_id, 人格正文)。
+        #   ``current`` 档从 on_llm_request 的 system_prompt 里切人格块后缓存，
+        #   **只缓存文本**：不落日志、不写文件（规格 §5.2 / §9.4）；
+        # - ``_fg_inflight``：umo -> 正在跑的**前台** browse_web 数（只观测告警，
+        #   不做单飞拦截：前台入口持锁会与内层工具锁互死，见 main.py 入口注释）。
+        self._browser_tools: list = []
+        self._browser_toolset: object | None = None
+        self._toolset_sig: tuple | None = None
+        self._agent_sync_task: asyncio.Task | None = None
+        self._persona_cache: dict[str, tuple[float, str | None, str]] = {}
+        self._fg_inflight: dict[str, int] = {}
+
     def _load_config(self) -> None:
         """将 _conf_schema.json 中的配置项读取为实例属性。
 
-        全部 6 组 45 叶（``_conf_schema.json``）：``browser``（引擎/默认页/
-        搜索引擎/视口/代理/超时）、``limits``（提取与链接上限/页数/空闲回收/
-        子代理步数与超时）、``security``（禁词/审核总开关/内网拦截/会话黑白
-        名单）、``perception``（感知模式/截图/识图 provider 与缓存）、
-        ``search``（v1.4.0 搜索 API 池 16 键：开关/池/并发/步数/超时/抓取）、
-        ``tools``（v1.5.0 后台任务 3 键 + v1.6.0 的 ``background_engine``）。
+        全部 7 组 54 叶（``_conf_schema.json`` / ``core.config_map.KEY_MAP``）：
+        ``browser``（引擎/默认页/搜索引擎/视口/代理/超时）、``limits``（提取与
+        链接上限/页数/空闲回收/子代理步数与超时）、``security``（禁词/审核总开关/
+        内网拦截/会话黑白名单）、``perception``（感知模式/截图/识图 provider 与
+        缓存；v1.7.0 起三个 vision 键**只在 caption 兜底路径**生效）、
+        ``search``（v1.4.0 的搜索 API 池 16 键 + v1.7.0 的 ``mode``）、
+        ``tools``（v1.5.0 后台 3 键 + v1.6.0 的 ``background_engine``）、
+        ``agent``（v1.7.0 新增整组 8 键：内嵌多模态子代理）。
 
-        类型健壮性（v1.3.1）：数值/布尔配置经 _as_int / _as_float /
-        _as_bool 归一解析，非法值（字符串、None、类型错误）回退默认值并
-        记录 warning——手动编辑 config.json 或第三方写入非法类型时插件
-        仍可正常加载，不再抛异常阻断初始化。Dashboard 路径本身有 AstrBot
-        类型校验保护，此处理为纵深防御。
+        数值/布尔/枚举配置经 _as_int / _as_float / _as_bool / _as_enum 归一解析，
+        非法值（字符串、None、类型错误、越界）回退默认并记录 warning——手动编辑
+        config.json 或第三方写入非法类型时插件仍可正常加载，不再抛异常阻断初始化。
+
+        生效时机（``core.config_map.EFFECT_TIMING``）：本方法读取的绝大多数键是
+        ``hot``（``_refresh_config()`` 每次工具调用重读），``browser.type`` /
+        ``browser.proxy`` / ``browser.viewport`` 是 ``import``（要重载插件），
+        ``security.block_internal_ip`` 是 ``new_context``。
         """
         cfg = self.config
         # S1：读取点统一切到点号路径；ConfigView 在过渡期自动回退到旧扁平键，
@@ -1249,9 +1480,11 @@ class BrowserLLMPlugin(Star):
 
         # ---- search.mode（v1.7.0）：池搜索挂在哪一层 ----
         # external（默认）= 外层工具 browser_web_search，主 LLM 直调（= v1.6.0
-        # 行为逐字节一致）；internal = 内层工具 browse_web_search，外层强制停用。
-        # 两档**互斥**（同时有会让主 LLM 与内层都去搜、结果重复、token 翻倍）。
-        # 非法值 fail-closed 到 external 并记 warning。
+        # 行为逐字节一致）；internal = 内层工具 browse_web_search，外层强制
+        # active=False。两档**互斥**：同时有会让主 LLM 与内层都去搜、结果重复、
+        # token 翻倍，还多一个"该用哪个"的决策面（规格 §4.1）。
+        # 非法值 fail-closed 到 external 并记 warning（宁可维持现状，也不要
+        # "写错一个词就把搜索挪进子代理"）。
         raw_search_mode = view.get("search.mode", default_of("search.mode", "external"))
         self.search_mode: str = self._as_enum(
             "search.mode", raw_search_mode, "external", ("external", "internal")
@@ -1299,7 +1532,8 @@ class BrowserLLMPlugin(Star):
 
         # ---- agent 组（v1.7.0）：内嵌多模态子代理的 8 个键 ----
         # 全部 hot（走既有 _refresh_config 路径）。默认值与
-        # ``core.config_map.LEAF_DEFAULTS`` 逐条相等（由 tests 钉住）。
+        # ``core.config_map.LEAF_DEFAULTS`` 逐条相等（由 tests 钉住），
+        # 因此"旧配置 + 新代码"的行为与 v1.6.0 一致。
         self.agent_provider_id: str = str(
             view.get("agent.provider_id", default_of("agent.provider_id", "")) or ""
         ).strip()
@@ -1307,7 +1541,7 @@ class BrowserLLMPlugin(Star):
             "agent.persona_mode",
             view.get("agent.persona_mode", default_of("agent.persona_mode", "default")),
             "default",
-            ("default", "current", "custom"),
+            agent_core.PERSONA_MODES,
         )
         self.agent_persona_prompt: str = str(
             view.get("agent.persona_prompt", default_of("agent.persona_prompt", "")) or ""
@@ -1345,7 +1579,7 @@ class BrowserLLMPlugin(Star):
         default: str,
         allowed: tuple[str, ...],
     ) -> str:
-        """枚举配置解析：非法值 fail-closed 到默认并记 warning（口径同 v5 spec §6.2）。"""
+        """枚举配置解析：非法值 fail-closed 到默认并记 warning（口径同 §6.2）。"""
         text = str(value or default).strip().lower()
         if text not in allowed:
             logger.warning(
@@ -1449,9 +1683,10 @@ class BrowserLLMPlugin(Star):
         self._start_cache_cleanup_task()
         # 后台空闲回收任务（每 60s 关闭超时未活动的会话）。
         await self.sessions.start_sweeper()
-        # 构建 24 个浏览工具（FunctionTool）与子 Agent 工具集。
-        self._browser_tools = [_make_browser_tool(self, s) for s in _BROWSER_TOOLS]
-        self._browser_toolset = self._build_toolset(self._browser_tools)
+        # 构建 26 个浏览工具（FunctionTool）与子 Agent 工具集；``search.mode=
+        # internal`` 时追加第 27 个（内层池搜索）。重建逻辑只在这里与
+        # ``_refresh_config`` 的签名变化处调用（单一定义 _rebuild_browser_toolset）。
+        self._rebuild_browser_toolset()
         # 按页面感知方式动态生成子代理指令（基础模板 + 感知方式段）。
         self._browser_instruction = self._build_subagent_instruction()
         # 识图 provider 下拉同步：把 AstrBot 已加载 provider 写进内存 schema
@@ -1461,9 +1696,14 @@ class BrowserLLMPlugin(Star):
         self._vision_sync_task: asyncio.Task | None = None
         self._sync_vision_provider_options()
         self._start_vision_provider_sync_task()
+        # 内层模型下拉同步（v1.7.0）：只列「多模态 + 支持 tool_use」的候选
+        # （规格 §3.1）。同一套启动期兜底轮询。
+        self._sync_agent_provider_options()
+        self._start_agent_provider_sync_task()
         logger.info(
             f"[{self.metadata_name}] 浏览器子代理工具集: "
             f"{len(self._browser_tools)} 个浏览工具"
+            f"（search.mode={self.search_mode}）"
         )
         logger.info(f"[{self.metadata_name}] 页面感知方式: {self.page_perception}")
         logger.info(
@@ -1472,7 +1712,10 @@ class BrowserLLMPlugin(Star):
         )
         # 搜索工具可见性对齐（v4）：配置是唯一事实源，initialize() 双向收敛
         # "持久化 inactivated_llm_tools 名单"与配置之间的分叉。
+        # v1.7.0：want 里多了 ``search.mode == "external"`` 这一条（internal
+        # 档外层**恒**停用，模型根本看不到它 —— 规格 §4.2）。
         await self._reconcile_search_tool()
+        self._search_reconcile_sig = self._toolset_signature()
         # 后台引擎（v1.6.0）：重载后 ``llm_tools.func_list`` 是**全新对象**
         # （核心 remove_func(name) + append），旧对象上的 flag 不会被继承 ⇒
         # 必须重放；并在加载后强探测一次（核心修复 + 重启后靠它自动恢复 core）。
@@ -1490,6 +1733,107 @@ class BrowserLLMPlugin(Star):
         from astrbot.core.agent.tool import ToolSet  # noqa: PLC0415 — 延迟导入
 
         return ToolSet(tools=tools)
+
+    # ------------------------------------------------------------
+    # 内层工具集装配（v1.7.0，规格 §1.3 / §4.2）
+    # ------------------------------------------------------------
+
+    def _toolset_signature(self) -> tuple:
+        """内层工具集的**签名**：只有它变了才需要重建 26 个 FunctionTool。
+
+        两个维度：``search.mode``（决定第 27 个条件工具在不在）与"池是否
+        可用"（``search.enabled`` + 至少一个可用 provider）。签名不变就不重建
+        —— 否则每次工具调用都要重建一整套 FunctionTool 对象（纯浪费）。
+        """
+        return (
+            getattr(self, "search_mode", "external"),
+            bool(self._search_pool_ready()),
+        )
+
+    def _rebuild_browser_toolset(self) -> None:
+        """（重）建内层工具集：26 个 ``browse_*`` + 条件的内层池搜索。
+
+        ``_BROWSER_TOOLS`` 里**不**含 ``browse_web_search``：它是运行时按
+        ``search.mode=internal`` 追加的第 27 个（判据 §1.3-1 明确要求
+        ``len(_BROWSER_TOOLS) == 26``，条件工具不进那个字面量）。
+        """
+        self._browser_tools = [_make_browser_tool(self, s) for s in _BROWSER_TOOLS]
+        if self.search_mode == "internal" and self._search_pool_ready():
+            self._browser_tools.append(self._make_inner_search_tool())
+        self._browser_toolset = self._build_toolset(self._browser_tools)
+        self._toolset_sig = self._toolset_signature()
+
+    def _apply_toolset_signature(self) -> bool:
+        """签名变化时重建内层工具集；返回是否真的重建了。"""
+        if getattr(self, "_toolset_sig", None) == self._toolset_signature():
+            return False
+        self._rebuild_browser_toolset()
+        return True
+
+    async def _sync_search_mode(self) -> None:
+        """按 ``search.mode`` 收敛两处状态（幂等；三个外层入口开头调用）。
+
+        1. 内层工具集（``internal`` 时第 27 个工具在/不在）；
+        2. 外层 ``browser_web_search`` 的 ``active``（internal ⇒ 恒停用）。
+
+        为什么不在 ``_refresh_config()`` 里做第 2 步：那一步是 async
+        （``activate/deactivate_llm_tool_async``），而 ``_refresh_config`` 被
+        内层工具 handler 在**每次调用**时同步调用；在这里做既保持入口的
+        确定性（await 完再执行任务），也不会让内层工具把外层工具翻来翻去。
+
+        **性能/副作用闸**：``activate/deactivate_llm_tool_async`` 会写**全局
+        持久化**名单 ``inactivated_llm_tools``（DB 写）。因此签名没变就**不**再
+        调一次 —— 否则每次 ``browse_web`` 都白写一次配置。签名 = ``(mode, 池可用
+        性)``，与内层工具集共用同一份定义。
+        """
+        sig = self._toolset_signature()
+        rebuilt = self._apply_toolset_signature()
+        if not rebuilt and getattr(self, "_search_reconcile_sig", None) == sig:
+            return
+        await self._reconcile_search_tool()
+        self._search_reconcile_sig = sig
+
+    def _make_inner_search_tool(self):
+        """构造内层池搜索工具 ``browse_web_search``（仅在 internal 档注册）。
+
+        三条设计约束（规格 §4.2-2 / §4.3）：
+
+        1. **同一个执行体**：直接复用 ``_run_browser_web_search``（含
+           ``_search_url_guard`` / ``_filter_banned_results`` / 冷却 / TTL
+           缓存），绝不另写一条 HTTP 路径；参数比外层少一个 ``providers``
+           （provider 顺序是运营配置，不让内层模型覆盖）；
+        2. **体积更紧**：``max_bytes=6000``（外层 ``PAYLOAD_MAX_BYTES``=24KB），
+           内层还要再叠 ``agent.result_max_chars`` 截断；
+        3. **永不后台化**：内层工具不在 ``llm_tools.func_list`` 里，核心的
+           ``is_background_task`` 机制看不到它；它的执行发生在
+           ``tool_loop_agent`` 之内，后台粒度只到外层工具（规格 §4.4）。
+        """
+        spec = _INNER_SEARCH_TOOL_SPEC
+
+        async def _handler(event, **kwargs):
+            self._refresh_config()
+            budget = min(
+                float(self.search_total_timeout), float(self.agent_tool_timeout)
+            )
+            raw = await self._run_browser_web_search(
+                event,
+                max_bytes=_INNER_SEARCH_MAX_BYTES,
+                timeout=int(_clamp(budget, 5, 300)),
+                **kwargs,
+            )
+            return agent_core.record_and_truncate(
+                raw,
+                tool=spec["name"],
+                args=kwargs,
+                run=agent_core.current_run(),
+            )
+
+        return agent_core.build_function_tool(
+            name=spec["name"],
+            description=spec["description"],
+            parameters=spec["parameters"],
+            handler=_handler,
+        )
 
     def _build_subagent_instruction(self, perception: str | None = None) -> str:
         """动态生成浏览器子代理指令（基础模板 + 页面感知方式段）。
@@ -1528,6 +1872,164 @@ class BrowserLLMPlugin(Star):
             mode = (self.page_perception or "").strip().lower()
         perception_note = perception_map.get(mode, perception_map["text_image"])
         return f"{_BROWSER_AGENT_INSTRUCTION}\n\n{perception_note}"
+
+    # ------------------------------------------------------------
+    # 内层人格三档与分层提示词（v1.7.0，规格 §5）
+    # ------------------------------------------------------------
+
+    def _remember_persona(
+        self, umo: str, system_prompt: str | None, persona_id: str | None = None
+    ) -> str:
+        """从 on_llm_request 的 system_prompt 里切出人格块并缓存（``current`` 主路径）。
+
+        只缓存文本：**不落日志、不写文件**（规格 §9.4 的禁止清单第一条）。
+        每 umo 一条、每次请求覆盖、TTL 30min（超时视为未命中 ⇒ 走次路径）。
+        返回切到的人格正文（没切到返回空串）。
+        """
+        text = agent_core.extract_persona_text(system_prompt)
+        if not text or not umo:
+            return text
+        cache = self._persona_store()
+        cache[umo] = (time.monotonic(), persona_id, text)
+        return text
+
+    def _persona_store(self) -> dict:
+        """人格缓存字典（按需建：手工装配的实例没有 __init__ 跑过的字段）。"""
+        cache = getattr(self, "_persona_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._persona_cache = cache
+        return cache
+
+    def _cached_persona(self, umo: str) -> str:
+        """读人格缓存（超过 30min 视为未命中并丢弃该条）。"""
+        cache = self._persona_store()
+        item = cache.get(umo)
+        if not item:
+            return ""
+        ts, _pid, text = item
+        if time.monotonic() - ts > _PERSONA_CACHE_TTL:
+            cache.pop(umo, None)
+            return ""
+        return text
+
+    async def _current_persona_text(self, event: AstrMessageEvent | None) -> str:
+        """``persona_mode=current`` 取"当前生效人格提示词"：三条路径 + 可见降级。
+
+        1. **主路径**：on_llm_request 缓存（``_remember_persona`` 在钩子里写入）。
+           它的顺序保证见 ``core.agent.extract_persona_text`` 的注释
+           （核心先拼人格、后触发 OnLLMRequestEvent）。
+        2. **次路径**：``persona_manager.resolve_selected_persona``（拿不到会话
+           persona_id 时走这条，核心的规则是"会话规则 > agent_runner 默认"，
+           因此**必须**记 WARNING —— 解析出来的可能与会话自己的 persona 不同）。
+        3. **末路径**：``get_default_persona_v3(umo)``（默认人格）。
+        4. 三条都拿不到 ⇒ 空串 + WARNING（等价 default，**可见**降级）。
+        """
+        umo = self._umo_of(event) if event is not None else ""
+        cached = self._cached_persona(umo)
+        if cached:
+            return cached
+        pm = getattr(self.context, "persona_manager", None)
+        if pm is None:
+            logger.warning(
+                f"[{self.metadata_name}] persona_mode=current 无法获取当前人格"
+                "提示词（无 persona_manager），已回落 default 档"
+            )
+            return ""
+        resolver = getattr(pm, "resolve_selected_persona", None)
+        if callable(resolver):
+            try:
+                platform = ""
+                try:
+                    platform = event.get_platform_name() if event is not None else ""
+                except Exception:  # noqa: BLE001 — 桩事件没有该方法
+                    platform = ""
+                pid, persona, _forced, _webchat = await resolver(
+                    umo=umo,
+                    conversation_persona_id=None,
+                    platform_name=platform,
+                    provider_settings=None,
+                )
+                text = str((persona or {}).get("prompt") or "").strip()
+                if text:
+                    logger.warning(
+                        f"[{self.metadata_name}] persona_mode=current 未捕获到"
+                        f"当前请求的人格块，改用 persona_manager 解析（pid={pid}）"
+                    )
+                    self._persona_store()[umo] = (time.monotonic(), pid, text)
+                    return text
+            except Exception as e:  # noqa: BLE001 — 次路径失败继续走末路径
+                logger.debug(
+                    f"[{self.metadata_name}] resolve_selected_persona 失败: {e}"
+                )
+        getter = getattr(pm, "get_default_persona_v3", None)
+        if callable(getter):
+            try:
+                persona = await getter(umo)
+                text = str((persona or {}).get("prompt") or "").strip()
+                if text:
+                    logger.warning(
+                        f"[{self.metadata_name}] persona_mode=current 未捕获到"
+                        "当前请求的人格块，改用默认人格（get_default_persona_v3）"
+                    )
+                    return text
+            except Exception as e:  # noqa: BLE001
+                logger.debug(
+                    f"[{self.metadata_name}] get_default_persona_v3 失败: {e}"
+                )
+        logger.warning(
+            f"[{self.metadata_name}] persona_mode=current 无法获取当前人格提示词，"
+            "已回落 default 档"
+        )
+        return ""
+
+    async def _compose_inner_prompt(
+        self,
+        perception: str | None = None,
+        *,
+        base: str | None = None,
+        event: AstrMessageEvent | None = None,
+    ) -> str:
+        """合成内层 system_prompt：**L0 红线 → L1 人格 → L2 工具 → L3 感知 → L4 契约**。
+
+        分层顺序写死在 ``core.agent.compose_inner_prompt``（结构性保证：人格层
+        没有位置去改写工具清单或覆盖红线，它是被**包裹**而不是替换）。本方法
+        只负责准备 L1 的文本：
+
+        - ``default``：L1 空（= v1.6.0 行为逐字节一致）；
+        - ``current``：当前会话人格（截断 2000 字符；失败可见降级到 default）；
+        - ``custom``：``agent.persona_prompt``（截断 4000 字符；空值 ⇒ 等价
+          default + WARNING，不静默）。
+
+        Args:
+            perception: 本次感知模式（L3 用）。
+            base: 预构建的 L2+L3 文本；None 时按 perception 现算。
+            event: 消息事件（``current`` 档取会话人格用），可为 None。
+        """
+        base_text = base if base is not None else self._build_subagent_instruction(
+            perception
+        )
+        mode = self.agent_persona_mode
+        persona_text = ""
+        if mode == "current":
+            persona_text = await self._current_persona_text(event)
+            if not persona_text:
+                logger.warning(
+                    f"[{self.metadata_name}] persona_mode=current 无可用人格文本，"
+                    "本次按 default 档（仅工具层）执行"
+                )
+        elif mode == "custom":
+            persona_text = str(self.agent_persona_prompt or "").strip()
+            if not persona_text:
+                logger.warning(
+                    f"[{self.metadata_name}] persona_mode=custom 但 "
+                    "agent.persona_prompt 为空，本次按 default 档执行"
+                )
+        return agent_core.compose_inner_prompt(
+            base=base_text,
+            persona_mode=mode,
+            persona_text=persona_text,
+        )
 
     def _cleanup_cache(self) -> int:
         """清理超过 cache_days 天的媒体/截图缓存文件，返回删除数。
@@ -1748,6 +2250,206 @@ class BrowserLLMPlugin(Star):
             return str(value or "").strip()
         return str(getattr(self, "vision_prompt", "") or "").strip()
 
+    # ------------------------------------------------------------
+    # 内层 provider（v1.7.0，规格 §3）：唯一解析点 + 面板候选同步
+    # ------------------------------------------------------------
+
+    def _live_agent_provider_id(self) -> str:
+        """实时读取 ``agent.provider_id``（面板保存即生效，不必等重载）。
+
+        语义与 ``_live_vision_provider_id`` 一致：空串 = **继承当前会话模型**
+        （默认，等于 v1.6.0 行为），非空 = 运营方显式指定。
+        """
+        view = ConfigView(self.config)
+        value, found = view.lookup("agent.provider_id")
+        if found:
+            return str(value or "").strip()
+        return str(getattr(self, "agent_provider_id", "") or "").strip()
+
+    def _collect_provider_configs(self) -> list[tuple[str, object]]:
+        """``[(provider_id, provider_config)]``：面板候选与能力判定共用一份数据。
+
+        数据源同 ``_collect_provider_ids``（优先 ``provider_insts``，即仅聊天
+        Provider；为空时才退 ``inst_map``）。``provider_config`` 取不到时给
+        ``{}`` —— 调用方按"未声明 modalities"（fail-open）处理。
+        """
+        pm = getattr(self.context, "provider_manager", None)
+        if pm is None:
+            return []
+        out: list[tuple[str, object]] = []
+        for inst in getattr(pm, "provider_insts", None) or []:
+            pid = ""
+            try:
+                pid = str(inst.meta().id)
+            except Exception:  # noqa: BLE001 — meta() 异常时尝试属性兜底
+                pid = str(getattr(inst, "provider_id", "") or "")
+            if not pid:
+                continue
+            cfg = getattr(inst, "provider_config", None)
+            out.append((pid, cfg if isinstance(cfg, dict) else {}))
+        if out:
+            seen: set[str] = set()
+            deduped: list[tuple[str, object]] = []
+            for pid, cfg in out:
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                deduped.append((pid, cfg))
+            return deduped
+        inst_map = getattr(pm, "inst_map", None)
+        if isinstance(inst_map, dict):
+            for pid, inst in inst_map.items():
+                if not pid:
+                    continue
+                cfg = getattr(inst, "provider_config", None)
+                out.append((str(pid), cfg if isinstance(cfg, dict) else {}))
+        return out
+
+    def _provider_config_of(self, provider_id: str) -> object:
+        """查一个 provider 的 ``provider_config``（查不到返回 ``{}``）。"""
+        target = str(provider_id or "")
+        if not target:
+            return {}
+        for pid, cfg in self._collect_provider_configs():
+            if pid == target:
+                return cfg
+        pm = getattr(self.context, "provider_manager", None)
+        inst_map = getattr(pm, "inst_map", None) if pm is not None else None
+        if isinstance(inst_map, dict):
+            inst = inst_map.get(target)
+            if inst is not None:
+                cfg = getattr(inst, "provider_config", None)
+                return cfg if isinstance(cfg, dict) else {}
+        return {}
+
+    def _sync_agent_provider_options(self) -> list[str]:
+        """把「多模态 + 可函数调用」的 provider 同步到面板下拉（内存 schema）。
+
+        为什么只列这两种：内层子代理要**看图**（影像原生）与**调工具**。
+        列出纯文本模型会让运营方选到一个必然走 caption 兜底甚至被拒的模型，
+        那是把"运行期才发现的错"推给运行期（规格 §3.1）。
+
+        与 ``_sync_vision_provider_options`` 同款做法：Dashboard 每次请求直接
+        读 ``plugin_md.config.schema``（同一对象），就地改 ``options`` 即生效；
+        ``""`` 空选项恒保留（= 继承当前会话），default 不在候选里时归零。
+        """
+        options = [""] + agent_core.agent_provider_candidates(
+            self._collect_provider_configs()
+        )
+        options = list(dict.fromkeys(options))
+        schema = getattr(self.config, "schema", None)
+        if isinstance(schema, dict):
+            item = schema_leaf(schema, "agent.provider_id")
+            if isinstance(item, dict):
+                if item.get("options") != options:
+                    item["options"] = options
+                if item.get("default") not in options:
+                    item["default"] = ""
+        return options
+
+    def _start_agent_provider_sync_task(self) -> None:
+        """启动内层 provider 下拉同步的启动期兜底任务（同识图那套，5s×120s）。
+
+        AstrBot 的启动顺序是「插件加载先于 provider 初始化」，因此
+        ``initialize()`` 里的首次同步可能拿到空列表；本任务轮询到 provider
+        就绪后同步一次即退出。
+        """
+        if self._agent_sync_task is not None and not self._agent_sync_task.done():
+            return
+
+        async def _loop() -> None:
+            deadline = time.monotonic() + 120
+            while True:
+                if self._collect_provider_configs():
+                    options = self._sync_agent_provider_options()
+                    logger.info(
+                        f"[{self.metadata_name}] 内层模型下拉已同步 "
+                        f"({len(options) - 1} 个多模态 Provider)"
+                    )
+                    return
+                if time.monotonic() > deadline:
+                    return
+                try:
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    raise
+
+        self._agent_sync_task = asyncio.create_task(
+            _loop(), name="browser-agent-provider-sync"
+        )
+
+    def _stop_agent_provider_sync_task(self) -> None:
+        """停止内层 provider 下拉同步任务（幂等）。"""
+        task = self._agent_sync_task
+        if task is None:
+            return
+        self._agent_sync_task = None
+        if not task.done():
+            task.cancel()
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._await_task(task))  # 不阻塞 terminate
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _current_chat_provider_id(self, event: AstrMessageEvent | None) -> str:
+        """**唯一**的「当前会话聊天 provider」解析点（v1.7.0 收口）。
+
+        为什么要收口：v1.6.0 有两处各自调 ``context.get_current_chat_provider_id``
+        （识图回退、browse_web 入口）。同一个语义两个调用点 ⇒ 一处加了缓存/
+        兜底另一处就漂移；守卫 ``grep -c`` 也数不清"到底有几个解析点"。
+        现在两处都走这里，``get_current_chat_provider_id`` 在 main.py 只出现一次。
+        """
+        umo = self._umo_of(event) if event is not None else ""
+        return await self.context.get_current_chat_provider_id(umo=umo)
+
+    async def _resolve_agent_provider(
+        self, event: AstrMessageEvent | None
+    ) -> agent_core.ProviderDecision:
+        """解析内层 provider（规格 §3.3 八格），失败**不回落**当前会话模型。
+
+        决策本身是纯函数（``core.agent.decide_provider``）：这里只负责取三件
+        事实（配置值 / 实际 id / 是否已加载 / provider_config），然后把日志按
+        决策给的级别打出去。取不到模型（继承档）时表现为一条错误文本 ——
+        前台/后台各自的投递语义由调用方决定（规格 §3.4）。
+        """
+        configured = self._live_agent_provider_id()
+        resolved = configured
+        if not resolved:
+            try:
+                resolved = await self._current_chat_provider_id(event)
+            except Exception as e:  # noqa: BLE001 — ProviderNotFoundError 等
+                logger.warning(
+                    f"[{self.metadata_name}] 获取当前对话 Provider 失败: {e}"
+                )
+                resolved = ""
+        loaded = self._provider_loaded(resolved) if configured else True
+        config = self._provider_config_of(resolved) if resolved else {}
+        decision = agent_core.decide_provider(
+            configured=configured,
+            resolved=resolved,
+            loaded=loaded,
+            provider_config=config,
+            persona_mode=self.agent_persona_mode,
+        )
+        # 先打本格的诊断行（ERROR/WARNING/INFO/DEBUG 随格而定），再打"内层模型
+        # 选定"那一行 INFO —— 后者是**每次任务一行**的固定口径
+        # （``内层模型= / 影像原生= / 人格档=``，规格 §1.2.5），故障排查按它 grep。
+        if decision.log_text:
+            level = decision.log_level
+            log_line = f"[{self.metadata_name}] {decision.log_text}"
+            if level == "error":
+                logger.error(log_line)
+            elif level == "warning":
+                logger.warning(log_line)
+            elif level == "info":
+                logger.info(log_line)
+            else:
+                logger.debug(log_line)
+        if decision.selection_log and decision.selection_log != decision.log_text:
+            logger.info(f"[{self.metadata_name}] {decision.selection_log}")
+        return decision
+
     async def _resolve_vision_provider_id(
         self, event: AstrMessageEvent | None = None
     ) -> str:
@@ -1783,9 +2485,7 @@ class BrowserLLMPlugin(Star):
         )
         if event is not None:
             try:
-                fallback = await self.context.get_current_chat_provider_id(
-                    umo=self._umo_of(event)
-                )
+                fallback = await self._current_chat_provider_id(event)
             except Exception as e:  # noqa: BLE001 — 回退失败不抛异常
                 logger.warning(
                     f"[{self.metadata_name}] 识图回退 provider 获取失败: {e}"
@@ -2654,6 +3354,9 @@ class BrowserLLMPlugin(Star):
             # 顺带同步识图 provider 下拉（面板每次请求实时读取内存 schema，
             # 此入口被主 LLM 高频调用，可保持面板选项跟随运行时 provider 变化）。
             self._sync_vision_provider_options()
+            # 搜索双模式收敛（v1.7.0）：search.mode / 池可用性变了就重建内层
+            # 工具集并重新对齐外层可见性（幂等；签名不变时是两次 dict 比较）。
+            await self._sync_search_mode()
             allowed, deny_reason = self._is_session_allowed(event)
             if not allowed:
                 return f"【拒绝】{deny_reason}"
@@ -2697,10 +3400,20 @@ class BrowserLLMPlugin(Star):
                     ),
                     task_text=task_input,
                 )
-            return await self._browse_web_run(event, task_input, perception_mode)
+            # 前台路径（唯一给主 LLM 直接返回的地方）：结论 + 台账要套上
+            # 「不可信外部内容」前缀（规格 §1.2.3）。错误/拒绝是我们自己的
+            # 可信文本，_with_untrusted_prefix 自动跳过。
+            return self._with_untrusted_prefix(
+                await self._browse_web_run(event, task_input, perception_mode)
+            )
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{self.metadata_name}] browse_web 执行异常: {e}")
             return f"【错误】浏览器子代理执行失败：{e}"
+
+    @staticmethod
+    def _with_untrusted_prefix(text: str) -> str:
+        """给前台返回体套「不可信外部内容」前缀（错误/拒绝不加）。"""
+        return agent_core.with_untrusted_prefix(text)
 
     async def _browse_web_run(
         self,
@@ -2708,37 +3421,117 @@ class BrowserLLMPlugin(Star):
         task_input: str,
         perception_mode: str,
     ) -> str:
-        """browse_web 的执行体（provider 解析 + 子 Agent）；前台与后台共用。
+        """browse_web 的执行体（provider 解析 + 内层代理 + 台账）；前台与后台共用。
 
-        provider 解析放在这里（而不是入口）：后台模式下拿不到模型应表现为
-        一条**异步失败终态消息**，而不是「被告知不可用却什么都没发生」。
-        ``event`` 只被读取（子工具取 umo / 加锁 / 发媒体由 sink 截流）。
+        返回体**不带**「不可信外部内容」前缀：前缀的加点是"消费者是模型"的
+        那两处（前台入口 ``browse_web`` 与 C 模式 ``_run_c_background_body``）——
+        见规格 §1.2.3。plugin 引擎的后台终态消息消费者是**人**，不加前缀。
+
+        为什么 provider 解析放在这里（而不是入口）：后台模式下拿不到模型应
+        表现为一条**异步失败终态消息**，而不是「被告知不可用却什么都没发生」。
+
+        四件结构与顺序相关的事：
+
+        1. ``agent_core.run_scope``：把本次任务的「是否影像原生 / 结果上限 /
+           图片参数 / 台账」放进 ContextVar（内层截图工具据此决定走原生还是
+           caption 兜底；并发会话之间不会串号）；
+        2. ``asyncio.wait_for`` 包住**整个** ``tool_loop_agent``：
+           ``agent.task_timeout`` 到点就取消，取消后只拼字符串、不再 await
+           任何可能阻塞的东西（规格 §8.4 的"不悬挂"硬要求）；
+        3. 超时/异常都归成 ``【错误】`` 文本（``TargetClosedError`` 这类取消
+           传播出来的异常必须被吞在这里，不许冒泡给主 LLM）；
+        4. 台账由插件按**实际工具调用**生成，追加在结论之后 —— 模型改不了它。
         """
-        instruction = self._build_subagent_instruction(perception_mode)
-        try:
-            provider_id = await self.context.get_current_chat_provider_id(
-                umo=self._umo_of(event)
+        umo = self._umo_of(event)
+        # 并发观测（规格 §8.5）：同会话前台并发**只告警不拦截**（前台入口持锁
+        # 会与内层工具锁互死，见 browse_web docstring）。计数器按需建：手工
+        # 装配的实例（单测 __new__）没有 __init__ 跑过的字段。
+        inflight = getattr(self, "_fg_inflight", None)
+        if not isinstance(inflight, dict):
+            inflight = {}
+            self._fg_inflight = inflight
+        depth = inflight.get(umo, 0)
+        if depth:
+            logger.warning(
+                f"[{self.metadata_name}] 同会话并发 browse_web（n={depth + 1}，"
+                f"umo={self._umo_digest(umo)}）——前台不单飞，仅观测"
             )
-        except Exception as e:  # noqa: BLE001 — ProviderNotFoundError 等
-            logger.warning(f"[{self.metadata_name}] 获取当前对话 Provider 失败: {e}")
-            return "【错误】无法确定当前对话模型，浏览器子代理不可用。"
-        if not provider_id:
-            return "【错误】无法确定当前对话模型，浏览器子代理不可用。"
-        logger.debug(f"[{self.metadata_name}] browse_web prov_id={provider_id!r}")
-        resp = await self.context.tool_loop_agent(
-            event=event,
-            chat_provider_id=provider_id,
-            prompt=task_input or "请根据用户请求浏览网页并返回结果",
-            system_prompt=instruction,
-            tools=self._browser_toolset,
-            max_steps=self.agent_max_steps,
-            tool_call_timeout=self.agent_tool_timeout,
-        )
-        text = getattr(resp, "completion_text", "") or ""
-        logger.debug(
-            f"[{self.metadata_name}] browse_web tool_loop_agent 返回，len={len(text)}"
-        )
-        return text or "（浏览器子代理未返回内容）"
+        inflight[umo] = depth + 1
+        try:
+            if getattr(self, "_browser_toolset", None) is None:
+                # 兜底：手工装配的实例（单测 / 极端加载顺序）没跑过 initialize()。
+                # 生产路径上 initialize() 一定会建好，这里只是让它不会拿 None 去跑。
+                self._rebuild_browser_toolset()
+            decision = await self._resolve_agent_provider(event)
+            if not decision.ok:
+                return decision.error
+            base_instruction = self._build_subagent_instruction(perception_mode)
+            instruction = await self._compose_inner_prompt(
+                perception_mode, base=base_instruction, event=event
+            )
+            budget = float(self.agent_task_timeout)
+            run = agent_core.AgentRun(
+                provider_id=decision.provider_id,
+                native_image=decision.native_image,
+                result_max_chars=int(self.agent_result_max_chars),
+                image_max_side=int(self.agent_image_max_side),
+                image_quality=int(self.agent_image_quality),
+                char_budget=int(self.agent_max_steps) * int(self.agent_result_max_chars),
+                redact=_redact_url,
+            )
+            with agent_core.run_scope(run) as scoped:
+                try:
+                    resp = await asyncio.wait_for(
+                        self.context.tool_loop_agent(
+                            event=event,
+                            chat_provider_id=decision.provider_id,
+                            prompt=task_input or "请根据用户请求浏览网页并返回结果",
+                            system_prompt=instruction,
+                            tools=self._browser_toolset,
+                            max_steps=self.agent_max_steps,
+                            tool_call_timeout=self.agent_tool_timeout,
+                        ),
+                        timeout=budget,
+                    )
+                    text = getattr(resp, "completion_text", "") or ""
+                    text = text or "（浏览器子代理未返回内容）"
+                except asyncio.TimeoutError:
+                    text = (
+                        f"【错误】浏览任务超过 {budget:.0f} 秒硬上限被中止"
+                        f"（已完成 {scoped.ledger.steps} 步，见台账）"
+                    )
+                except Exception as e:  # noqa: BLE001 — 取消/浏览器已关等
+                    logger.warning(
+                        f"[{self.metadata_name}] browse_web 内层执行异常: {e}"
+                    )
+                    text = f"【错误】浏览器子代理执行失败：{e}（已中止）"
+                logger.debug(
+                    f"[{self.metadata_name}] 台账 steps={scoped.ledger.steps} "
+                    f"provider={scoped.provider_id!r}"
+                )
+                ledger_block = agent_core.render_ledger(
+                    scoped.ledger, int(self.agent_ledger_max_lines)
+                )
+                images = scoped.ledger.images
+            parts: list[str] = []
+            if decision.notice and not text.startswith(("【错误】", "【拒绝】")):
+                parts.append(decision.notice)
+            parts.append(text)
+            if ledger_block:
+                parts.append(ledger_block)
+            logger.debug(
+                f"[{self.metadata_name}] browse_web tool_loop_agent 返回，"
+                f"len={len(text)} images={images}"
+            )
+            return "\n\n".join(part for part in parts if part)
+        finally:
+            inflight = getattr(self, "_fg_inflight", None)
+            if isinstance(inflight, dict):
+                left = inflight.get(umo, 1) - 1
+                if left > 0:
+                    inflight[umo] = left
+                else:
+                    inflight.pop(umo, None)
 
     # ================================================================
     # 本地页面渲染预览入口（面向子代理：browse_local_page）
@@ -2819,8 +3612,19 @@ class BrowserLLMPlugin(Star):
                         event, target, full_page, wait_ms, perception_mode, progress
                     ),
                 )
-            return await self._local_page_render(
-                event, target, full_page, wait_ms, perception_mode, {}
+            # 结果预算走**共享执行体**（``core.agent.truncate_text``）：三个
+            # 外层入口对"一次工具结果能有多长"的口径必须一致（``agent.
+            # result_max_chars``），否则模型会看到三套长度契约。
+            #
+            # 为什么本工具**不**进浏览器子代理（规格 §1.4 三条理由）：① 四道
+            # 路径校验必须**同步**拒绝（越权路径不能退化成异步失败）② 6 条生产
+            # 人格显式列了它（合并=静默剥夺）③ 它的消费者是主 LLM（"没有视觉
+            # 模型时看渲染结果"），语义与"网页交互"不同类。
+            return agent_core.truncate_text(
+                await self._local_page_render(
+                    event, target, full_page, wait_ms, perception_mode, {}
+                ),
+                int(self.agent_result_max_chars),
             )
         except Exception as e:  # noqa: BLE001 — LLM 工具必须容错
             logger.warning(f"[{METADATA_NAME}] browse_local_page 失败: {e}")
@@ -3281,6 +4085,76 @@ class BrowserLLMPlugin(Star):
                 return f"【拒绝】页面{field}包含违禁内容：{banned}"
         return f"URL: {info['url']}\n标题: {info['title']}\n\n正文摘要: {text}"
 
+    async def _page_compact(self, page, max_chars: int = 0) -> str:
+        """紧凑页面面貌：``URL / 标题 / 正文前 N 字``（v1.7.0，N=``agent.result_max_chars``）。
+
+        为什么非"读正文"类原语（点击/滚动/切标签/刷新）要改成紧凑返回：
+        它们的职责是"动作是否生效"，附上整页正文既吃 token 又诱导模型把
+        同一次点击的正文重复读一遍；正文请用 ``browse_get_text`` 显式取。
+        禁词过滤与 ``_page_summary`` 同口径（同一个出口，不新开一条路径）。
+        """
+        info = await self.extractor.extract_page_info(page)
+        # getattr 兜底：手工装配的插件实例（单测 __new__）没有该字段。
+        default_limit = int(getattr(self, "agent_result_max_chars", 0) or self.max_chars)
+        limit = int(max_chars or default_limit)
+        text = await self.extractor.extract_text(page, max_chars=limit)
+        text = text or "（页面无文本内容）"
+        for field, value in (("标题", info.get("title") or ""), ("正文", text)):
+            banned = self._check_banned(value)
+            if banned:
+                return f"【拒绝】页面{field}包含违禁内容：{banned}"
+        return f"URL: {info['url']}\n标题: {info['title']}\n\n正文前 {len(text)} 字: {text}"
+
+    async def _page_url_title(self, page) -> str:
+        """只回 ``URL + 标题``（v1.7.0，供"跳转类"原语用，规格 §1.3 #6）。"""
+        info = await self.extractor.extract_page_info(page)
+        banned = self._check_banned(info.get("title") or "")
+        if banned:
+            return f"【拒绝】页面标题包含违禁内容：{banned}"
+        return f"URL: {info['url']}\n标题: {info['title']}"
+
+    async def _scroll_report(self, page, delta: int) -> str:
+        """滚动结果报告：``已滚动 <px> px，进度 <%>，页面高度 <h>px``（规格 §1.3 #7）。
+
+        为什么不回正文：滚动这一步的"是否生效"只需要进度与页高；正文要求
+        ``browse_get_text`` 显式取，否则同一页正文会被反复塞进上下文。
+        """
+        info = await self.extractor.extract_page_info(page)
+        banned = self._check_banned(info.get("title") or "")
+        if banned:
+            return f"【拒绝】页面标题包含违禁内容：{banned}"
+        metrics: dict = {}
+        evaluate = getattr(page, "evaluate", None)
+        if evaluate is not None:
+            try:
+                metrics = (
+                    await evaluate(
+                        "() => ({y: window.scrollY, h: document.body ? "
+                        "document.body.scrollHeight : 0, "
+                        "vh: window.innerHeight || 0})"
+                    )
+                    or {}
+                )
+            except Exception as e:  # noqa: BLE001 — 量不到就不报进度
+                logger.debug(f"读取滚动位置失败: {e}")
+                metrics = {}
+        action = "向下" if delta >= 0 else "向上"
+        height = int(metrics.get("h") or 0)
+        y = int(metrics.get("y") or 0)
+        vh = int(metrics.get("vh") or 0)
+        if height > 0:
+            reachable = max(1, height - vh) if vh else height
+            percent = int(min(100, max(0, round(y * 100 / reachable))))
+            return (
+                f"已{action}滚动 {abs(int(delta))} px，进度 {percent}%，"
+                f"页面高度 {height}px（当前 scrollY={y}）。"
+                "需要正文请用 browse_get_text。"
+            )
+        return (
+            f"已{action}滚动 {abs(int(delta))} px（页面高度读取不可用）。"
+            "需要正文请用 browse_get_text。"
+        )
+
     def _lock_for(self, event: AstrMessageEvent) -> asyncio.Lock:
         """返回该会话的专用锁（串行化同一会话的并发工具调用）。"""
         return self.sessions.get_lock(self._umo_of(event))
@@ -3459,7 +4333,9 @@ class BrowserLLMPlugin(Star):
                 page, err = await self._get_page(event)
                 if page is None:
                     return f"【错误】{err}"
-                return await self._page_summary(page)
+                # v1.7.0：紧凑返回（URL/标题/正文前 N 字），正文请用
+                # browse_get_text 显式取（规格 §1.3 #3）。
+                return await self._page_compact(page)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{METADATA_NAME}] browse_current_page 失败: {e}")
             return f"【错误】读取当前页面失败：{e}"
@@ -3558,7 +4434,9 @@ class BrowserLLMPlugin(Star):
                     return f"【拒绝】链接 {index} 未通过安全校验：{reason}"
                 # 链接已是绝对 URL（playwright evaluate 已绝对化），直接 goto。
                 await page.goto(target, wait_until="domcontentloaded")
-                return await self._page_summary(page)
+                # v1.7.0：只回 URL + 标题（不附正文）——点击的职责是"跳没跳"，
+                # 正文由 browse_get_text 显式取（规格 §1.3 #6）。
+                return await self._page_url_title(page)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{METADATA_NAME}] browse_click_link 失败: {e}")
             return f"【错误】点击链接失败：{e}"
@@ -3584,7 +4462,9 @@ class BrowserLLMPlugin(Star):
                 y = sign * int(pixels)
                 await page.evaluate(f"window.scrollBy(0, {y})")
                 self._vision_cache_invalidate(event, getattr(page, "url", ""))
-                return await self._page_summary(page)
+                # v1.7.0：只回滚动结果（像素/进度/页高），**不返回正文**——
+                # 滚动是"看没看到更多"，正文用 browse_get_text（规格 §1.3 #7）。
+                return await self._scroll_report(page, y)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{METADATA_NAME}] browse_scroll 失败: {e}")
             return f"【错误】滚动页面失败：{e}"
@@ -3603,7 +4483,7 @@ class BrowserLLMPlugin(Star):
                 except Exception as e:  # noqa: BLE001
                     return f"【错误】后退失败：{e}"
                 self._vision_cache_invalidate(event, pre_url)
-                return await self._page_summary(page)
+                return await self._page_compact(page)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{METADATA_NAME}] browse_go_back 失败: {e}")
             return f"【错误】后退失败：{e}"
@@ -3622,7 +4502,7 @@ class BrowserLLMPlugin(Star):
                 except Exception as e:  # noqa: BLE001
                     return f"【错误】前进失败：{e}"
                 self._vision_cache_invalidate(event, pre_url)
-                return await self._page_summary(page)
+                return await self._page_compact(page)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{METADATA_NAME}] browse_go_forward 失败: {e}")
             return f"【错误】前进失败：{e}"
@@ -3652,7 +4532,7 @@ class BrowserLLMPlugin(Star):
                 new_page = await self.sessions.new_tab(umo, url)
                 if new_page is None:
                     return "【错误】标签页数量已达上限，无法新开标签。"
-                summary = await self._page_summary(new_page)
+                summary = await self._page_compact(new_page)
                 return f"已新开标签页（当前共 {self.sessions.tab_count(umo)} 个标签）。\n{summary}"
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{METADATA_NAME}] browse_new_tab 失败: {e}")
@@ -3685,7 +4565,7 @@ class BrowserLLMPlugin(Star):
                 if target is None:
                     return f"【错误】标签页编号 {index} 不存在（当前共 {total} 个，编号从 1 开始）。"
                 self._vision_cache_invalidate(event, pre_url)
-                summary = await self._page_summary(target)
+                summary = await self._page_compact(target)
                 return f"已切换到标签 {index}（共 {total} 个）。\n{summary}"
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{METADATA_NAME}] browse_switch_tab 失败: {e}")
@@ -3805,11 +4685,24 @@ class BrowserLLMPlugin(Star):
 
         await event.send(event.chain_result([Video.fromFileSystem(path)]))
 
-    async def browse_screenshot(self, event: AstrMessageEvent) -> str:
-        """截取当前页面截图并发送给用户，若配置识图模型则附上识图描述（无需参数）。
+    async def browse_screenshot(self, event: AstrMessageEvent):
+        """截取当前页面截图；**影像原生**交给内层模型（无参数）。
 
+        三个分支（规格 §2.3 的三行表格）：
+
+        1. 内层模型多模态 ⇒ 返回 ``mcp.types.CallToolResult``（TextContent +
+           ImageContent），图片由核心缓存后在**下一轮**以 user 消息塞进内层
+           上下文（``tool_loop_agent_runner.py:1310-1325`` / ``:1107-1141``）。
+           此时**完全不调用** ``llm_generate``，``vision_provider_id`` 不参与。
+        2. 内层模型是纯文本 ⇒ 走 caption 兜底：返回 ``str``
+           ``"识图结果：\\n<caption>"``（等于 v1.6.0 的行为，用 T2 修过的
+           内容哈希缓存）。
+        3. 纯文本 + 未配/无效的识图兜底 ⇒ 返回明确 ``【不可用】`` 文案，
+           **不许**静默返回空串让模型瞎猜。
+
+        ``silent_mode=false`` 时仍向会话发图（``_emit_media`` 不变）。
         子 Agent 工具上下文（FunctionTool.call）不能 yield 消息，因此发图
-        改用 event.send(image_result(path))，返回文本供 LLM 阅读。
+        改用 event.send(image_result(path))。
         """
         try:
             async with self._lock_for(event):
@@ -3830,7 +4723,21 @@ class BrowserLLMPlugin(Star):
                         await self._emit_media(event, result, "image")
                     except Exception as e:  # noqa: BLE001 — 发图失败不阻塞识图
                         logger.warning(f"[{METADATA_NAME}] 发送截图失败: {e}")
-                # 识图（可选）：配置了 vision_provider_id 才尝试。
+                run = agent_core.current_run()
+                if run is not None and run.native_image:
+                    # ---- 分支 1：影像原生 ----
+                    payload = await self._image_native_result(
+                        result,
+                        run=run,
+                        size_label=self._viewport_label(page),
+                        sent_to_user=not self.silent_mode,
+                        crop=None,
+                    )
+                    if payload is not None:
+                        return payload
+                    # mcp 不可用 / 图片超硬上限 / 张数用尽 ⇒ 走 caption 兜底
+                    # （可见降级：文本里说明了原因，不是静默丢图）。
+                # ---- 分支 2/3：caption 兜底（T2 的内容哈希缓存路径）----
                 # kind="screenshot" 进缓存键：全图与 browse_zoom_crop 的裁剪
                 # 结果不再互相命中（v1.6.1）。
                 desc = await self._describe_screenshot(
@@ -3851,6 +4758,10 @@ class BrowserLLMPlugin(Star):
                         else "截图已发送给用户"
                     )
                     return f"{prefix}。识图结果：\n{desc}"
+                if run is not None and run.native_image:
+                    # 影像原生失败且 caption 也没有（未配置识图兜底）：
+                    # 明确告知不可用，别让模型猜页面长什么样。
+                    return _IMAGE_UNAVAILABLE_TEXT
                 prefix = (
                     "截图已识图（静默模式，未发送）"
                     if self.silent_mode
@@ -3861,11 +4772,101 @@ class BrowserLLMPlugin(Star):
             logger.warning(f"[{METADATA_NAME}] browse_screenshot 失败: {e}")
             return f"【错误】截图失败：{e}"
 
-    async def browse_click_text(self, event: AstrMessageEvent, text: str) -> str:
+    def _viewport_label(self, page) -> str:
+        """截图尺寸标签（``1280x800``）：取自视口，取不到用配置兜底。"""
+        viewport = getattr(page, "viewport_size", None) or {}
+        width = int(viewport.get("width") or 0)
+        height = int(viewport.get("height") or 0)
+        if width <= 0 or height <= 0:
+            configured = self.viewport if isinstance(self.viewport, dict) else {}
+            width = int(configured.get("width") or 1280)
+            height = int(configured.get("height") or 800)
+        return f"{width}x{height}"
+
+    async def _image_native_result(
+        self,
+        path: str,
+        *,
+        run: agent_core.AgentRun,
+        size_label: str,
+        sent_to_user: bool,
+        crop: tuple[int, int, int, int] | None,
+    ):
+        """把截图/裁剪包成 ``CallToolResult``（影像原生的**唯一**出站处）。
+
+        三条产出规则（规格 §2.2 / §8.1）：
+
+        - 每工具每次最多 **1** 张 ``ImageContent``，全任务最多
+          ``MAX_IMAGES_PER_TASK`` 张；超额 ⇒ 返回纯文本（说明原因），不丢静默；
+        - base64 超过 ``LLM_IMAGE_MAX_B64`` 由 ``agent_core`` 再压/丢弃；
+        - 安全：``path`` 必须是**本插件截图目录**下的文件（不允许任意路径
+          变成模型可读图片 —— 否则就是任意文件读取原语，规格 §9.3-P6）。
+
+        Returns:
+            ``CallToolResult`` / 纯文本 ``str``；``None`` 表示"图片没做成，
+            请调用方继续走 caption 兜底"。
+        """
+        if not self._is_own_screenshot(path):
+            logger.error(
+                f"[{METADATA_NAME}] 影像原生拒绝非截图目录路径"
+                f"（{Path(str(path)).name}）"
+            )
+            return None
+        if run.ledger.images >= agent_core.MAX_IMAGES_PER_TASK:
+            return (
+                f"【预算】本次任务图片数已达上限（{agent_core.MAX_IMAGES_PER_TASK} 张），"
+                "本张不再附图片；请改用 browse_get_text / browse_get_interactive 获取信息。"
+            )
+        image = await agent_core.async_image_content(
+            path,
+            max_side=run.image_max_side,
+            quality=run.image_quality,
+        )
+        if image is None:
+            # 太大/读不到：图片没做成，交给调用方走 caption 兜底。
+            return None
+        if crop is None:
+            first = (
+                "截图已发送给用户，同时附在本条结果之后。"
+                if sent_to_user
+                else f"截图已获取（{size_label}，JPEG q={run.image_quality}）。"
+                "图片已附在本条工具结果之后，可直接查看。"
+            )
+            text = (
+                f"{first}\n如需读小字/图标：先据此图定位，再用 "
+                "browse_zoom_crop(x,y,w,h) 放大该区域。"
+            )
+        else:
+            x, y, width, height = crop
+            text = f"裁剪区域 (x,y,w,h)=({x},{y},{width},{height}) 已放大附在本条结果之后。"
+        result = agent_core.call_result_with_image(text, image)
+        if result is None:
+            return None
+        # 张数由台账在 ``record_and_truncate`` 里统一计一次（``Ledger.add`` 看到
+        # ImageContent 就 +1）。这里**不能**再加一次：那会让"40 张上限"实际变成
+        # 20 张（每张被计两遍）。
+        return result
+
+    def _is_own_screenshot(self, path: str) -> bool:
+        """该路径是否在本插件的截图目录下（影像原生的安全边界）。"""
+        root = getattr(self, "_screenshot_dir", None)
+        if root is None:
+            return False
+        try:
+            Path(str(path)).resolve().relative_to(Path(root).resolve())
+        except (ValueError, OSError):
+            return False
+        return True
+
+
+    async def browse_click_text(
+        self, event: AstrMessageEvent, text: str, index: int = 0
+    ) -> str:
         """网页交互场景专用：按文本内容精准点击页面元素（按钮/选项等非链接 JS 元素）。
 
         Args:
             text(string): 要点击的元素包含的文本内容，如"确认并继续"。
+            index(number): 多个元素包含同一文本时的序号，从 0 开始，默认 0（第一个）。
         """
         try:
             async with self._lock_for(event):
@@ -3875,13 +4876,25 @@ class BrowserLLMPlugin(Star):
                 text = str(text).strip()
                 if not text:
                     return "【错误】text 不能为空。"
+                try:
+                    idx = int(index or 0)
+                except (TypeError, ValueError):
+                    return (
+                        f"【错误】index 参数无效：{index!r}，"
+                        "应为从 0 开始的整数（0=第一个匹配）。"
+                    )
+                if idx < 0:
+                    return f"【错误】index 不能为负数（收到 {idx}），编号从 0 开始。"
                 clicked = False
                 # 优先 Playwright 的 get_by_text（语义化文本定位）。
+                # v1.7.0 扩参 index：多匹配时用 .nth(idx) 取第 idx 个 ——
+                # v1.6.1 的 .first 只能点第一个，页面里同名按钮/选项一多就
+                # 点错目标（规格 §1.3 #16）。
                 if hasattr(page, "get_by_text"):
                     try:
-                        await page.get_by_text(text, exact=False).first.click(
-                            timeout=10000
-                        )
+                        target = page.get_by_text(text, exact=False)
+                        target = target.first if idx == 0 else target.nth(idx)
+                        await target.click(timeout=10000)
                         clicked = True
                     except Exception as e:  # noqa: BLE001 — 未找到或不可点，降级
                         logger.debug(
@@ -3889,7 +4902,9 @@ class BrowserLLMPlugin(Star):
                         )
                 if not clicked:
                     try:
-                        await page.locator(f"text={text}").first.click(timeout=10000)
+                        fallback = page.locator(f"text={text}")
+                        fallback = fallback.first if idx == 0 else fallback.nth(idx)
+                        await fallback.click(timeout=10000)
                         clicked = True
                     except Exception as e:  # noqa: BLE001
                         # 失败路径（v1.6.1）：**不伪装成功**——保留【错误】
@@ -3900,13 +4915,14 @@ class BrowserLLMPlugin(Star):
                             f"[{METADATA_NAME}] 未找到可点击元素（文本: {text}）: {e}"
                         )
                         message = (
-                            f"【错误】页面上找不到包含文本「{text}」的可点击元素。"
+                            f"【错误】页面上找不到包含文本「{text}」的可点击元素"
+                            f"（index={idx}）。"
                         )
                         candidates = await self._click_text_candidates(page, text)
                         return f"{message}\n{candidates}" if candidates else message
-                logger.info(f"[{METADATA_NAME}] 已按文本点击: {text}")
+                logger.info(f"[{METADATA_NAME}] 已按文本点击: {text}（index={idx}）")
                 self._vision_cache_invalidate(event, getattr(page, "url", ""))
-                return await self._page_summary(page)
+                return await self._page_compact(page)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{METADATA_NAME}] browse_click_text 失败: {e}")
             return f"【错误】点击元素失败：{e}"
@@ -3970,13 +4986,70 @@ class BrowserLLMPlugin(Star):
                 page, err = await self._get_page(event)
                 if page is None:
                     return f"【错误】{err}"
-                await page.select_option(selector, value)
+                try:
+                    await page.select_option(selector, value)
+                except Exception as exc:  # noqa: BLE001 — 失败要给出可选值
+                    logger.warning(
+                        f"[{METADATA_NAME}] browse_select_option 失败: {exc}"
+                    )
+                    # v1.7.0：失败时列出该 select 的**全部真实 option**
+                    # （规格 §1.3 #18）。只回【错误】会让模型继续猜选项名
+                    # （事故根因②的同型问题：模型编造页面里没有的标签）。
+                    message = f"【错误】选择下拉选项失败：{exc}"
+                    options = await self._select_options(page, selector)
+                    return f"{message}\n{options}" if options else message
                 logger.info(f"[{METADATA_NAME}] 已选择下拉项: {selector} = {value}")
                 self._vision_cache_invalidate(event, getattr(page, "url", ""))
-                return await self._page_summary(page)
+                return await self._page_compact(page)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{METADATA_NAME}] browse_select_option 失败: {e}")
             return f"【错误】选择下拉选项失败：{e}"
+
+    async def _select_options(self, page, selector: str) -> str:
+        """列出某个 select 的全部真实 option（label/value/当前选中）；失败返回空串。"""
+        evaluate = getattr(page, "evaluate", None)
+        if evaluate is None:
+            return ""
+        try:
+            raw = await evaluate(
+                """(sel) => {
+                  const el = document.querySelector(sel);
+                  if (!el || el.tagName.toLowerCase() !== 'select') return null;
+                  return Array.from(el.options).slice(0, 50).map((o) => ({
+                    label: String(o.label || o.text || '').trim().slice(0, 40),
+                    value: String(o.value ?? '').slice(0, 40),
+                    selected: !!o.selected,
+                  }));
+                }""",
+                selector,
+            )
+        except Exception as e:  # noqa: BLE001 — 附加信息，失败不影响原错误
+            logger.debug(f"读取 select 选项失败: {e}")
+            return ""
+        if not isinstance(raw, list) or not raw:
+            return ""
+        lines = [f"该下拉框共有 {len(raw)} 个真实选项（label / value / 是否选中）："]
+        for idx, item in enumerate(raw, start=1):
+            if not isinstance(item, dict):
+                continue
+            mark = "（当前选中）" if item.get("selected") else ""
+            label = item.get("label") or ""
+            value = item.get("value") or ""
+            lines.append(f"{idx}. 「{label}」 / value={value}{mark}")
+        lines.append("请只用上面列出的 label 或 value 重试，禁止臆造选项。")
+        return "\n".join(lines)
+
+    async def _element_at_point(self, page, x: int, y: int) -> str:
+        """视口坐标命中的元素标签（``role「文本」``）；失败返回空串。"""
+        evaluate = getattr(page, "evaluate", None)
+        if evaluate is None:
+            return ""
+        try:
+            raw = await evaluate(_POINT_ELEMENT_JS, x, y)
+        except Exception as e:  # noqa: BLE001 — 附加信息
+            logger.debug(f"读取点击点元素失败: {e}")
+            return ""
+        return str(raw or "").strip()
 
     async def browse_click_coords(self, event: AstrMessageEvent, x: int, y: int) -> str:
         """网页交互场景专用：按视口坐标点击页面（识图后定位无文本元素时使用）。
@@ -3993,7 +5066,13 @@ class BrowserLLMPlugin(Star):
                 await page.mouse.click(int(x), int(y))
                 logger.info(f"[{METADATA_NAME}] 已点击坐标: ({x}, {y})")
                 self._vision_cache_invalidate(event, getattr(page, "url", ""))
-                return await self._page_summary(page)
+                # v1.7.0：紧凑返回 + 附「点到了哪个元素」（规格 §1.3 #19）——
+                # 坐标点击最容易出错，模型需要一条能自我纠正的旁证。
+                hit = await self._element_at_point(page, int(x), int(y))
+                body = await self._page_compact(page)
+                if hit:
+                    return f"已点击坐标 ({int(x)}, {int(y)})，命中元素：{hit}\n{body}"
+                return f"已点击坐标 ({int(x)}, {int(y)})（该位置没有可读元素）\n{body}"
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{METADATA_NAME}] browse_click_coords 失败: {e}")
             return f"【错误】坐标点击失败：{e}"
@@ -4031,11 +5110,17 @@ class BrowserLLMPlugin(Star):
                         logger.warning(
                             f"[{METADATA_NAME}] 未找到可悬停元素（文本: {text}）: {e}"
                         )
-                        return f"【错误】页面上找不到包含文本「{text}」的可悬停元素。"
+                        # v1.7.0：与 browse_click_text 同口径给相近候选 top-5
+                        # （规格 §1.3 #20）——否则模型只能继续猜文本。
+                        message = (
+                            f"【错误】页面上找不到包含文本「{text}」的可悬停元素。"
+                        )
+                        candidates = await self._click_text_candidates(page, text)
+                        return f"{message}\n{candidates}" if candidates else message
                 logger.info(f"[{METADATA_NAME}] 已悬停: {text}")
                 # 悬停常触发悬浮菜单/下拉层（画面变化，URL 不变）⇒ 也失效。
                 self._vision_cache_invalidate(event, getattr(page, "url", ""))
-                return await self._page_summary(page)
+                return await self._page_compact(page)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{METADATA_NAME}] browse_hover 失败: {e}")
             return f"【错误】悬停元素失败：{e}"
@@ -4050,20 +5135,34 @@ class BrowserLLMPlugin(Star):
                 await page.reload(wait_until="domcontentloaded", timeout=20000)
                 logger.info(f"[{METADATA_NAME}] 已刷新页面")
                 self._vision_cache_invalidate(event, getattr(page, "url", ""))
-                return await self._page_summary(page)
+                return await self._page_compact(page)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{METADATA_NAME}] browse_reload 失败: {e}")
             return f"【错误】刷新页面失败：{e}"
 
     async def browse_checkbox(
-        self, event: AstrMessageEvent, selector: str, checked: bool, index: int = 0
+        self,
+        event: AstrMessageEvent,
+        selector: str,
+        checked: bool = True,
+        index: int = 0,
     ) -> str:
         """网页交互场景专用：设置复选框/单选框/按钮式选项的选中状态。
 
         Args:
             selector(string): 复选框的 CSS 选择器（多匹配时用 index 指定第几个）。
-            checked(boolean): 目标选中状态（true=勾选，false=取消）。
+            checked(boolean): 目标选中状态（true=勾选，false=取消）。默认 true。
             index(number): 多匹配时的序号，从 0 开始，默认 0（第一个匹配）。
+
+        v1.7.0 三条语义（规格 §1.3 #22）：
+
+        1. ``checked`` 变**可选**（默认 ``true``）⇒ 旧调用（只传 selector）仍成立；
+        2. 多匹配**不再**冒泡 Playwright 的 ``strict mode violation``，改用
+           ``.nth(index)``（v1.6.1 已做 index，本轮把"取第几个"变成默认行为）；
+        3. 目标不是 checkbox/radio 时**降级为点击 + 读回**
+           ``aria-checked/aria-pressed/data-state``，禁止直接报
+           ``Not a checkbox or radio button`` 就结束 —— 按钮式选项（
+           ``<button aria-pressed>``）在真实页面里非常常见。
         """
         try:
             async with self._lock_for(event):
@@ -4079,13 +5178,14 @@ class BrowserLLMPlugin(Star):
                     )
                 if idx < 0:
                     return f"【错误】index 不能为负数（收到 {idx}），编号从 0 开始。"
+                want = bool(checked)
                 loc = page.locator(selector)
                 total = await self._locator_count(loc)
                 if total is not None and total == 0:
                     return (
                         f"【错误】页面上找不到匹配「{selector}」的复选框/单选框/"
                         "按钮式选项（候选 0 个）。请确认选择器，或先用 "
-                        "browse_get_text / browse_screenshot 看清页面元素。"
+                        "browse_get_interactive / browse_get_text 看清页面元素。"
                     )
                 if total is not None and idx >= total:
                     return (
@@ -4101,37 +5201,91 @@ class BrowserLLMPlugin(Star):
                 # 漏 await 时 bool(coroutine) 恒为 True，会把「目标状态与
                 # 当前状态一致」误判为不一致而误点击（切换语义反转）。
                 state = await self._checkbox_state(target)
+                downgraded = False
                 if state is None:
                     # 按钮式选项（<button aria-pressed> / role=radio 等）：
-                    # 无可读选中状态。要求「选中」时点一次（选中幂等）；
-                    # 要求「取消」时明确报错而不是盲点（盲点可能反而选中）。
-                    if not checked:
-                        return (
-                            f"【错误】「{selector}」[index={idx}] 不是复选框/"
-                            "单选框且没有可读的选中状态，无法执行「取消选中」。"
-                            "如需切换请改用 browse_click_text 按文本点击。"
+                    # 没有原生选中状态 ⇒ **降级为点击**（v1.7.0）：先读回
+                    # aria-checked/aria-pressed/data-state，能读就读，读不到
+                    # 就点一次再读回，最后如实报告读到什么。
+                    downgraded = True
+                    before = await self._button_state(target)
+                    if before is not None and before == want:
+                        logger.info(
+                            f"[{METADATA_NAME}] 按钮式选项状态已符合目标，未点击: "
+                            f"{selector}[{idx}] -> {want}"
                         )
-                    await target.click()
-                    logger.info(
-                        f"[{METADATA_NAME}] 已按按钮式选项点击（无可读状态）: "
-                        f"{selector}[{idx}]"
+                    else:
+                        await target.click()
+                        logger.info(
+                            f"[{METADATA_NAME}] 已按按钮式选项点击（无可读原生状态）: "
+                            f"{selector}[{idx}]"
+                        )
+                    after = await self._button_state(target)
+                    self._vision_cache_invalidate(event, getattr(page, "url", ""))
+                    body = await self._page_compact(page)
+                    readback = (
+                        "未知（点击后仍读不到 aria-checked/aria-pressed/data-state）"
+                        if after is None
+                        else ("true" if after else "false")
                     )
-                elif state != bool(checked):
+                    note = (
+                        "（已降级为点击：目标不是 checkbox/radio，没有原生选中状态）"
+                        if downgraded
+                        else ""
+                    )
+                    return (
+                        f"已设置「{selector}」[index={idx}] 目标状态={want}{note}；"
+                        f"点击前状态={before}，点击后状态={readback}。\n{body}"
+                    )
+                clicked = False
+                if state != want:
                     await target.click()
+                    clicked = True
                     logger.info(
-                        f"[{METADATA_NAME}] 已设置选中状态: "
-                        f"{selector}[{idx}] -> {checked}"
+                        f"[{METADATA_NAME}] 已设置选中状态: {selector}[{idx}] -> {want}"
                     )
                 else:
                     logger.info(
                         f"[{METADATA_NAME}] 选中状态已符合目标，未点击: "
-                        f"{selector}[{idx}] -> {checked}"
+                        f"{selector}[{idx}] -> {want}"
                     )
                 self._vision_cache_invalidate(event, getattr(page, "url", ""))
-                return await self._page_summary(page)
+                body = await self._page_compact(page)
+                tail = "" if clicked else "（选中状态已符合目标，未点击）"
+                return (
+                    f"已设置「{selector}」[index={idx}] 选中状态={want}"
+                    f"（当前={state}）{tail}。\n{body}"
+                )
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{METADATA_NAME}] browse_checkbox 失败: {e}")
             return f"【错误】设置复选框状态失败：{e}"
+
+    @staticmethod
+    async def _button_state(loc) -> bool | None:
+        """读按钮式选项的"按下状态"：aria-checked / aria-pressed / data-state。
+
+        与 ``_checkbox_state`` 的区别：这里**接受** ``data-state``（Radix 系
+        组件用 ``data-state="checked|unchecked"``），且不尝试 ``is_checked()``
+        （已知它会对非 checkbox 抛错）。读不到返回 ``None``（如实报告未知）。
+        """
+        getter = getattr(loc, "get_attribute", None)
+        if getter is None:
+            return None
+        for attr in ("aria-checked", "aria-pressed", "data-state"):
+            try:
+                value = await getter(attr)
+            except Exception:  # noqa: BLE001 — 单属性失败继续试下一个
+                continue
+            if value is None:
+                continue
+            text = str(value).strip().lower()
+            if text in ("true", "false"):
+                return text == "true"
+            if text in ("checked", "on", "selected"):
+                return True
+            if text in ("unchecked", "off"):
+                return False
+        return None
 
     async def browse_zoom_crop(
         self, event: AstrMessageEvent, x: int, y: int, width: int, height: int
@@ -4172,7 +5326,19 @@ class BrowserLLMPlugin(Star):
                 logger.info(
                     f"[{METADATA_NAME}] 已裁剪截图 ({cx},{cy},{cw}x{ch}) -> {save_path}"
                 )
-                # 识图该区域（配置了 vision_provider_id 才执行）。
+                run = agent_core.current_run()
+                if run is not None and run.native_image:
+                    # ---- 影像原生：裁剪图直接进内层上下文（规格 §2.2）----
+                    payload = await self._image_native_result(
+                        save_path,
+                        run=run,
+                        size_label=f"{cw}x{ch}",
+                        sent_to_user=False,
+                        crop=(cx, cy, cw, ch),
+                    )
+                    if payload is not None:
+                        return payload
+                # ---- caption 兜底（T2 的内容哈希缓存路径）----
                 # kind + 裁剪参数进缓存键（v1.6.1）：裁剪结果与 browse_screenshot
                 # 的全图结果不再互相命中（事故里 crop 的描述被当成全图描述返回）。
                 desc = await self._describe_screenshot(
@@ -4189,7 +5355,14 @@ class BrowserLLMPlugin(Star):
                     if banned:
                         return f"【拒绝】裁剪区域识图结果包含违禁内容：{banned}"
                     return f"裁剪区域识图结果：\n{desc}"
-                return f"已裁剪区域截图并保存：{save_path}（如需识图请配置 vision_provider_id 多模态模型）。"
+                if run is not None and run.native_image:
+                    return (
+                        "【不可用】本次裁剪图既无法作为图片交给内层模型"
+                        f"（可能超过 {agent_core.LLM_IMAGE_MAX_B64} 字符或图片数已达上限），"
+                        "且未配置可用的识图兜底模型。请缩小裁剪区域重试，"
+                        "或改用 browse_get_text / browse_get_interactive。"
+                    )
+                return _IMAGE_UNAVAILABLE_TEXT
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{METADATA_NAME}] browse_zoom_crop 失败: {e}")
             return f"【错误】裁剪识图失败：{e}"
@@ -4324,6 +5497,168 @@ class BrowserLLMPlugin(Star):
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{METADATA_NAME}] browse_sniff_media 失败: {e}")
             return f"【错误】媒体嗅探失败：{e}"
+
+    async def browse_get_interactive(
+        self, event: AstrMessageEvent, max_items: int = 40, role_filter: str = ""
+    ) -> str:
+        """列出当前页面上**真实存在**的可交互元素（v1.7.0 新增，规格 §1.3 #25）。
+
+        每行 8 列：``#n | role | name(可点文本) | type | checked | disabled |
+        selector | cx,cy``。``selector`` 由注入 JS 计算的 CSS 路径（``#id``
+        优先，否则 ``tag:nth-of-type`` 链），**可直接喂给
+        ``browse_click_selector``** —— "枚举 → 确定性落点"这条链路是关闭事故
+        根因②（交互原语太粗、只能猜文本）的关键。
+
+        安全边界：只做 DOM 枚举（``page.evaluate`` 只读），不发网络请求、
+        不返回 ``innerHTML`` 全文（只回文本名 + selector），拒绝任意 JS 执行。
+
+        Args:
+            max_items(number): 最多返回多少个元素，默认 40（上限 200）。
+            role_filter(string): 只列该 role 的元素（如 button/link/checkbox/
+                radio/tab），留空 = 全部。
+        """
+        try:
+            async with self._lock_for(event):
+                page, err = await self._get_page(event)
+                if page is None:
+                    return f"【错误】{err}"
+                try:
+                    limit = int(max_items) if max_items else 40
+                except (TypeError, ValueError):
+                    return f"【错误】max_items 参数无效：{max_items!r}，应为数字。"
+                limit = max(1, min(200, limit))
+                role = str(role_filter or "").strip().lower()
+                evaluate = getattr(page, "evaluate", None)
+                if evaluate is None:
+                    return "【错误】当前页面不支持元素枚举（evaluate 不可用）。"
+                try:
+                    raw = await evaluate(_INTERACTIVE_JS, limit, role)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        f"[{METADATA_NAME}] browse_get_interactive 枚举失败: {e}"
+                    )
+                    return f"【错误】枚举可交互元素失败：{e}"
+                items = [
+                    item
+                    for item in (raw or [])
+                    if isinstance(item, dict) and item.get("selector")
+                ]
+                if not items:
+                    suffix = f"（role_filter={role}）" if role else ""
+                    return (
+                        f"当前页面上没有找到可交互元素{suffix}。"
+                        "可以先用 browse_get_text 看页面文字，或用 browse_screenshot 看外观。"
+                    )
+                info = await self.extractor.extract_page_info(page)
+                lines = [
+                    f"URL: {info['url']}",
+                    f"可交互元素共 {len(items)} 个"
+                    f"（#{'-'.join(str(i) for i in (1, len(items)))}；"
+                    "selector 可直接用于 browse_click_selector）：",
+                    "#n | role | name | type | checked | disabled | selector | cx,cy",
+                ]
+                for idx, item in enumerate(items, start=1):
+                    state = item.get("state") or "-"
+                    disabled = "是" if item.get("disabled") else "否"
+                    visible = "" if item.get("visible", True) else "（不可见）"
+                    lines.append(
+                        f"{idx} | {item.get('role') or '-'} | "
+                        f"{item.get('name') or '-'}{visible} | "
+                        f"{item.get('type') or '-'} | {state} | {disabled} | "
+                        f"{item.get('selector')} | {item.get('x')},{item.get('y')}"
+                    )
+                lines.append(
+                    "点击请用 browse_click_selector(selector=…, index=…)："
+                    "selector 内的 nth-of-type 与 index 都从 0 开始的序号语义不同，"
+                    "同一 selector 多匹配时用 index 选第几个。"
+                )
+                return "\n".join(lines)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[{METADATA_NAME}] browse_get_interactive 失败: {e}")
+            return f"【错误】枚举可交互元素失败：{e}"
+
+    async def browse_click_selector(
+        self, event: AstrMessageEvent, selector: str, index: int = 0
+    ) -> str:
+        """按 CSS 选择器点击元素（v1.7.0 新增，规格 §1.3 #26）。
+
+        走 ``locator(selector).nth(index)`` + ``wait_for(state="visible")`` +
+        ``click(timeout=10000)``；返回紧凑摘要 + 该元素点击后的
+        ``aria-checked``/``aria-pressed`` 读回值（用于确认"到底选没选中"）。
+
+        为什么单独加这个原语而不是让模型用坐标：``browse_get_interactive``
+        给出的 selector 是**确定性落点**，比坐标/文本都稳（坐标会随滚动失效，
+        文本会随多匹配选错）。
+
+        Args:
+            selector(string): CSS 选择器，通常直接取自 browse_get_interactive。
+            index(number): 多匹配时的序号，从 0 开始，默认 0（第一个）。
+        """
+        try:
+            async with self._lock_for(event):
+                page, err = await self._get_page(event)
+                if page is None:
+                    return f"【错误】{err}"
+                sel = str(selector or "").strip()
+                if not sel:
+                    return "【错误】selector 不能为空。"
+                try:
+                    idx = int(index or 0)
+                except (TypeError, ValueError):
+                    return (
+                        f"【错误】index 参数无效：{index!r}，"
+                        "应为从 0 开始的整数（0=第一个匹配）。"
+                    )
+                if idx < 0:
+                    return f"【错误】index 不能为负数（收到 {idx}），编号从 0 开始。"
+                loc = page.locator(sel)
+                total = await self._locator_count(loc)
+                if total is not None and total == 0:
+                    return (
+                        f"【错误】页面上找不到匹配「{sel}」的元素（候选 0 个）。"
+                        "请先用 browse_get_interactive 看清可用的 selector。"
+                    )
+                if total is not None and idx >= total:
+                    return (
+                        f"【错误】index={idx} 越界：选择器「{sel}」共匹配 {total} 个"
+                        f"（编号 0..{total - 1}）。"
+                    )
+                target = loc if (total is None or total <= 1) else loc.nth(idx)
+                waiter = getattr(target, "wait_for", None)
+                if waiter is not None:
+                    try:
+                        await waiter(state="visible", timeout=10000)
+                    except Exception as e:  # noqa: BLE001 — 等不到可见也试一次点击
+                        logger.debug(f"wait_for(visible) 未通过，仍尝试点击: {e}")
+                try:
+                    await target.click(timeout=10000)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        f"[{METADATA_NAME}] browse_click_selector 点击失败: {e}"
+                    )
+                    return (
+                        f"【错误】点击「{sel}」[index={idx}] 失败：{e}。"
+                        "可用 browse_get_interactive 重新枚举，或改用 "
+                        "browse_click_text / browse_click_coords。"
+                    )
+                logger.info(
+                    f"[{METADATA_NAME}] 已按 selector 点击: {sel}[{idx}]"
+                )
+                self._vision_cache_invalidate(event, getattr(page, "url", ""))
+                after = await self._button_state(target)
+                readback = (
+                    "读不到（该元素没有 aria-checked/aria-pressed/data-state）"
+                    if after is None
+                    else ("true" if after else "false")
+                )
+                body = await self._page_compact(page)
+                return (
+                    f"已点击「{sel}」[index={idx}]（候选 {total if total is not None else '未知'} 个）；"
+                    f"点击后状态读回：{readback}。\n{body}"
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[{METADATA_NAME}] browse_click_selector 失败: {e}")
+            return f"【错误】按选择器点击失败：{e}"
 
     async def _download_media(
         self, url: str, index: int, media_class: str = "image"
@@ -4735,13 +6070,31 @@ class BrowserLLMPlugin(Star):
         """池内可用条目 = 模板已知 + 启用 + 有 key + 无配置错误。"""
         return [entry for entry in self._parse_search_providers() if is_entry_usable(entry)]
 
-    def _search_available(self) -> bool:
-        """工具是否应当可用：总开关开 + 池内至少一个可用 provider。
+    def _search_pool_ready(self) -> bool:
+        """池是否就绪：``search.enabled`` + 至少一个可用 provider（**与模式无关**）。
 
-        两条都满足才会 ``activate`` 工具；否则自动闸门关掉（防"开着开关但没
-        填 key"时报一堆 missing_key 给模型看）。
+        v1.7.0 起"池是否就绪"和"外层工具该不该可见"分开了：internal 档下池
+        就绪（内层要用它）但外层工具必须不可见。混成一个函数会让
+        ``_rebuild_browser_toolset`` 在 internal 档永远拿不到池（自相矛盾）。
+
+        ``getattr`` 兜底：本方法在内层工具集签名与若干"手工装配的插件实例"
+        （单测用 ``BrowserLLMPlugin.__new__`` 造的那种）里都会被调到，属性缺失
+        时按"未启用"处理，不要把 AttributeError 抛进工具链。
         """
-        return bool(self.search_enabled) and bool(self._search_usable_entries())
+        if not getattr(self, "search_enabled", False):
+            return False
+        return bool(self._search_usable_entries())
+
+    def _search_available(self) -> bool:
+        """**外层** ``browser_web_search`` 是否应当可见：池就绪 + 模式为 external。
+
+        internal 档恒 False ⇒ ``_reconcile_search_tool`` 会把外层工具 deactivate
+        （模型根本看不到它；规格 §4.2）。内层工具在不在由
+        ``_rebuild_browser_toolset`` 用 ``_search_pool_ready()`` 判断。
+        """
+        return self._search_pool_ready() and (
+            getattr(self, "search_mode", "external") == "external"
+        )
 
     def _search_secret_values(self) -> list:
         """运行期脱敏表：池内所有非空 api_key（只进内存，不落日志/返回体）。"""
@@ -4886,6 +6239,11 @@ class BrowserLLMPlugin(Star):
             )
             return
 
+        # v1.7.0：want 多一条 ``search_mode == "external"``（规格 §4.2-1）。
+        # internal 档 = 池搜索已经挪进内层工具，外层同名工具**必须**对模型
+        # 不可见；否则就是"同名两份并存"——主 LLM 与内层都会搜、结果重复、
+        # token 翻倍，还多一个"该用哪个"的决策面（main.py 顶部
+        # ``_SEARCH_TOOL_NAME`` 的注释记过同类教训）。
         want = self._search_available()
         if not own:
             # import 期以外（桩环境/管理器不可见）：只记影子值，入口兜底负责。
@@ -4923,11 +6281,17 @@ class BrowserLLMPlugin(Star):
                 f"（可用 provider={[e.name for e in self._search_usable_entries()]}）"
             )
         else:
-            reason = (
-                "search.enabled=false"
-                if not self.search_enabled
-                else "池内无可用 provider（缺 api_key / 全部禁用 / 端点非法）"
-            )
+            if self.search_mode == "internal":
+                # v1.7.0：internal 档停用外层工具是**正常状态**，原因要写清
+                # （否则运营方会以为"搜索坏了"）。池是否可用影响内层工具在不在。
+                reason = (
+                    f"search.mode=internal（池搜索已挂到内层工具 "
+                    f"{_INNER_SEARCH_TOOL_NAME}，外层对模型不可见）"
+                )
+            elif not self.search_enabled:
+                reason = "search.enabled=false"
+            else:
+                reason = "池内无可用 provider（缺 api_key / 全部禁用 / 端点非法）"
             logger.info(
                 f"[{self.metadata_name}] search tool inactive: {_SEARCH_TOOL_NAME}"
                 f"（{reason}）"
@@ -5078,10 +6442,35 @@ class BrowserLLMPlugin(Star):
         后台模式（v1.5.0）：tools.background_mode=all 时本工具后台化——立刻
         返回「已受理 + task_id」**纯文本**（不是 JSON），搜索结果单独作为一条
         消息发到本会话。因此后台模式下**不要**用这次返回值回答事实问题。
+
+        双模式（v1.7.0，配置 search.mode）：
+        - ``external``（默认）：就是上面这套 —— 你（主 LLM）直接拿到原始结构化
+          结果；
+        - ``internal``：池搜索已经挪进浏览器子代理（内层工具
+          ``browse_web_search``），本工具被插件强制停用、你根本看不到它；要搜
+          就用 ``browse_web`` 委托，拿回的是子代理加工过的结论而不是原始 JSON。
         """
         # 后台模式热更新（v1.5.0）：入口第一行刷新配置，Dashboard 把
         # background_mode 改回 off 时下一次调用即生效（F1）。
         self._refresh_config()
+        # 双模式收敛（v1.7.0）：配置里刚切成 internal 时，本入口可能还会被
+        # 调用一次（核心在模型请求装配期缓存了工具集），这里显式拒绝并指向
+        # browse_web —— 不给"同名两份并存"留任何缝隙。
+        if self.search_mode == "internal":
+            return self._search_payload(
+                status="disabled",
+                code="handled_by_agent",
+                summary=(
+                    "【拒绝】search.mode=internal：池搜索由浏览器子代理执行，"
+                    "请改用 browse_web 委托搜索任务。"
+                ),
+                query=(query or "").strip(),
+                hint=(
+                    "插件配置 search.mode=internal 时，池搜索是内层工具 "
+                    "browse_web_search（子代理调用）；外层同名工具对模型不可见。"
+                    "若希望自己直接拿到原始搜索结果，请把 search.mode 改回 external。"
+                ),
+            )
         if not self.search_enabled:
             return self._search_payload(
                 status="disabled",
@@ -5134,14 +6523,26 @@ class BrowserLLMPlugin(Star):
         fetch_top_n: int = 0,
         progress: dict | None = None,
         refresh: bool = True,
+        max_bytes: int = PAYLOAD_MAX_BYTES,
     ) -> str:
         """browser_web_search 的实际执行体（前台同步调用与后台任务共用）。
 
         ``progress``：增量快照容器（后台任务会传入自己的那份，超时时据此
         渲染「已得部分结果」）；``refresh``：是否在开头重读配置——入口已刷新
-        时传 False（后台分支），避免一次调用读两遍配置。
+        时传 False（后台分支），避免一次调用读两遍配置；``max_bytes``：返回
+        体体积上限（外层默认 24KB，**内层工具传 6000**，规格 §4.3 —— 内层
+        还要再叠 ``agent.result_max_chars`` 截断）。
+
+        双模式（v1.7.0）：外层 ``browser_web_search`` 与内层 ``browse_web_search``
+        走的是**同一个**执行体（同一套 ``_search_url_guard`` / 禁词过滤 /
+        冷却 / TTL 缓存），绝不另写一条 HTTP 路径 —— 安全防线只有一处实现。
         """
         began = time.monotonic()
+
+        def _payload(**kwargs) -> str:
+            """本次调用的返回体渲染（统一挂 max_bytes，避免某个分支漏传）。"""
+            return self._search_payload(max_bytes=max_bytes, **kwargs)
+
         text = (query or "").strip()
         notes: list[str] = []
         # 搜索阶段的**增量快照**容器（t6 M-1）：search_waves 每波结束都把
@@ -5155,7 +6556,7 @@ class BrowserLLMPlugin(Star):
             if refresh:
                 self._refresh_config()
             if not self.search_enabled:
-                return self._search_payload(
+                return _payload(
                     status="disabled",
                     code="disabled",
                     summary="【拒绝】搜索工具已在插件配置中关闭（search.enabled=false）",
@@ -5165,7 +6566,7 @@ class BrowserLLMPlugin(Star):
 
             allowed, deny_reason = self._is_session_allowed(event)
             if not allowed:
-                return self._search_payload(
+                return _payload(
                     status="failed",
                     code="session_denied",
                     summary=f"【拒绝】{deny_reason}",
@@ -5173,7 +6574,7 @@ class BrowserLLMPlugin(Star):
                 )
 
             if not text:
-                return self._search_payload(
+                return _payload(
                     status="failed",
                     code="empty_query",
                     summary="【错误】检索词为空，请提供要搜索的问题或关键词",
@@ -5182,7 +6583,7 @@ class BrowserLLMPlugin(Star):
 
             banned = self._check_banned(text)
             if banned:
-                return self._search_payload(
+                return _payload(
                     status="failed",
                     code="banned",
                     summary=f"【拒绝】检索词包含违禁内容：{banned}",
@@ -5198,7 +6599,7 @@ class BrowserLLMPlugin(Star):
                     entry.url_guard = guard
             usable = [entry for entry in entries if is_entry_usable(entry)]
             if not usable:
-                return self._search_payload(
+                return _payload(
                     status="failed",
                     code="no_provider",
                     summary="【错误】没有可用的搜索后端（池内无已填写 api_key 的 provider）",
@@ -5276,7 +6677,7 @@ class BrowserLLMPlugin(Star):
             hint = ""
             if status == "failed":
                 hint = self._search_failure_hint(code)
-            return self._search_payload(
+            return _payload(
                 status=status,
                 code=code,
                 summary=summary,
@@ -5302,7 +6703,7 @@ class BrowserLLMPlugin(Star):
             if dropped:
                 timeout_notes.append(f"banned_results:{dropped}")
             if partial:
-                return self._search_payload(
+                return _payload(
                     status="partial",
                     code="ok",
                     summary=summarize(
@@ -5321,7 +6722,7 @@ class BrowserLLMPlugin(Star):
                     attempts=attempts,
                     notes=timeout_notes,
                 )
-            return self._search_payload(
+            return _payload(
                 status="failed",
                 code="total_timeout",
                 summary=f"【错误】搜索超过总预算（{self.search_total_timeout:.0f}s）被中断",
@@ -5340,7 +6741,7 @@ class BrowserLLMPlugin(Star):
             logger.warning(
                 f"[{self.metadata_name}] browser_web_search 执行异常: {message}"
             )
-            return self._search_payload(
+            return _payload(
                 status="failed",
                 code="internal_error",
                 summary="【错误】搜索工具内部异常，请稍后重试或改用 browse_web",
@@ -5429,7 +6830,30 @@ class BrowserLLMPlugin(Star):
     async def inject_browser_instruction(
         self, event: AstrMessageEvent, req: ProviderRequest
     ):
-        """在 LLM 请求前注入网页浏览工具使用指引。"""
+        """在 LLM 请求前注入网页浏览工具使用指引；顺带截留当前人格块。
+
+        两件事、两个理由：
+
+        1. **委托指引**（v1.3.0 起）：告诉主 LLM 什么时候该调 ``browse_web``、
+           什么时候不该（纯搜索别开浏览器）；
+        2. **人格截留**（v1.7.0，``agent.persona_mode=current`` 的**主路径**）：
+           核心先 ``_ensure_persona_and_skills`` 把人格 append 成
+           ``\\n# Persona Instructions\\n\\n{prompt}\\n``（``astr_main_agent.py:599-603``），
+           **之后**才触发 ``OnLLMRequestEvent``（``internal.py:271`` → ``:307``）。
+           所以在这里切人格块拿到的就是"本轮真实生效的人格"，比事后问
+           persona_manager 更准（后者拿不到会话 persona_id 时会走别的规则）。
+           只缓存文本：不落日志、不写文件（规格 §9.4）。
+
+        会话被拒绝时也照样截留人格（拒绝只影响指引，不影响"人格是什么"这一事实）。
+        """
+        try:
+            self._remember_persona(
+                self._umo_of(event),
+                getattr(req, "system_prompt", "") or "",
+                getattr(getattr(req, "conversation", None), "persona_id", None),
+            )
+        except Exception as e:  # noqa: BLE001 — 截留失败绝不能影响主链路
+            logger.debug(f"[{self.metadata_name}] 人格块截留失败（忽略）: {e}")
         allowed, deny_reason = self._is_session_allowed(event)
         if not allowed:
             req.system_prompt = (req.system_prompt or "") + (
