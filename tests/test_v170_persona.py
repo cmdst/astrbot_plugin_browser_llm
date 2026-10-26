@@ -358,6 +358,68 @@ def test_persona_cache_is_per_umo_and_expires():
     assert "umo-a" not in plugin._persona_store()
 
 
+def test_persona_fallback_cuts_skills_tail():
+    """**次路径**（文本切分）必须截界：人格块后面紧跟 skills 段（评审 R3）。
+
+    事实：核心在 ``req.system_prompt += f"\\n# Persona Instructions\\n\\n{prompt}\\n"``
+    之后立刻 ``+= f"\\n{build_skills_prompt(skills)}\\n"``（``## Skills`` 开头）。
+    旧实现"取标记后的全部内容"会把技能清单当成人格正文。
+    """
+    system_prompt = (
+        "工具说明"
+        + agent_core.PERSONA_MARKER
+        + MARKER_CURRENT
+        + "\n\n## Skills\n\n### Available skills\n\n- **pdf**: 处理 PDF"
+    )
+    got = agent_core.extract_persona_text(system_prompt)
+    assert got == MARKER_CURRENT
+    assert "## Skills" not in got and "pdf" not in got
+
+
+def test_persona_hook_uses_persona_id_primary_path(monkeypatch):
+    """**主路径**：``req.conversation.persona_id`` + ``get_persona_v3_by_id``。
+
+    这条路径完全不看 ``system_prompt``，因此 skills 段 / 其它拼接都不影响它。
+    """
+
+    class _Mgr:
+        def __init__(self):
+            self.calls = []
+
+        def get_persona_v3_by_id(self, pid):
+            self.calls.append(pid)
+            return {"name": pid, "prompt": MARKER_CURRENT}
+
+    mgr = _Mgr()
+    plugin = _plugin(
+        {"agent": {"persona_mode": "current"}}, SimpleNamespace(persona_manager=mgr)
+    )
+    event = _Event()
+    req = SimpleNamespace(
+        system_prompt="x" + agent_core.PERSONA_MARKER + "别的人格\n\n## Skills\n\n- a",
+        conversation=SimpleNamespace(persona_id="pid-77"),
+    )
+    asyncio.run(plugin.inject_browser_instruction(event, req))
+    assert mgr.calls == ["pid-77"]
+    assert plugin._cached_persona(plugin._umo_of(event)) == MARKER_CURRENT, (
+        "必须用 persona_id 查到的正文，而不是 system_prompt 里那一段"
+    )
+
+
+def test_persona_hook_falls_back_to_text_when_id_missing():
+    """没有 persona_id / 管理器查不到 ⇒ 回落文本切分（并同样截界）。"""
+    plugin = _plugin({"agent": {"persona_mode": "current"}})
+    event = _Event()
+    req = SimpleNamespace(
+        system_prompt=(
+            agent_core.PERSONA_MARKER + MARKER_CURRENT + "\n\n## Skills\n\n- a"
+        ),
+        conversation=None,
+    )
+    asyncio.run(plugin.inject_browser_instruction(event, req))
+    assert plugin._cached_persona(plugin._umo_of(event)) == MARKER_CURRENT
+
+
 def test_extract_persona_text_handles_absent_marker():
     """没有标记 ⇒ 空串（调用方走次路径）；有标记 ⇒ 只取后半段并 strip。"""
     assert agent_core.extract_persona_text("") == ""
@@ -366,6 +428,39 @@ def test_extract_persona_text_handles_absent_marker():
         agent_core.extract_persona_text("sys" + agent_core.PERSONA_MARKER + "  人格  ")
         == "人格"
     )
+
+
+def test_terminate_stops_both_sync_tasks_and_clears_persona():
+    """``terminate()`` 收尾：两个 provider 同步任务都停、人格正文不留内存（R8）。"""
+    plugin = _plugin({"agent": {"persona_mode": "current"}})
+    plugin.sessions = None
+    plugin.browser = None
+    plugin._vision_cache = {}
+    plugin._local_page_locks = {}
+    # 这几个属性 initialize() 才会建；手工装配的实例显式补齐
+    plugin._vision_sync_task = None
+    plugin._cache_cleanup_task = None
+    plugin._search_service = None
+    plugin._background = main_module.BackgroundRegistry()
+
+    async def flow():
+        # 两个同步任务都起来（provider_manager 为空 ⇒ 它们会挂着轮询）
+        plugin._start_vision_provider_sync_task()
+        plugin._start_agent_provider_sync_task()
+        vision_task = plugin._vision_sync_task
+        agent_task = plugin._agent_sync_task
+        assert vision_task is not None and agent_task is not None
+        # 人格缓存里塞一条（模拟上一轮请求截留到的人格）
+        plugin._remember_persona(_Event().unified_msg_origin, agent_core.PERSONA_MARKER + MARKER_CURRENT, "pid")
+        assert plugin._cached_persona(_Event().unified_msg_origin)
+        await plugin.terminate()
+        await asyncio.sleep(0)  # 让 cancel 的收尾协程跑一格
+        return vision_task, agent_task
+
+    vision_task, agent_task = asyncio.run(flow())
+    assert vision_task.done(), "识图 provider 同步任务必须停下"
+    assert agent_task.done(), "内层 provider 同步任务也必须停下（R8 的缺口）"
+    assert plugin._persona_cache == {}, "人格正文不得留在内存里"
 
 
 def test_inner_output_contract_is_last_layer():

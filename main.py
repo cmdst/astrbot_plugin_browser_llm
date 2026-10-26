@@ -361,6 +361,18 @@ _CLICK_TEXT_CANDIDATE_MAX_LEN = 40
 #: 重新走 persona_manager 次路径 —— 人格可能在会话里被切换，缓存太久会用旧人格。
 _PERSONA_CACHE_TTL = 30 * 60
 
+#: 会被误读成"插件自己报的"三个前缀（v1.7.0 repair，评审 V4）。只用于
+#: **人读的终态消息**加一行消歧说明；模型侧的前缀语义由结构化 meta 决定。
+_TRUSTED_LOOKING_PREFIXES = ("【错误】", "【拒绝】", "【不可用】")
+
+#: 页面/内层模型原文以「像插件的错误前缀」开头时，给人加的一行消歧说明。
+_ECHO_NOTE = "（以下为内层模型或页面原文，不是插件判定的错误）"
+
+#: C 模式（唤醒轮）台账的行数上限（v1.7.0）：比面板的 ``agent.ledger_max_lines``
+#: 更紧，因为这一份要和结论挤在同一个返回体里（结论已经被
+#: ``tools.background_max_chars`` 截断，台账再占 24 行就把"结论"淹了）。
+_C_MODE_LEDGER_MAX_LINES = 12
+
 #: 影像原生失败且没有可用的 caption 兜底时的**明确**文案（逐字，规格 §2.3
 #: 第 3 行）：**不许**静默返回空串让内层模型瞎猜页面长什么样。
 _IMAGE_UNAVAILABLE_TEXT = (
@@ -1812,9 +1824,23 @@ class BrowserLLMPlugin(Star):
 
         async def _handler(event, **kwargs):
             self._refresh_config()
+            # timeout 必须先``pop`` 再合成：内层模型的 schema 里**有** ``timeout``
+            # 参数（见 ``_INNER_SEARCH_TOOL_SPEC``），若直接 ``**kwargs`` 透传又
+            # 同时显式传 ``timeout=``，Python 会抛
+            # ``TypeError: got multiple values for keyword argument 'timeout'``
+            # —— 模型一旦真的传了它，整个内层搜索就变成一条工具异常。
+            given = kwargs.pop("timeout", 0)
             budget = min(
                 float(self.search_total_timeout), float(self.agent_tool_timeout)
             )
+            try:
+                given_n = int(given or budget)
+            except (TypeError, ValueError):
+                given_n = int(budget)
+            # 合成**一次**：模型给的预算先夹进 [5,300]，再与插件预算取小；
+            # 结果再夹一次（``budget`` 可能比 5 还小，例如 agent_tool_timeout=3）。
+            given_n = int(_clamp(given_n, 5, 300))
+            budget = min(budget, given_n)
             raw = await self._run_browser_web_search(
                 event,
                 max_bytes=_INNER_SEARCH_MAX_BYTES,
@@ -1871,22 +1897,75 @@ class BrowserLLMPlugin(Star):
             # 非法/空显式值：回退全局 page_perception（再回退 text_image）。
             mode = (self.page_perception or "").strip().lower()
         perception_note = perception_map.get(mode, perception_map["text_image"])
-        return f"{_BROWSER_AGENT_INSTRUCTION}\n\n{perception_note}"
+        base = f"{_BROWSER_AGENT_INSTRUCTION}\n\n{perception_note}"
+        # v1.7.0 repair（评审 R9）：``browse_web_search`` 是**条件工具**（只有
+        # ``search.mode=internal`` 且池就绪时才在内层工具集里），因此它不在
+        # ``_BROWSER_AGENT_INSTRUCTION`` 的固定清单里，必须在这里按当前配置
+        # 动态补一行 —— 否则模型看得到工具却不知道它是什么（工具清单与指令
+        # 不一致是幻觉调用的来源）。
+        if self.search_mode == "internal" and self._search_pool_ready():
+            base = (
+                f"{base}\n\n"
+                "池搜索工具（本部署 search.mode=internal，已挂在本工具集里）：\n"
+                "- browse_web_search：用配置的搜索 API 池检索（返回结构化结果，"
+                "不打开页面）"
+            )
+        return base
 
     # ------------------------------------------------------------
     # 内层人格三档与分层提示词（v1.7.0，规格 §5）
     # ------------------------------------------------------------
 
+    def _persona_prompt_by_id(self, persona_id: str | None) -> str:
+        """按 persona_id 直接取人格正文（``current`` 档的**主路径**，v1.7.0 repair）。
+
+        为什么不再靠切 ``req.system_prompt``：核心在同一个人格块后面紧接着 append
+        skills 段（``astr_main_agent.py:629-642``），文本切分要么带上尾巴、要么
+        依赖"下一个标题行"这种脆弱约定。``persona_manager.get_persona_v3_by_id``
+        是**同步**的纯查表（``persona_mgr.py:73``），拿到 prompt 就是 prompt。
+
+        取不到（无管理器 / id 为空 / 表里没有）返回空串 ⇒ 调用方回落文本切分。
+        """
+        pid = str(persona_id or "").strip()
+        if not pid:
+            return ""
+        pm = getattr(self.context, "persona_manager", None)
+        getter = getattr(pm, "get_persona_v3_by_id", None)
+        if not callable(getter):
+            return ""
+        try:
+            persona = getter(pid)
+        except Exception as e:  # noqa: BLE001 — 查表失败只影响主路径
+            logger.debug(f"[{self.metadata_name}] get_persona_v3_by_id 失败: {e}")
+            return ""
+        prompt = ""
+        if isinstance(persona, dict):
+            prompt = str(persona.get("prompt") or "")
+        else:
+            prompt = str(getattr(persona, "prompt", "") or "")
+        return prompt.strip()
+
     def _remember_persona(
         self, umo: str, system_prompt: str | None, persona_id: str | None = None
     ) -> str:
-        """从 on_llm_request 的 system_prompt 里切出人格块并缓存（``current`` 主路径）。
+        """截留"本轮真实生效的人格"并缓存（``current`` 档的主/次路径合体）。
+
+        两条路径，**顺序不可换**：
+
+        1. **主路径**：``persona_id`` → ``persona_manager.get_persona_v3_by_id``
+           直接取 prompt（无文本切分、无尾巴）。``req.conversation.persona_id``
+           就是本轮真正生效的那条人格（核心按"会话 > agent_runner 默认"解析完
+           才写进 req）。
+        2. **次路径**：从 ``system_prompt`` 里切 ``# Persona Instructions`` 块，
+           并截界到下一个标题行之前（见 ``core.agent.extract_persona_text``）。
 
         只缓存文本：**不落日志、不写文件**（规格 §9.4 的禁止清单第一条）。
-        每 umo 一条、每次请求覆盖、TTL 30min（超时视为未命中 ⇒ 走次路径）。
-        返回切到的人格正文（没切到返回空串）。
+        每 umo 一条、每次请求覆盖、TTL 30min（超时视为未命中 ⇒ 走运行期次路径）。
+        返回拿到的人格正文（都没有返回空串）。
         """
-        text = agent_core.extract_persona_text(system_prompt)
+        text = self._persona_prompt_by_id(persona_id)
+        if not text:
+            text = agent_core.extract_persona_text(system_prompt)
         if not text or not umo:
             return text
         cache = self._persona_store()
@@ -2448,6 +2527,16 @@ class BrowserLLMPlugin(Star):
                 logger.debug(log_line)
         if decision.selection_log and decision.selection_log != decision.log_text:
             logger.info(f"[{self.metadata_name}] {decision.selection_log}")
+        if decision.ok and not decision.multimodal:
+            # v1.7.0 repair（评审 R6）：运营方必须能在日志里看到"谁在兜底识图"。
+            # 生产观测清单（verification/20261026-v170-repair-t10-report.md）里有
+            # 这条的 grep 口径。
+            caption_id = self._live_vision_provider_id()
+            logger.info(
+                f"[{self.metadata_name}] 内层模型非多模态，改用识图兜底 "
+                f"provider={caption_id or '（空=未配置，截图将不可用）'}"
+                f"（内层模型={decision.provider_id}）"
+            )
         return decision
 
     async def _resolve_vision_provider_id(
@@ -2552,6 +2641,9 @@ class BrowserLLMPlugin(Star):
         tag = f"[{self.metadata_name}]"
         self._stop_cache_cleanup_task()
         self._stop_vision_provider_sync_task()
+        # v1.7.0 repair（评审 R8）：内层模型下拉同步任务与识图那个是**两个**任务，
+        # 只停一个会在重载后留下一个最长跑 120s 的轮询协程。
+        self._stop_agent_provider_sync_task()
         # 后台任务（v1.5.0 路线 D）：先取消在跑任务并等一小段——否则浏览器关了
         # 它们才抛错，终态消息面对的是已销毁的浏览器/页面，重载还多一批悬挂协程。
         await self._cancel_background_tasks()
@@ -2570,6 +2662,9 @@ class BrowserLLMPlugin(Star):
             self._local_page_locks.clear()
             # 识图短时缓存清空（防插件重载/禁用后内存残留）。
             self._vision_cache.clear()
+            # 人格正文缓存清空（v1.7.0 repair，评审 R8）：人格是**运营方写的文本**，
+            # 与聊天正文同级的隐私内容，重载/禁用后不该留在内存里。
+            self._persona_store().clear()
             # 搜索服务缓存/冷却清空（密钥随服务实例一起释放）。
             if self._search_service is not None:
                 self._search_service.clear_cache()
@@ -2886,25 +2981,39 @@ class BrowserLLMPlugin(Star):
     ) -> str:
         """C 模式执行体：在核心的后台任务里跑真正的浏览，返回**给唤醒轮看的文本**。
 
-        三件事（顺序即正确性）：①``artifact_sink`` 截流媒体（机械保证不
-        ``event.send``）②整任务预算自截断 ③不可信前缀 + 截断正文 + 媒体块。
-        **没有任何**"已受理"文案：核心已经先回过提交回执了。
+        四件事（顺序即正确性）：①``artifact_sink`` 截流媒体（机械保证不
+        ``event.send``）②整任务预算自截断 ③不可信前缀 + 截断正文 ④**台账与媒体
+        块都在截断之后**拼接。**没有任何**"已受理"文案：核心已经先回过提交回执了。
 
         预算仍用 ``tools.background_timeout``（默认 240）：核心那层是 3600s
         硬编码，插件不自带预算就等于没有上限。超时不是异常抛出，而是一条
         ``【错误】`` 文本返回给唤醒轮（与失败同口径）。
+
+        **为什么台账必须在截断之后拼接**（与媒体块同位置同理由）：台账是"内层
+        模型到底动了哪些手"的唯一旁证，而它排在结论**后面**——一次 2000 字的
+        结论 + ``background_max_chars=1500`` 就足以把整块台账吃掉，于是"收尾
+        失真"这个缺陷在最需要它的生产配置下（``all × core`` + 800 字符）反而
+        看不见了。截断只作用于结论，台账按自己的行数上限单独渲染。
+
+        失败判定走 ``meta["plugin_failure"]``（**结构化**），不再嗅探文本前缀：
+        内层模型把页面正文（页面以【错误】开头）原样带回时，前缀嗅探会把一次
+        **成功**的浏览判成失败，还会让页面自己写"原因"。
         """
         umo = self._umo_of(event)
         budget = float(self.background_timeout)
         media: list[str] = []
+        meta: dict = {}
         try:
             with artifact_sink() as bucket:
                 try:
                     text = await asyncio.wait_for(
-                        self._browse_web_run(event, task_input, perception_mode),
+                        self._browse_web_run(
+                            event, task_input, perception_mode, meta=meta
+                        ),
                         timeout=budget,
                     )
                 except asyncio.TimeoutError:
+                    meta["plugin_failure"] = True
                     text = (
                         f"【错误】浏览超过 {budget:.0f} 秒整任务预算被中断"
                         f"（C 模式；{_BROWSE_WEB_TOOL_NAME} 没有中断前的部分结果）。"
@@ -2912,20 +3021,33 @@ class BrowserLLMPlugin(Star):
                 media = [str(p) for p in bucket]
         except Exception as exc:  # noqa: BLE001 — 后台任务不能把异常抛给核心
             logger.warning(f"[{self.metadata_name}] browse_web（C 模式）执行异常: {exc}")
+            meta["plugin_failure"] = True
             text = f"【错误】浏览器子代理执行失败：{exc}"
         published = [self._publish_c_media(umo, p) for p in media if os.path.isfile(p)]
         paths = [dst for dst, _ok in published]
         unpublished = any(not ok for _dst, ok in published)
         body = truncate_result(str(text or ""), int(self.background_max_chars))[0]
-        ok_text = not body.startswith(("【错误】", "【拒绝】"))
+        ok_text = not bool(meta.get("plugin_failure"))
         parts: list[str] = []
         if ok_text:
-            # 前缀只给"可信性未知的正文"；错误/拒绝是我们自己的可信文本，且
-            # 唤醒轮要靠【错误】/【拒绝】前缀分流。
-            parts.append(C_UNTRUSTED_PREFIX)
+            # 前缀只给"可信性未知的正文"；插件自述的失败是我们自己的可信文本，
+            # 且唤醒轮要靠【错误】/【拒绝】前缀分流。幂等：结论若已带前缀（源侧
+            # 加过）就不再加第二遍。
+            prefixed = agent_core.with_untrusted_prefix(body)
+            if prefixed != body:
+                parts.append(C_UNTRUSTED_PREFIX)
+                body = prefixed[len(C_UNTRUSTED_PREFIX) :].lstrip("\n")
         parts.append(body)
+        if ok_text:
+            ledger_block = agent_core.render_ledger(
+                meta.get("ledger"), min(int(self.agent_ledger_max_lines), _C_MODE_LEDGER_MAX_LINES)
+            )
+            if ledger_block:
+                # 台账在**截断之后**拼接（理由见 docstring）：它有独立行数上限，
+                # 不受 ``background_max_chars`` 裁切。
+                parts.append(ledger_block)
         if paths and ok_text:
-            # 媒体只附成功态（与 v1.5.0 同口径）；媒体块在**截断之后**拼接，
+            # 媒体只附成功态（与 v1.5.0 同口径）；媒体块同样在截断之后拼接，
             # 否则绝对路径会被砍断（"媒体只给路径"方案的致命细节）。
             parts.append(render_c_media_block(paths, unpublished=unpublished))
         return "\n".join(parts)
@@ -3110,8 +3232,23 @@ class BrowserLLMPlugin(Star):
         - 无法解析 / 缺 ``status`` → 失败，原因「返回体无法解析」；
         - 其它未知 status（含 ``disabled``）→ 失败（绝不把未知态算成成功）。
         """
+        body = str(raw or "")
+        if body.startswith(C_UNTRUSTED_PREFIX):
+            # v1.7.0 repair（评审 V4）：带「不可信外部内容」前缀 ⇔ 这段正文来自
+            # **内层模型/页面**（源侧是结构化加的，页面伪造不出来）。因此：
+            # ① 判定成功态，**不许**因为页面正文以【错误】开头就把一次成功浏览
+            #    显示成「【后台任务失败】」并附上页面自己写的原因；
+            # ② 前缀是给模型看的，人读的终态消息里去掉（规格 §1.2.3：plugin
+            #    引擎的后台终态消息不加前缀）；
+            # ③ 去掉前缀后若正文本身以【错误】/【拒绝】/【不可用】开头，加一行
+            #    说明把它钉成"原文"，否则人读起来仍像插件在报错（旧 test_t4 的
+            #    关切仍然成立，只是判定依据从"文本前缀"换成了"结构化来源"）。
+            stripped = body[len(C_UNTRUSTED_PREFIX) :].lstrip("\n")
+            if stripped.startswith(_TRUSTED_LOOKING_PREFIXES):
+                stripped = f"{_ECHO_NOTE}\n{stripped}"
+            return STATUS_OK, stripped, ""
         if tool_name != _SEARCH_TOOL_NAME:
-            return None, str(raw or ""), ""
+            return None, body, ""
         payload = self._parse_search_payload(raw)
         if payload is None:
             return STATUS_FAILED, "", "返回体无法解析"
@@ -3354,12 +3491,14 @@ class BrowserLLMPlugin(Star):
             # 顺带同步识图 provider 下拉（面板每次请求实时读取内存 schema，
             # 此入口被主 LLM 高频调用，可保持面板选项跟随运行时 provider 变化）。
             self._sync_vision_provider_options()
-            # 搜索双模式收敛（v1.7.0）：search.mode / 池可用性变了就重建内层
-            # 工具集并重新对齐外层可见性（幂等；签名不变时是两次 dict 比较）。
-            await self._sync_search_mode()
             allowed, deny_reason = self._is_session_allowed(event)
             if not allowed:
                 return f"【拒绝】{deny_reason}"
+            # 搜索双模式收敛（v1.7.0 repair，评审 R4）：search.mode / 池可用性变了
+            # 就重建内层工具集并重新对齐外层可见性（幂等；签名不变时是两次 dict
+            # 比较）。**放在会话鉴权之后**：对齐会写全局持久化名单
+            # （``inactivated_llm_tools``），不该让一次被拒绝的调用产生 DB 写。
+            await self._sync_search_mode()
             # 感知模式精细化（v1.3.0）：解析 input 前缀（显式参数）并按下述
             # 优先级取本次模式：显式参数 > perception_rules 会话规则命中 >
             # 全局 page_perception；按本次模式动态构造子代理指令，不依赖
@@ -3401,11 +3540,21 @@ class BrowserLLMPlugin(Star):
                     task_text=task_input,
                 )
             # 前台路径（唯一给主 LLM 直接返回的地方）：结论 + 台账要套上
-            # 「不可信外部内容」前缀（规格 §1.2.3）。错误/拒绝是我们自己的
-            # 可信文本，_with_untrusted_prefix 自动跳过。
-            return self._with_untrusted_prefix(
-                await self._browse_web_run(event, task_input, perception_mode)
+            # 「不可信外部内容」前缀（规格 §1.2.3）。前缀由执行体在**源侧**加
+            # （见 ``_browse_web_run`` 的 ``meta`` 契约）：这样"这是模型说的话"
+            # 是结构化事实，不必靠嗅探文本前缀 —— 页面回声以【错误】开头时也
+            # 不会被误判成插件自己的失败（评审 R6/V4）。这里的 wrap 是幂等的。
+            meta: dict = {}
+            body = await self._browse_web_run(
+                event, task_input, perception_mode, meta=meta
             )
+            ledger_block = agent_core.render_ledger(
+                meta.get("ledger"), int(self.agent_ledger_max_lines)
+            )
+            parts = [body]
+            if ledger_block:
+                parts.append(ledger_block)
+            return "\n\n".join(part for part in parts if part)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{self.metadata_name}] browse_web 执行异常: {e}")
             return f"【错误】浏览器子代理执行失败：{e}"
@@ -3420,12 +3569,23 @@ class BrowserLLMPlugin(Star):
         event: AstrMessageEvent,
         task_input: str,
         perception_mode: str,
+        meta: dict | None = None,
     ) -> str:
         """browse_web 的执行体（provider 解析 + 内层代理 + 台账）；前台与后台共用。
 
-        返回体**不带**「不可信外部内容」前缀：前缀的加点是"消费者是模型"的
-        那两处（前台入口 ``browse_web`` 与 C 模式 ``_run_c_background_body``）——
-        见规格 §1.2.3。plugin 引擎的后台终态消息消费者是**人**，不加前缀。
+        ``meta`` 是**结构化回传通道**（v1.7.0 repair）：调用方传一个 dict，执行体
+        填两项事实，避免"靠文本前缀猜语义"：
+
+        - ``meta["plugin_failure"]``：本次失败是**插件自己**判定的（超时 / 内层
+          异常 / provider 不可用），还是模型的结论。页面正文以【错误】开头时
+          文本前缀嗅探会把一次成功判成失败，还会让页面自己写"原因"。
+        - ``meta["ledger"]``：本次的 ``Ledger`` 对象（调用方按自己的行数上限
+          渲染，并在**截断之后**拼接 —— C 模式的台账就是这么保住的）。
+          ``meta is None`` 时本方法自己把台账拼进返回体（直接调用者的旧行为）。
+
+        前缀：模型结论在**源侧**就带「不可信外部内容」（``with_untrusted_prefix``
+        幂等，调用方再 wrap 一次不会翻倍）；插件自述失败**不带**前缀。这样
+        ``startswith("【错误】")`` 在下游只剩"插件自己说的"这一种含义。
 
         为什么 provider 解析放在这里（而不是入口）：后台模式下拿不到模型应
         表现为一条**异步失败终态消息**，而不是「被告知不可用却什么都没发生」。
@@ -3439,8 +3599,9 @@ class BrowserLLMPlugin(Star):
            ``agent.task_timeout`` 到点就取消，取消后只拼字符串、不再 await
            任何可能阻塞的东西（规格 §8.4 的"不悬挂"硬要求）；
         3. 超时/异常都归成 ``【错误】`` 文本（``TargetClosedError`` 这类取消
-           传播出来的异常必须被吞在这里，不许冒泡给主 LLM）；
-        4. 台账由插件按**实际工具调用**生成，追加在结论之后 —— 模型改不了它。
+           传播出来的异常必须被吞在这里，不许冒泡给主 LLM），并置
+           ``meta["plugin_failure"] = True``；
+        4. 台账由插件按**实际工具调用**生成 —— 模型改不了它。
         """
         umo = self._umo_of(event)
         # 并发观测（规格 §8.5）：同会话前台并发**只告警不拦截**（前台入口持锁
@@ -3479,6 +3640,7 @@ class BrowserLLMPlugin(Star):
                 char_budget=int(self.agent_max_steps) * int(self.agent_result_max_chars),
                 redact=_redact_url,
             )
+            plugin_failure = False
             with agent_core.run_scope(run) as scoped:
                 try:
                     resp = await asyncio.wait_for(
@@ -3496,6 +3658,7 @@ class BrowserLLMPlugin(Star):
                     text = getattr(resp, "completion_text", "") or ""
                     text = text or "（浏览器子代理未返回内容）"
                 except asyncio.TimeoutError:
+                    plugin_failure = True
                     text = (
                         f"【错误】浏览任务超过 {budget:.0f} 秒硬上限被中止"
                         f"（已完成 {scoped.ledger.steps} 步，见台账）"
@@ -3504,21 +3667,31 @@ class BrowserLLMPlugin(Star):
                     logger.warning(
                         f"[{self.metadata_name}] browse_web 内层执行异常: {e}"
                     )
+                    plugin_failure = True
                     text = f"【错误】浏览器子代理执行失败：{e}（已中止）"
                 logger.debug(
                     f"[{self.metadata_name}] 台账 steps={scoped.ledger.steps} "
                     f"provider={scoped.provider_id!r}"
                 )
-                ledger_block = agent_core.render_ledger(
-                    scoped.ledger, int(self.agent_ledger_max_lines)
-                )
                 images = scoped.ledger.images
+                ledger_obj = scoped.ledger
+            if meta is not None:
+                meta["plugin_failure"] = plugin_failure
+                meta["ledger"] = ledger_obj
             parts: list[str] = []
-            if decision.notice and not text.startswith(("【错误】", "【拒绝】")):
+            if not plugin_failure:
+                # 源侧加前缀（幂等）：下游不必再猜"这句话是谁说的"。
+                text = agent_core.with_untrusted_prefix(text)
+            if decision.notice and not plugin_failure:
                 parts.append(decision.notice)
             parts.append(text)
-            if ledger_block:
-                parts.append(ledger_block)
+            if meta is None:
+                # 直接调用者（含 plugin 引擎后台 runner）：照旧自带台账。
+                ledger_block = agent_core.render_ledger(
+                    ledger_obj, int(self.agent_ledger_max_lines)
+                )
+                if ledger_block:
+                    parts.append(ledger_block)
             logger.debug(
                 f"[{self.metadata_name}] browse_web tool_loop_agent 返回，"
                 f"len={len(text)} images={images}"
@@ -3583,6 +3756,10 @@ class BrowserLLMPlugin(Star):
             allowed, deny_reason = self._is_session_allowed(event)
             if not allowed:
                 return f"【拒绝】{deny_reason}"
+            # 搜索双模式收敛（v1.7.0 repair，评审 R4）：本工具也是外层入口，
+            # 从它进来的调用同样要能把 search.mode 的切换落到实处。鉴权之后才做
+            # （理由同 browse_web：对齐会写全局持久化名单）。
+            await self._sync_search_mode()
 
             # 0. 感知模式解析（v1.3.0 补强）：显式 perception 参数 > 全局
             # page_perception；非法显式值记录警告并回落全局。子代理无独立
@@ -5553,24 +5730,43 @@ class BrowserLLMPlugin(Star):
                 lines = [
                     f"URL: {info['url']}",
                     f"可交互元素共 {len(items)} 个"
-                    f"（#{'-'.join(str(i) for i in (1, len(items)))}；"
+                    f"（#{'-'.join(str(i) for i in (0, max(0, len(items) - 1)))}；"
                     "selector 可直接用于 browse_click_selector）：",
                     "#n | role | name | type | checked | disabled | selector | cx,cy",
                 ]
-                for idx, item in enumerate(items, start=1):
+                # v1.7.0 repair（评审 R5）：``#n`` **就是** browse_click_selector 的
+                # ``index``（0 起算）。此前这里从 1 数、而 index 从 0 起 —— 模型看到
+                # "#3" 会传 index=3，实际点到第 4 个（同页三个原语 click_link /
+                # click_coords / checkbox 都是 0 起，只有这里不一致）。
+                shown = 0
+                dropped = 0
+                for idx, item in enumerate(items, start=0):
+                    name = str(item.get("name") or "")
+                    # v1.7.0 repair（评审 V3）：本出口也过禁词，但**逐行丢弃**而不是
+                    # 整段拒绝 —— 页面上一个违禁词不该让整个元素清单消失（那等于
+                    # 削掉内层能力）。与 ``_filter_banned_results`` 同口径。
+                    if name and self._check_banned(name):
+                        dropped += 1
+                        continue
+                    shown += 1
                     state = item.get("state") or "-"
                     disabled = "是" if item.get("disabled") else "否"
                     visible = "" if item.get("visible", True) else "（不可见）"
                     lines.append(
                         f"{idx} | {item.get('role') or '-'} | "
-                        f"{item.get('name') or '-'}{visible} | "
+                        f"{name or '-'}{visible} | "
                         f"{item.get('type') or '-'} | {state} | {disabled} | "
                         f"{item.get('selector')} | {item.get('x')},{item.get('y')}"
                     )
+                if dropped:
+                    lines.append(
+                        f"（另有 {dropped} 个元素的文本命中禁词，已按 security.banned_words 略去）"
+                    )
                 lines.append(
                     "点击请用 browse_click_selector(selector=…, index=…)："
-                    "selector 内的 nth-of-type 与 index 都从 0 开始的序号语义不同，"
-                    "同一 selector 多匹配时用 index 选第几个。"
+                    "上面的 #n **就是** index（都从 0 起算），可直接照抄；"
+                    "selector 里的 nth-of-type 则从 1 开始 —— 两者是不同维度，"
+                    "同一 selector 多匹配时才需要改用 index 选第几个。"
                 )
                 return "\n".join(lines)
         except Exception as e:  # noqa: BLE001
@@ -5906,8 +6102,11 @@ class BrowserLLMPlugin(Star):
         for k in doomed:
             del cache[k]
         if doomed:
+            # v1.7.0 repair（评审 R7）：URL 的 query 里可能有 token/签名，日志只留
+            # 参数名（_redact_url 把值打成 ***）。
             logger.debug(
-                f"[{METADATA_NAME}] 交互后失效识图缓存 {len(doomed)} 条: {page_url}"
+                f"[{METADATA_NAME}] 交互后失效识图缓存 {len(doomed)} 条: "
+                f"{_redact_url(str(page_url or ''))}"
             )
         return len(doomed)
 
@@ -5966,7 +6165,21 @@ class BrowserLLMPlugin(Star):
         # 先解析 provider 与提示词：两者都进缓存键（改配置 ⇒ 旧描述不命中）。
         provider_id = await self._resolve_vision_provider_id(event)
         if not provider_id:
+            # v1.7.0 repair（评审 R6）：内层模型非多模态、又没配兜底 ⇒ 这条
+            # 截图必然变成【不可用】，日志要说清"兜底 provider 是空的"。
+            run = agent_core.current_run()
+            if run is not None and not run.native_image:
+                logger.info(
+                    f"[{self.metadata_name}] 内层模型非多模态，改用识图兜底 "
+                    "provider=（空=未配置，截图将不可用）"
+                )
             return ""
+        run_now = agent_core.current_run()
+        if run_now is not None and not run_now.native_image:
+            logger.info(
+                f"[{self.metadata_name}] 内层模型非多模态，改用识图兜底 "
+                f"provider={provider_id}（caption 路径）"
+            )
         # 识图提示词：优先用用户配置的 vision_prompt（实时读取），空则回退
         # 默认提示词。
         prompt = self._live_vision_prompt() or _DEFAULT_VISION_PROMPT
@@ -5992,7 +6205,7 @@ class BrowserLLMPlugin(Star):
                 if time.time() - ts <= ttl:
                     logger.debug(
                         f"[{self.metadata_name}] 识图缓存命中（TTL={ttl}s，"
-                        f"kind={kind}）: {page_url}"
+                        f"kind={kind}）: {_redact_url(str(page_url or ''))}"
                     )
                     return f"[缓存] {cached_text}"
                 del self._vision_cache[cache_key]
@@ -6453,9 +6666,14 @@ class BrowserLLMPlugin(Star):
         # 后台模式热更新（v1.5.0）：入口第一行刷新配置，Dashboard 把
         # background_mode 改回 off 时下一次调用即生效（F1）。
         self._refresh_config()
-        # 双模式收敛（v1.7.0）：配置里刚切成 internal 时，本入口可能还会被
-        # 调用一次（核心在模型请求装配期缓存了工具集），这里显式拒绝并指向
-        # browse_web —— 不给"同名两份并存"留任何缝隙。
+        # 双模式收敛（v1.7.0 repair，评审 R4）：本工具也是外层入口。鉴权先做
+        # （对齐会写全局持久化名单，未授权调用不该产生 DB 写），再做收敛。
+        allowed, _deny_reason = self._is_session_allowed(event)
+        if allowed:
+            await self._sync_search_mode()
+        # 配置里刚切成 internal 时，本入口可能还会被调用一次（核心在模型请求
+        # 装配期缓存了工具集），这里显式拒绝并指向 browse_web —— 不给"同名
+        # 两份并存"留任何缝隙。
         if self.search_mode == "internal":
             return self._search_payload(
                 status="disabled",

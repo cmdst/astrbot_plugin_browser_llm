@@ -254,13 +254,40 @@ INTERACTIVE_ROW = {
 
 
 def test_get_interactive_lists_eight_columns():
+    """8 列 + ``#n`` **从 0 起算**（= ``browse_click_selector(index=…)`` 的基数）。
+
+    v1.7.0 repair（评审 R5）：此前 ``#n`` 从 1 数而 index 从 0 起 —— 模型看到
+    ``#3`` 传 ``index=3`` 就会点到第 4 个（同页 click_link / click_coords /
+    checkbox 都是 0 起，只有这里不一致）。
+    """
     page = _Page(interactives=[INTERACTIVE_ROW])
     plugin = _plugin(page)
     out = _run(plugin.browse_get_interactive(_Event(), 40, ""))
     header = "#n | role | name | type | checked | disabled | selector | cx,cy"
     assert header in out
-    assert "1 | radio | 非常同意 | radio | false | 否 | #agree | 120,240" in out
+    assert "0 | radio | 非常同意 | radio | false | 否 | #agree | 120,240" in out
     assert "browse_click_selector" in out, "要告诉模型 selector 怎么用"
+    assert "#n **就是** index" in out, "文案必须说明 #n 与 index 同基数"
+
+
+def test_get_interactive_number_column_matches_click_index():
+    """基数关系：第 k 行（0 起）的 ``#k`` 与 ``browse_click_selector(index=k)`` 同指。
+
+    用两行元素真跑一遍：``#1`` 那行的 selector 交给 ``click_selector(index=1)``，
+    断言点中的正是第二个元素（而不是第一个/第三个）。
+    """
+    rows = [
+        dict(INTERACTIVE_ROW, name="甲", selector="#a", x=10, y=10),
+        dict(INTERACTIVE_ROW, name="乙", selector="#b", x=20, y=20),
+    ]
+    page = _Page(interactives=rows)
+    plugin = _plugin(page)
+    out = _run(plugin.browse_get_interactive(_Event(), 40, ""))
+    assert "1 | radio | 乙 |" in out, out
+    elements = [_Element(attrs={"aria-pressed": "false"}) for _ in range(2)]
+    page.buttons["#b"] = elements
+    _run(plugin.browse_click_selector(_Event(), "#b", index=1))
+    assert elements[1].clicks == 1 and elements[0].clicks == 0
 
 
 def test_get_interactive_passes_limits_and_role_filter():
@@ -558,6 +585,40 @@ def test_instruction_lists_every_inner_tool():
         assert spec["name"] in _BROWSER_AGENT_INSTRUCTION, (
             f"内层指令缺 {spec['name']}（模型不知道它存在）"
         )
+
+
+def test_instruction_covers_conditional_inner_tools():
+    """v1.7.0 repair（评审 R9）：**当前 toolset** 的每个名字都要在指令里。
+
+    条件工具（``browse_web_search``）不在固定常量里，必须在
+    ``_build_subagent_instruction`` 里按配置动态补 —— 否则模型看得到工具却
+    不知道它是什么，是幻觉调用的来源。
+    """
+    plugin = _plugin(_Page())
+    # external 档：没有条件工具，指令里也不该出现（不诱导幻觉）
+    plugin.search_mode = "external"
+    plugin._rebuild_browser_toolset()
+    names = {t.name for t in plugin._browser_tools}
+    text = plugin._build_subagent_instruction("text")
+    assert names == {spec["name"] for spec in _BROWSER_TOOLS}
+    assert "browse_web_search" not in text
+    for name in names:
+        assert name in text, f"指令缺 {name}"
+
+    # internal 档 + 池就绪：条件工具进 toolset，也必须进指令
+    plugin.config["search"] = {
+        "mode": "internal",
+        "enabled": True,
+        "providers": [{"__template_key": "brave", "api_key": "sk-test"}],
+    }
+    plugin._refresh_config()
+    plugin._rebuild_browser_toolset()
+    names = {t.name for t in plugin._browser_tools}
+    text = plugin._build_subagent_instruction("text")
+    assert "browse_web_search" in names
+    assert "browse_web_search：用配置的搜索 API 池检索" in text
+    for name in names:
+        assert name in text, f"指令缺 {name}（条件工具也要覆盖）"
 
 
 def test_instruction_teaches_enumeration_first():

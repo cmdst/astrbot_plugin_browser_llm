@@ -162,6 +162,43 @@ def test_cache_hit_logs_debug(tmp_path, monkeypatch):
     assert any("缓存命中" in d for d in debugs), "应有缓存命中日志标注"
 
 
+def test_cache_hit_log_has_no_query_string(tmp_path, monkeypatch):
+    """命中日志里的 URL **不含 query 值**（v1.7.0 repair，评审 R7）。
+
+    旧实现直接打 ``page_url``：URL 常带 ``?token=…``/签名，日志因此成了凭据
+    泄漏面。现在两处（命中 + 交互后失效）都过 ``_redact_url``（值打码、保留
+    参数名，便于排障）。
+    """
+    plugin = _make_plugin(ttl=60)
+    event = _Event()
+    url = "https://example.com/page?token=SECRET123&sig=abc#frag"
+    img = _png(tmp_path, "a.png", b"A")
+    debugs = _capture_logger(monkeypatch, "debug")
+    _run(plugin._describe_screenshot(img, event, page_url=url))
+    _run(plugin._describe_screenshot(img, event, page_url=url))
+    hit_lines = [d for d in debugs if "缓存命中" in d]
+    assert hit_lines, "应有缓存命中日志（否则本断言无意义）"
+    joined = "\n".join(hit_lines)
+    assert "SECRET123" not in joined, "query 值不得进日志"
+    assert "sig=abc" not in joined
+    assert "?token=***" in joined, "参数名保留（便于定位是哪个页面）"
+
+
+def test_invalidate_log_has_no_query_string(tmp_path, monkeypatch):
+    """交互后失效日志同样脱敏（第二处，评审 R7 要求两处都改）。"""
+    plugin = _make_plugin(ttl=60)
+    event = _Event()
+    url = "https://example.com/page?token=SECRET123"
+    img = _png(tmp_path, "a.png", b"A")
+    _run(plugin._describe_screenshot(img, event, page_url=url))
+    debugs = _capture_logger(monkeypatch, "debug")
+    removed = plugin._vision_cache_invalidate(event, url)
+    assert removed == 1
+    joined = "\n".join(debugs)
+    assert "SECRET123" not in joined
+    assert "?token=***" in joined
+
+
 def test_cache_miss_when_picture_changes(tmp_path):
     """**事故核心**：同 URL 不同画面不得互相命中（v1.3.0 会命中旧描述）。"""
     plugin = _make_plugin(ttl=60)
