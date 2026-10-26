@@ -55,8 +55,10 @@ python tools/migrate_config_v6.py --verify --baseline
 - 迁移器**五模式**：`--dry-run` / `--apply` / `--verify` / `--restore-from`（逐字节回滚）/ `--strip-v6`。
 - **必须配置先动、代码后换，且配置与代码成对回滚**：v6 schema 会把 schema 之外的键判为 stale 从配置里**删掉**
   （`search.providers` 的 `api_key` 一旦被删就是**永久丢失**，不可恢复）。只回滚其一会静默丢设置。
-- 历史迁移链（v3 → v4 → v5）的脚本与用例按 spec 判定**退役**：本版只保留 v6 单跳（v3/v4/v5 形态都能被
-  `migrate_config_v6.py` 直接读入并迁到 v6，无需链式中转）。
+- 历史迁移链（v3 → v4 → v5）的脚本与用例**退役**：规格勘误 **E1**（`spec/20261027-v175-arch-spec-errata-r2.md`）
+  把 §1.3/§11.2 改为「v6 单跳」—— `migrate_config_v6.py` 对 v3 扁平 25 键 / v4 45 键 / v5 54 键三种形态
+  都直接得到 `keys=58 groups=7 new=15 unknown=0`（实测），链式中转不再必要，且三个旧脚本按旧 `KEY_MAP`
+  输出会把 v5 目标写成 v6 形状（半坏）。
 
 ### 修复（ops 报错合集 D1–D9）
 
@@ -67,6 +69,50 @@ python tools/migrate_config_v6.py --verify --baseline
 - **D4/D5/D6**：候选清单/勾选态三路读回（`aria-checked` → 原生 `checked` → `data-state`）/ 输入走
   `fill` 或 `Input.insertText`（不再 `page.type`）。
 - **D9**：取消路径不吞 `CancelledError`、不 await；关页时同时摘感知层 CDP 会话与执行层缓存。
+
+### 测试网：1128 → 770 的逐主题去向（R8）
+
+删除过时用例本身合理，但净 −421 条里有三处**非过时**缺口，处置如下（规格勘误 E7）：
+
+| 去向 | 约计 | 内容 |
+| --- | --- | --- |
+| 删除的 v1.3–v1.7.0 用例 | −421 | 主体是被删 API：caption 链 / core 引擎 / `search.mode` / 26 个旧原语 / v5 计数 / 历史迁移器 |
+| **本轮补回** | **+58** | `test_v175_local_page.py` 16（路径穿越/软链/扩展名/黑名单，R6）、`test_v175_agent.py` 22（8 格决策/人格三档/六段/台账/归类/抽图/作用域，R7）、`test_v175_repair_r1.py` 20（R1–R4/R9/R13/R17/R20–R22 的调用级回归） |
+
+现行门禁 **770 passed / 0 failed**、ruff clean。三个"覆盖缺口"的结论：
+R6/R7 **已补回**（不是接受缺口）；文档⇄代码由 `tests/test_v175_docs_vs_code.py`（10 条）承接。
+规格 §12.3 的「≥1128」据此作废（勘误 E7 改为「≥760 且 0 failed + 四个守卫模块全绿」）。
+
+### 返工收口（round 2，t9 评审 24 条）
+
+- **R1**（blocker）`browse_search` 读从未定义的 `self.agent_tool_timeout` ⇒ 改用
+  `min(search.total_timeout_s, resources.total_budget_s)`，并补**调用级**用例。
+- **R2**（blocker）`perception.screenshot_to_chat` 语义反向（默认发群、开了静默）⇒
+  改为 `if bool(self.screenshot_to_chat)` 才发群，`sent_to_user` 同步为真值，补两条用例并
+  修正把 bug 钉成"正确"的守卫断言。
+- **R3**（high）`browse_local_page` 的后台去重键不含 path ⇒ 带上
+  `target|full_page|wait_ms|perception`；补「同会话两个不同文件都必须 accepted」用例。
+- **R4**（high）5 个"读了没人用"的叶全部接线：`actions.repeat_guard`（`RepeatGuard(threshold=…)`）、
+  `tools.deliver_once`（投递闸）、`tools.isolate_context`（是否按任务换页）、
+  `tools.narrow_tools`（构造断言 + 运行期过滤 + WARN）、`perception.rules`（命中第一条 → 截图策略）。
+  另加守卫：`effect=热` 的开关型叶必须在非测试代码里"读值并影响控制流"。
+- **R9** 候选表去掉 `box=`（像素坐标不进模型可见观测块，`to_payload()` 保留）。
+- **R10** 失败行渲染 `elapsed=<n>ms attempt=<k>`（勘误 E5）。
+- **R11** 后台终态渲染步数与台账（`render_terminal_text(steps=, ledger=)`），`_browse_web_run`
+  超时写 `progress["steps"]/["partial"]`（勘误 E8）。
+- **R12** 幂等 `--apply` 不再生成备份；`--baseline` 自动挑选跳过 v6 形态备份；`--baseline` 指向
+  v6 配置时 `rc=2` + 明确报错（3 条新用例）。
+- **R13/R17** 外层搜索工具 description 重写（不再讲 `search.mode`/`browse_web_search`）；
+  模型可见串与 `core/agent.py` 文案里的已删工具名全部改掉，并加 docs-gate。
+- **R15/R16** `SessionManager(default_url=…)` 形参与属性删除（勘误 E3）；
+  步数护栏按 `clamp(64,512,total×2)` 派生（勘误 E2）。
+- **R20** 任务状态淘汰改"只淘汰空闲（`deadline==0`）"。
+- **R21** 同 UMO 只允许一个 `browse_web`（前台 + 后台）做成**真闸**，不再只 WARN。
+- **R22** 内层超时在后台抛出去，由 watchdog 映射成 `STATUS_TIMEOUT`（不再记成"完成"）。
+- **R23** CDP 会话统一由 `a11y.CdpSessionPool` 持有（executor 的模块级 `id(page)` 缓存退出运行期）。
+- **R5/R6/R7/R8/R14/R19/R24** 文档与规格侧已按条处置：README 补全 v1.7.5 正文并把旧内容整体
+  移入「历史版本」章节 + docs-gate；R6/R7 用例补回；R14/R16/R19/R24 进规格勘误
+  `spec/20261027-v175-arch-spec-errata-r2.md`（E1–E8）。
 
 ### 群聊缺陷（U1–U4）
 

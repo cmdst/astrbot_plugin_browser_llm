@@ -39,6 +39,57 @@ python tools/migrate_config_v6.py --strip-v6       # 只删 v6 新叶（成对�
 `api_key` 一旦被删就是**永久丢失（不可恢复）**。只回滚其一（只回代码或只回配置）会静默丢设置，因此
 **配置与代码必须成对回滚**。
 
+## 🧭 v1.7.5 现行能力（权威；下面「历史版本」里的旧描述一律以此节为准）
+
+### 工具面：外层 3 个 + 内层 5 个
+
+| 层 | 工具 | 作用 | 返回 |
+| --- | --- | --- | --- |
+| 外层 | `browse_web` | 把整件事委托给内层子代理（唯一委派入口） | 不可信前缀 + 结论 + `【执行台账】` |
+| 外层 | `browse_local_page` | **直调**：渲染本地 HTML 并给结构视图（不进子代理） | 结构视图 + 正文摘要 +（可选）截图 |
+| 外层 | `browser_web_search` | 插件自有搜索 API 池（不启浏览器） | 结构化 JSON；后台模式回「【已受理】」 |
+| 内层 | `browse_observe` | 取 A11y 结构视图（`compact`/`full`/`text`） | `【观测 #n】…` 节点表 |
+| 内层 | `browse_act` | **一个**结构化动作（16 种） | `【执行】…` + `【验证】…` |
+| 内层 | `browse_screenshot` | Set-of-Mark 截图兜底（无文本元素专用） | 图 + mark 表 |
+| 内层 | `browse_media` | 从页面嗅探图片/视频并下载 | 媒体清单（前台直发/后台进附件） |
+| 内层 | `browse_search` | 内层检索（池搜索，不启浏览器） | 结构化 JSON 摘要 |
+
+16 个动作：`navigate` / `click` / `type` / `press` / `scroll` / `hover` / `select` /
+`check` / `uncheck` / `wait_for` / `read` / `links` / `screenshot` / `media` /
+`tab` / `back`。模型每步只输出**一个**动作对象，例：
+`{"action":"click","target":{"role":"button","name":"提交"}}`。
+
+### 配置结构 v6：7 组 / 配置叶 58 条（JSON 叶子键 60 个）
+
+| 组 | 叶数 | 键名（不含组前缀） |
+| --- | --- | --- |
+| `resources` | 13 | `engine`、`headless`、`viewport`、`proxy`、`max_tabs`、`idle_timeout_s`、`cache_days`、`max_text_chars`、`max_links`、`max_parallel`、`total_budget_s`、`goto_timeout_s`、`action_timeout_s` |
+| `perception` | 6 | `a11y_max_nodes`、`a11y_max_name_chars`、`screenshot_fallback`、`som_max_marks`、`screenshot_to_chat`、`rules` |
+| `model` | 7 | `provider_id`、`persona_mode`、`persona_prompt`、`image_max_side`、`image_quality`、`result_max_chars`、`ledger_max_lines` |
+| `actions` | 4 | `trusted_events`、`verify`、`max_retries`、`repeat_guard` |
+| `search` | 17 | `enabled`、`engine`、`providers`、`proxy`、`max_parallel`、`max_results`、`max_rounds`、`provider_timeout_s`、`total_timeout_s`、`cooldown_s`、`cache_ttl_s`、`fetch_pages`、`fetch_top_n`、`fetch_timeout_s`、`fetch_max_chars`、`region`、`safesearch` |
+| `security` | 5 | `banned_words`、`enable_banned_filter`、`block_internal_ip`、`session_whitelist`、`session_blacklist` |
+| `tools` | 6 | `background_mode`、`background_max_chars`、`deliver_once`、`dedupe_window_s`、`isolate_context`、`narrow_tools` |
+
+`resources.viewport` 是唯一的复合叶（1 条 ↔ 3 个 JSON 叶子键
+`width`/`height`/`device_scale_factor`），所以"配置叶 58 条"与"JSON 叶子键 60 个"
+两个口径差恒为 2。
+
+### 三个 v1.7.5 的行为约定
+
+1. **无起始页**：v5 的 `browser.default_url` 已删。任务里没有显式网址、且本会话
+   还没有活页面时，`browse_web` 回「【需要网址】…」并**不打开任何默认站点**。
+2. **后台只有一条终态**：平台原生 core 引擎（`tools.background_engine`）退役，
+   升级后生产组合从 `all × core` 变 `all × plugin`；投递由「核心唤醒一轮主 LLM
+   生成」变为「插件模板生成的一条终态消息」（四态前缀 + task_id + 耗时 + 可选附件）。
+3. **截图只作兜底**：结构视图是主通道；`browse_screenshot` 的图必须带
+   Set-of-Mark 编号，模型只回编号不回坐标。`perception.screenshot_to_chat`
+   决定这张图**是否也发到会话**（默认 false = 只给模型看）。
+
+## 📜 历史版本（v1.7.0 及更早）
+
+> 下面从「功能特性」到「配置迁移」的**全部内容都是 v1.7.0 及更早的实现说明**，保留仅作历史参考与回滚对账。v1.7.5 的现行能力见上文「v1.7.5 现行能力」；两者冲突时**一律以前者为准**（例如内层工具是 5 个而不是 26 个、配置是 v6 58 叶而不是 v5 54 叶、后台没有 `core` 引擎、没有 `browser.default_url`）。
+
 ## ✨ 功能特性
 
 - **两个委派入口 + 一个直调入口（v1.7.0）**：主 LLM 只调 `browse_web`（`search.mode=external` 且搜索池可用时还有 `browser_web_search`）把任务交出去，**26 个 `browse_*` 工具**（`search.mode=internal` 时 **27** 个）在**插件内置的内层多模态模型**上下文里运行；`browse_local_page` 仍是**直调**入口、**不进子代理**（安全理由见下文「三个入口的真实语义」），显著减少主 LLM 的 token 占用
