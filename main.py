@@ -553,13 +553,6 @@ def _make_browser_tool(plugin: "BrowserLLMPlugin", spec: dict):
     )
 
 
-# browse_click_text 失败时的「相近可点击文本」采集脚本（v1.6.1）。
-# 只收**看起来可点**的元素（标签 / role / onclick / tabindex），文本取
-# innerText→value→aria-label 后压空白；按小写文本去重。长度上限与展示
-# 条数在 Python 侧用 _CLICK_TEXT_CANDIDATE_* 常量控制（JS 里不掺 Python
-# 值，避免字符串插值）。每条带 tag（含 role）与 visible（尺寸 +
-# display/visibility/opacity 判定）——事故里模型最缺的就是「页面上真实
-# 存在的文本长什么样、能不能点」。
 #: 终态附件按扩展名分流用的视频后缀（`Image` 发视频会失败）。
 _VIDEO_SUFFIXES = (".mp4", ".webm", ".mov", ".m4v", ".mkv")
 
@@ -585,10 +578,20 @@ def _has_explicit_url(text: str) -> bool:
     return bool(_URL_IN_TEXT_RE.search(body) or _DOMAIN_IN_TEXT_RE.search(body))
 
 
-#: 传给核心 ``tool_loop_agent`` 的步数上限。**不是**预算口径：v1.7.5 只用一条
-#: 墙钟预算收口（``resources.total_budget_s``）；核心 API 需要 int，这里给足够
-#: 大的值，避免它拿 None 去比较。
-_AGENT_MAX_STEPS = 1000
+#: 传给核心 ``tool_loop_agent`` 的步数上限**不是预算口径**（v1.7.5 只用一条墙钟
+#: 预算收口）。按规格 §7.4-9 的公式派生：``clamp(64, 512, total_budget_s * 2)`` ——
+#: 墙钟是主闸，这个值只做"防死循环"的护栏，且**不可配置**。
+AGENT_MAX_STEPS_MIN = 64
+AGENT_MAX_STEPS_MAX = 512
+
+
+def derive_max_steps(total_budget_s: float) -> int:
+    """从总预算派生步数护栏（纯函数，spec §7.4-9 的公式）。"""
+    try:
+        budget = float(total_budget_s)
+    except (TypeError, ValueError):
+        budget = 0.0
+    return int(max(AGENT_MAX_STEPS_MIN, min(AGENT_MAX_STEPS_MAX, int(budget * 2))))
 
 
 @dataclass
@@ -999,7 +1002,6 @@ class BrowserLLMPlugin(Star):
         if self.sessions is not None:
             self.sessions.max_pages = int(self.max_pages)
             self.sessions.idle_timeout = float(self.idle_timeout)
-            self.sessions.default_url = "about:blank"
         if self.safety is not None:
             self.safety.update_config(
                 banned_words=self.banned_words,
@@ -1022,7 +1024,6 @@ class BrowserLLMPlugin(Star):
             self.browser,
             max_pages=int(self.max_pages),
             idle_timeout=float(self.idle_timeout),
-            default_url="about:blank",  # v6：无起始页（第一个动作自己 navigate）
             on_page_closed=self._forget_page_caches,
         )
         self.extractor = ContentExtractor()
@@ -1078,6 +1079,21 @@ class BrowserLLMPlugin(Star):
         一个工具统一承接，因此这里只在 ``initialize()`` 调一次。
         """
         self._browser_tools = [_make_browser_tool(self, s) for s in INNER_TOOLS]
+        # R4：tools.narrow_tools 承诺的三件事 —— 构造断言 + 运行期过滤 + WARN。
+        # 关掉时三件都不做（排障用：允许临时多挂工具再看模型行为）。
+        if bool(getattr(self, "narrow_tools", True)):
+            names = [str(getattr(tool, "name", "")) for tool in self._browser_tools]
+            missing = [name for name in INNER_TOOL_NAMES if name not in names]
+            extra = [name for name in names if name not in INNER_TOOL_NAMES]
+            if missing or extra:
+                logger.warning(
+                    f"[{self.metadata_name}] 内层工具面与 INNER_TOOL_NAMES 不一致："
+                    f"缺 {missing} 多 {extra}（已按窄口径过滤）"
+                )
+            self._browser_tools = [
+                tool for tool in self._browser_tools
+                if str(getattr(tool, "name", "")) in INNER_TOOL_NAMES
+            ]
         self._browser_toolset = self._build_toolset(self._browser_tools)
 
 
@@ -1474,7 +1490,7 @@ class BrowserLLMPlugin(Star):
         列出纯文本模型会让运营方选到一个必然走 caption 兜底甚至被拒的模型，
         那是把"运行期才发现的错"推给运行期（规格 §3.1）。
 
-        与 ``_sync_vision_provider_options`` 同款做法：Dashboard 每次请求直接
+        与面板其它下拉同步同一做法：Dashboard 每次请求直接
         读 ``plugin_md.config.schema``（同一对象），就地改 ``options`` 即生效；
         ``""`` 空选项恒保留（= 继承当前会话），default 不在候选里时归零。
         """
@@ -1775,6 +1791,14 @@ class BrowserLLMPlugin(Star):
             dedupe_window_s=float(self.dedupe_window_s),
             max_parallel=int(self.max_parallel),
         )
+        # R4：tools.deliver_once 决定"每任务恰好一条主动投递 + 一条终态"的闸
+        # 是否生效（生产必须开；关掉只用于对照实验）。
+        try:
+            self._watchdog.registry.deliver_once = bool(
+                getattr(self, "deliver_once", True)
+            )
+        except Exception:  # noqa: BLE001 — 老的 registry 没有该属性也不该炸
+            pass
         logger.info(
             f"[{self.metadata_name}] 后台提交 tool={tool_name} "
             f"kind={handle.decision.kind} task_id={handle.task_id or '-'} "
@@ -1810,6 +1834,27 @@ class BrowserLLMPlugin(Star):
     # 浏览器子代理入口（工具化子代理：browse_web）
     # ================================================================
 
+    def _screenshot_allowed_for(self, umo: str) -> bool:
+        """本次任务是否允许截图（``perception.rules`` 命中第一条即生效）。
+
+        R4：v5 的"按会话设定感知方式"被整段删掉后又保留了键与迁移，等于承诺了
+        一个不存在的功能。这里按 v5 的优先级恢复最小闭环：规则列表按顺序匹配
+        ``umo`` 子串（大小写不敏感），命中第一条后看它的 ``perception``：
+        ``text`` ⇒ 不开截图（纯结构视图）；其它值 ⇒ 开。没有命中就用全局
+        ``perception.screenshot_fallback``。
+        """
+        target = str(umo or "").casefold()
+        for rule in list(getattr(self, "perception_rules", []) or []):
+            if not isinstance(rule, dict):
+                continue
+            needle = str(
+                rule.get("umo") or rule.get("match") or rule.get("session") or ""
+            ).casefold()
+            if needle and needle in target:
+                mode = str(rule.get("perception") or "").strip().lower()
+                return mode != "text"
+        return bool(getattr(self, "enable_screenshot", True))
+
     def _missing_url_hint(self, event: AstrMessageEvent, task_input: str) -> str:
         """无起始页之后的准入判定：没有目标网址就**要网址**，不静默开默认站。
 
@@ -1832,6 +1877,32 @@ class BrowserLLMPlugin(Star):
             f"[{self.metadata_name}] 拒绝无网址的浏览任务（无起始页，不打开默认站）"
         )
         return _NEED_URL_TEXT
+
+    def _busy_browse_reason(self, event: AstrMessageEvent) -> str:
+        """同会话已有浏览任务时返回拒绝文案（R21 的单飞真闸）。
+
+        两个来源都算"在跑"：前台 ``_fg_inflight`` 计数、后台 watchdog 登记表。
+        这样"后台 + 前台"与"两个前台"都不会互相踩页面、抢 ref 与 mark 纪元。
+        """
+        umo = self._umo_of(event)
+        inflight = getattr(self, "_fg_inflight", None)
+        if isinstance(inflight, dict) and int(inflight.get(umo, 0) or 0) > 0:
+            return (
+                "【拒绝】同一会话已有一个浏览任务在跑（前台）：等它结束再提交，"
+                "或把它合并成一次任务。"
+            )
+        watchdog = getattr(self, "_watchdog", None)
+        if watchdog is not None:
+            try:
+                active = watchdog.registry.active_task_id(umo)
+            except Exception:  # noqa: BLE001 — 查询失败不拦路
+                active = None
+            if active:
+                return (
+                    f"【拒绝】同一会话已有一个后台任务在跑（task_id={active}）："
+                    "等它结束再提交（结果会单独发一条消息）。"
+                )
+        return ""
 
     @filter.llm_tool(name="browse_web")
     async def browse_web(self, event: AstrMessageEvent, input: str = "") -> str:
@@ -1858,11 +1929,22 @@ class BrowserLLMPlugin(Star):
             need_url = self._missing_url_hint(event, input)
             if need_url:
                 return need_url
+            # R21：前台并发 + 按任务换页会互相踩页面（后到的关掉先到的）。
+            # 规格 §10.2 允许"不拦只 WARN"，但那样两个任务会抢同一张页面，
+            # 因此把"同 UMO 只允许一个 browse_web（含后台）"做成**真闸**。
+            busy = self._busy_browse_reason(event)
+            if busy:
+                return busy
             if self._background_enabled_for(_BROWSE_WEB_TOOL_NAME):
                 return await self._submit_background(
                     event=event,
                     tool_name=_BROWSE_WEB_TOOL_NAME,
-                    runner=lambda _progress: self._browse_web_run(event, input),
+                    runner=lambda progress: self._browse_web_run(
+                        event,
+                        input,
+                        progress=progress,
+                        background=True,
+                    ),
                     task_text=input,
                 )
             meta: dict = {}
@@ -1884,6 +1966,8 @@ class BrowserLLMPlugin(Star):
         task_input: str,
         perception_mode: str | None = None,  # 兼容旧调用点（v1.7.5 已无感知档位）
         meta: dict | None = None,
+        progress: dict | None = None,
+        background: bool = False,
     ) -> str:
         """browse_web 的执行体：provider 决策 + 内层代理 + 台账（前台/后台共用）。
 
@@ -1898,6 +1982,8 @@ class BrowserLLMPlugin(Star):
         if isinstance(perception_mode, dict) and meta is None:
             # 旧调用点把 meta 作为第 3 个位置参数传进来（v1.7.0 是 perception_mode）
             meta = perception_mode
+        if isinstance(meta, dict) and progress is None:
+            progress = meta  # 兼容：meta 同时充当 progress 通道
         umo = self._umo_of(event)
         inflight = getattr(self, "_fg_inflight", None)
         if not isinstance(inflight, dict):
@@ -1941,7 +2027,8 @@ class BrowserLLMPlugin(Star):
                             prompt=task_input or "请根据用户请求浏览网页并返回结果",
                             system_prompt=instruction,
                             tools=self._browser_toolset,
-                            max_steps=_AGENT_MAX_STEPS,  # 只防核心侧 None；预算靠墙钟
+                            # 步数护栏按 total_budget_s 派生（spec §7.4-9）；预算仍是墙钟
+                            max_steps=derive_max_steps(self.total_budget_s),
                             tool_call_timeout=int(self.action_timeout_s * 6),
                         ),
                         timeout=budget,
@@ -1957,6 +2044,14 @@ class BrowserLLMPlugin(Star):
                         else "（尚未产生任何内层工具调用）"
                     )
                     text = f"【错误】浏览任务超过 {budget:.0f} 秒硬上限被中止{hint}"
+                    if isinstance(progress, dict):
+                        # R11：超时也要把半成品与步数交给终态（规格 §6.2/§6.7）
+                        progress["partial"] = text
+                        progress["steps"] = int(steps)
+                    if background:
+                        # R22：本工具自己的超时不能被记成"完成" —— 抛出去让
+                        # watchdog 的 _run 映射成 STATUS_TIMEOUT。
+                        raise
                 except Exception as e:  # noqa: BLE001 — 取消/浏览器已关等
                     logger.warning(
                         f"[{self.metadata_name}] browse_web 内层执行异常: {e}"
@@ -2043,6 +2138,12 @@ class BrowserLLMPlugin(Star):
                     tool_name=_LOCAL_PAGE_TOOL_NAME,
                     runner=lambda progress: self._local_page_render(
                         event, target, full_page, wait_ms, text_only, progress
+                    ),
+                    # R3：task_key = sha1(umo|tool|task_text) —— 不带 path 时同会话
+                    # 所有本地页共用一个键，all 模式会把别人的结果投给当前用户。
+                    task_text=(
+                        f"{target}|full_page={full_page}|wait_ms={wait_ms}"
+                        f"|perception={perception}"
                     ),
                 )
             return agent_core.truncate_text(
@@ -2283,7 +2384,12 @@ class BrowserLLMPlugin(Star):
                 return None, str(e)
         umo = self._umo_of(event)
         state = self._task_state(umo)
-        page = await self.sessions.claim_page(umo, task_key=str(state.task_key or umo))
+        # R4：tools.isolate_context 真正影响控制流 —— 关掉时不按任务换页
+        # （跨任务复用同一张页面，等于放弃"上下文隔离"，生产中默认开启）。
+        task_key = state.task_key if bool(getattr(self, "isolate_context", True)) else ""
+        page = await self.sessions.claim_page(
+            umo, task_key=str(task_key or state.task_key or umo)
+        )
         if page is None:
             return None, "会话数已达上限或页面创建失败，请稍后再试"
         return page, ""
@@ -2333,9 +2439,22 @@ class BrowserLLMPlugin(Star):
         state = tasks.get(umo)
         if state is None:
             if len(tasks) > 64:  # 长跑实例的任务表不该无限增长
-                for key in list(tasks)[:32]:
+                # R20：按"最后使用时间"淘汰**空闲**状态（deadline==0）；绝不踢掉
+                # 有预算在身的状态，否则它的 ref/mark 会与手上那张 SoM 图对不上。
+                idle = sorted(
+                    (float(getattr(other, "last_used", 0.0)), key)
+                    for key, other in tasks.items()
+                    if float(getattr(other, "deadline", 0) or 0) <= 0
+                )
+                for _stamp, key in idle[:32]:
                     tasks.pop(key, None)
-            state = _TaskState()
+            state = _TaskState(
+                # R4：actions.repeat_guard 之前读了没人用；阈值必须来自配置
+                # （0 = 关闭重复守卫，由 RepeatGuard 自己处理 <=0）。
+                guard=vf.RepeatGuard(
+                    threshold=int(getattr(self, "repeat_guard_limit", 3))
+                )
+            )
             tasks[umo] = state
         return state
 
@@ -2599,7 +2718,9 @@ class BrowserLLMPlugin(Star):
         cdp = None
         if bool(self.trusted_events):
             try:
-                cdp = await ex.ensure_cdp(page)
+                # R23：CDP 会话只由感知层的 CdpSessionPool 持有（每页一条），
+                # executor 的模块级缓存不再参与 ⇒ 不会有 id(page) 复用返回死会话。
+                cdp = await self._cdp_session(page)
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001 — 拿不到 CDP 就退回 locator 事件
@@ -2723,9 +2844,17 @@ class BrowserLLMPlugin(Star):
         state.pending = vf.ledger_status(verdict)
         note = ""
         if not result.ok:
-            note = result.render()
-            if attempt > 1:
-                note += f"（已重试 {attempt - 1} 次）"
+            # R10（选①）：D7 要求"返回体固定带 elapsed={ms}ms attempt={n}"，
+            # 这里把它渲染进模型可见的失败行；成功路径不刷噪声（结构化字段仍在
+            # ExecutionResult / to_payload 里）。
+            elapsed = int(getattr(result, "elapsed_ms", 0) or 0)
+            tried = int(getattr(result, "attempt", attempt) or attempt)
+            note = (
+                f"{result.render()}"
+                f"（elapsed={elapsed}ms attempt={tried}"
+                + (f"，已重试 {attempt - 1} 次" if attempt > 1 else "")
+                + "）"
+            )
         return self._render_obs(
             after_snap, umo=umo, step=step, action=action, verdict=verdict, note=note
         )
@@ -2783,9 +2912,9 @@ class BrowserLLMPlugin(Star):
                 return f"【拒绝】检索词包含违禁内容：{banned}"
             if bool(open_page):
                 return await self._open_engine_page(event, text)
-            budget = min(
-                float(self.search_total_timeout), float(self.agent_tool_timeout)
-            )
+            # R1：v5 的 limits.agent_tool_timeout 已并入 resources.total_budget_s，
+            # 读取点必须跟着改（旧名从来不存在 ⇒ 一调就 AttributeError）。
+            budget = min(float(self.search_total_timeout), float(self.total_budget_s))
             try:
                 given = int(timeout or budget)
             except (TypeError, ValueError):
@@ -2881,8 +3010,11 @@ class BrowserLLMPlugin(Star):
         self, event: AstrMessageEvent, *, target: dict | None, full: bool
     ) -> str:
         """截图执行体（**已在会话锁内**）。"""
-        if not bool(self.enable_screenshot):
-            return "【不可用】截图兜底已关闭（perception.screenshot_fallback=false）。"
+        if not self._screenshot_allowed_for(self._umo_of(event)):
+            return (
+                "【不可用】截图兜底已关闭"
+                "（perception.screenshot_fallback=false，或被 perception.rules 关掉）。"
+            )
         page, err = await self._get_page(event)
         if page is None:
             return f"【错误】{err}"
@@ -2960,7 +3092,9 @@ class BrowserLLMPlugin(Star):
             notes.append(
                 "（标签数已达上限，未标的元素请用 browse_observe 的 [role]名称 定位）"
             )
-        if not bool(self.screenshot_to_chat):
+        # R2：v6 语义是"截图**是否**发到会话"（false = 只给模型看、不刷屏）。
+        # v5 的旧静默开关迁过来时已经取反，所以这里必须用**真值**判断。
+        if bool(self.screenshot_to_chat):
             try:
                 await self._emit_media(event, save_path, "image")
             except Exception as e:  # noqa: BLE001 — 发图失败不阻塞识图
@@ -2974,6 +3108,14 @@ class BrowserLLMPlugin(Star):
         )
         return payload if payload is not None else text + "\n" + _IMAGE_UNAVAILABLE_TEXT
 
+
+    async def _cdp_session(self, page):
+        """取该页**唯一**的 CDP 会话（感知层池子；失败返回 None）。"""
+        pool = getattr(self, "_cdp_pool", None)
+        if pool is None:
+            return None
+        call = await pool.session_for(page)
+        return getattr(call, "data", None) if getattr(call, "ok", False) else None
 
     def _viewport_label(self, page) -> str:
         """截图尺寸标签（``1280x800``）：取自视口，取不到用配置兜底。"""
@@ -3455,43 +3597,23 @@ class BrowserLLMPlugin(Star):
         fetch_pages: bool = False,
         fetch_top_n: int = 0,
     ) -> str:
-        """网页搜索（本插件自有搜索 API 池，返回结构化 JSON）；与内置的 web_search_<provider> 不同，同时可见时只选其一。
-
-        并行调用本插件配置的搜索 API（brave/bocha/firecrawl/tavily/exa，
-        每种可配多份、各有自己的 api_key），按 URL 去重合并后返回带来源的
-        结构化结果，可选抓取前几条的正文。**与 AstrBot 内置的
-        ``web_search_<provider>`` 工具不同**：本工具只用插件配置里的 key，
-        不读核心 ``provider_settings``，两者不会互相读取 key、也不会互相降级；
-        若主 LLM 同时看到内置搜索工具，**只选其一**（不要重复搜同一个问题）。
-
-        适合：事实问答、需要来源链接、只需摘要无需页面交互的检索。
-        不适合：需要登录/点击/翻页/表单等真实页面交互（用 browse_web 委托
-        浏览器子代理）、需要看页面外观（用 browse_web 截图）。
-
-        返回一个 JSON 字符串：``status``（ok/partial/failed/disabled）、
-        ``results[]``（rank/title/url/snippet/sources/fetched）、``attempts[]``
-        （每个 provider 的 outcome/code/耗时）、``error_codes``、``notes``。
-        回答用户时请依据 ``results[].snippet`` 或 ``fetched.text``，并给出链接。
+        """用插件自有的搜索 API 池做联网检索；与内置 web_search_<provider> 并存，同一问题只选其一。
 
         Args:
-            query(string): 检索词。必填，空串会被拒绝。
-            max_results(number): 返回条数上限（1-50）。0 表示用插件配置值。可省略
-            rounds(number): 搜索步数 = 并行波次上限（1-5）。0 表示用插件配置值。可省略
-            timeout(number): 本次调用总预算秒数（5-300）。0 表示用插件配置值。可省略
-            providers(string): 逗号分隔的 provider 名（如 "brave#1,bocha#1"），只允许池内已启用项，用于覆盖默认顺序。可省略
-            fetch_pages(boolean): 是否抓取结果正文（需插件配置 search.fetch_pages 已开启，取「与」）。可省略
-            fetch_top_n(number): 抓取前 N 条（0-5）。0 表示用插件配置值。可省略
+            query(string): 检索词。
+            max_results(number): 最多返回多少条（0 = 用配置默认）。
+            rounds(number): 多轮检索轮数（0 = 用配置默认）。
+            timeout(number): 本次总秒数（0 = 用配置默认；不会超过总预算）。
+            providers(string): 逗号分隔的 provider 白名单（空 = 全部启用项）。
+            fetch_pages(boolean): 是否抓取前 N 条正文。
+            fetch_top_n(number): 抓正文条数（0 = 用配置默认）。
 
-        后台模式（v1.5.0）：tools.background_mode=all 时本工具后台化——立刻
-        返回「已受理 + task_id」**纯文本**（不是 JSON），搜索结果单独作为一条
-        消息发到本会话。因此后台模式下**不要**用这次返回值回答事实问题。
-
-        双模式（v1.7.0，配置 search.mode）：
-        - ``external``（默认）：就是上面这套 —— 你（主 LLM）直接拿到原始结构化
-          结果；
-        - ``internal``：池搜索已经挪进浏览器子代理（内层工具
-          ``browse_web_search``），本工具被插件强制停用、你根本看不到它；要搜
-          就用 ``browse_web`` 委托，拿回的是子代理加工过的结论而不是原始 JSON。
+        只做「检索 + 摘要」，返回结构化 JSON：`status` / `results[]`
+        （url/title/snippet，可选 fetched.text）/ `error_codes` / `notes`。
+        需要登录、点击、翻页或看页面外观的检索请改用 `browse_web` 委托子代理。
+        `tools.background_mode` 打开时本工具改为后台执行：先回一行
+        「【已受理】task_id=…」，结果随后单独发一条消息 —— 此时**不要**用这次
+        返回值回答事实问题，只回一句"已开始搜索，结果稍后单独发送"。
         """
         # 后台模式热更新（v1.5.0）：入口第一行刷新配置，Dashboard 把
         # background_mode 改回 off 时下一次调用即生效（F1）。
