@@ -6,8 +6,11 @@
 每会话锁串行化同会话的并发工具调用。
 
 设计说明：_pages[umo] 为该会话的标签页列表，_active[umo] 为当前
-激活标签的 0 起始索引；ensure_page 返回激活页（无会话时新建第一个
-标签并打开 default_url），兼容 T4 的单页用法。
+激活标签的 0 起始索引；ensure_page 返回激活页（无会话时新建第一个标签，
+落在 default_url = ``about:blank``）。v1.7.5 起工具链走
+:meth:`claim_page`：**按任务**取页 —— 同一任务复用，换任务先关旧任务页
+（跨任务复用会带上上一任务的表单/滚动/登录态，且 mark/ref 纪元是按任务
+隔离的，页面也应隔离）。
 
 playwright 对象以鸭子类型传递（mock 可替换），本模块不 import
 playwright。
@@ -16,7 +19,7 @@ playwright。
 import asyncio
 import logging
 import time
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:  # pragma: no cover — 仅类型检查
     from playwright.async_api import Page
@@ -37,7 +40,8 @@ class SessionManager:
         browser: "BrowserCore",
         max_pages: int = 5,
         idle_timeout: float = 1800,
-        default_url: str = "https://www.baidu.com",
+        default_url: str = "about:blank",
+        on_page_closed: "Callable[[Any], None] | None" = None,
     ) -> None:
         """初始化会话管理器。
 
@@ -46,18 +50,26 @@ class SessionManager:
             max_pages: 全部会话的标签页总数上限；达到后新标签/
                 新会话被拒绝。
             idle_timeout: 会话空闲回收阈值（秒）。
-            default_url: 新会话首个标签的初始页地址。
+            default_url: 新会话首个标签的初始页地址（v1.7.5 恒为
+                ``about:blank``：不再有"起始页"配置，第一个动作自己 navigate）。
+            on_page_closed: 页面关闭后的回调（插件用它把感知层的 CDP 会话
+                （``a11y.CdpSessionPool``）与执行层的会话缓存（``executor.drop_cdp``）
+                一起释放 —— 两者都以 ``id(page)`` 为键，不摘就是泄漏）。
         """
         self.browser = browser
         self.max_pages = int(max_pages)
         self.idle_timeout = float(idle_timeout)
         self.default_url = default_url
+        self.on_page_closed = on_page_closed
 
         # umo -> 标签页列表；_active 为当前激活标签的 0 起始索引。
         self._pages: dict[str, list[Page]] = {}
         self._active: dict[str, int] = {}
         # 最后活动时间（time.monotonic 时钟）。
         self._last_active: dict[str, float] = {}
+
+        # 每会话的"当前任务键"（claim_page 用：换任务 ⇒ 关旧任务页）。
+        self._task_of: dict[str, str] = {}
 
         # 每会话专用锁：串行化同一会话的并发工具调用。
         self._locks: dict[str, asyncio.Lock] = {}
@@ -108,6 +120,13 @@ class SessionManager:
             await self.browser.close_page(page)
         except Exception as e:  # noqa: BLE001
             logger.debug("关闭标签页失败（忽略） umo=%s: %s", umo, e)
+        finally:
+            # 无论关成功与否都摘掉按 id(page) 建的会话缓存（幂等、只做字典操作）。
+            if self.on_page_closed is not None:
+                try:
+                    self.on_page_closed(page)
+                except Exception as e:  # noqa: BLE001 — 回调失败不许影响关页
+                    logger.debug("关页回调失败（忽略） umo=%s: %s", umo, e)
 
     def _drop_tab(self, umo: str, index: int) -> None:
         """从会话标签列表中移除 index（0 起始），不关闭页面。
@@ -164,6 +183,45 @@ class SessionManager:
     # ------------------------------------------------------------
     # 页面获取 / 标签管理
     # ------------------------------------------------------------
+
+    async def _close_all_pages(self, umo: str) -> None:
+        """关闭该会话全部标签页（**不动**会话锁与任务键，供 claim_page 复用）。"""
+        pages = self._pages.pop(umo, [])
+        self._active.pop(umo, None)
+        self._last_active.pop(umo, None)
+        for page in pages:
+            await self._close_page(umo, page)
+
+    def current_page(self, umo: str) -> Optional["Page"]:
+        """该会话当前的激活页（**不创建**、不导航；没有/已关闭返回 None）。
+
+        用途：无起始页之后，"这次任务需不需要显式网址"取决于会话里有没有一个
+        仍然活着的页面 —— 有就能"在这个页面上继续操作"，没有就必须问网址。
+        """
+        pages = self._pages.get(umo) or []
+        index = self._active.get(umo, 0)
+        page = pages[index] if 0 <= index < len(pages) else None
+        return page if page is not None and self._page_alive(page) else None
+
+    async def claim_page(self, umo: str, *, task_key: str = "") -> Optional["Page"]:
+        """按**任务**取该会话的页面（v1.7.5 的唯一取页入口）。
+
+        语义：``task_key`` 变了 ⇒ 先把上一任务的标签页全部关掉再新建；同一个
+        ``task_key``（同一任务内的多步动作/观测）⇒ 复用当前激活页。
+
+        为什么按任务隔离：跨任务复用同一标签会把上一任务的表单值、滚动位置、
+        甚至登录态带进新任务（上下文污染）；而且 mark 编号与 ref 编号都是**按
+        任务**作废的，页面若不隔离，"新任务的页面"与"旧任务的观测"会错位。
+
+        锁纪律：本方法**不**持有会话锁（调用方在 ``async with lock`` 内调用），
+        因此清理路径不使用 ``release()``（它会 pop 掉 ``_locks``，让并发调用者
+        拿到另一把锁 ⇒ 会话串行化失效）。
+        """
+        key = str(task_key or "")
+        if key and self._task_of.get(umo, "") != key:
+            await self._close_all_pages(umo)
+            self._task_of[umo] = key
+        return await self.ensure_page(umo)
 
     async def ensure_page(self, umo: str) -> Optional["Page"]:
         """获取该会话当前激活的 Page；无会话则新建第一个标签。
@@ -371,6 +429,7 @@ class SessionManager:
         pages = self._pages.pop(umo, [])
         self._active.pop(umo, None)
         self._last_active.pop(umo, None)
+        self._task_of.pop(umo, None)
         self._locks.pop(umo, None)  # 会话锁随会话销毁
         for page in pages:
             await self._close_page(umo, page)
