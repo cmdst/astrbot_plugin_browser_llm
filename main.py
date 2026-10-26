@@ -6217,8 +6217,8 @@ class BrowserLLMPlugin(Star):
     async def _reconcile_search_tool(self) -> None:
         """把工具 ``active`` 态对齐到配置（配置 = 唯一事实源）。
 
-        机制（spec §6.2，captain 裁定 D4）：``@filter.llm_tool`` 在 import 期
-        就注册（平台没有"按配置注册"的口子），因此用 ``activate_llm_tool_async``
+        机制（spec §6.2，captain 裁定 D4）：LLM 工具装饰器在 import 期就注册
+        （平台没有"按配置注册"的口子），因此用 ``activate_llm_tool_async``
         / ``deactivate_llm_tool_async`` 切 ``active``；请求装配期核心会剔除
         ``active=False`` 的工具，模型**根本看不到**它（不是"调用后报错"）。
 
