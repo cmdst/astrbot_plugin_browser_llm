@@ -57,7 +57,7 @@ from .core.background import (
     truncate_result,
 )
 from .core.browser import BrowserCore, validate_browser_type
-from .core.config_map import ConfigView, schema_leaf
+from .core.config_map import ConfigView, clamp_of, default_of, schema_leaf
 from .core.crawler import AiohttpFetcher, CrawlerLimits, FetchOutcome
 from .core.delivery import artifact_sink, collect_artifact
 from .core.extract import ContentExtractor
@@ -1247,6 +1247,16 @@ class BrowserLLMPlugin(Star):
         # 搜索与抓取共用（与浏览器代理 browser.proxy 相互独立）。
         self.search_proxy: str = str(view.get("search.proxy", "") or "").strip()
 
+        # ---- search.mode（v1.7.0）：池搜索挂在哪一层 ----
+        # external（默认）= 外层工具 browser_web_search，主 LLM 直调（= v1.6.0
+        # 行为逐字节一致）；internal = 内层工具 browse_web_search，外层强制停用。
+        # 两档**互斥**（同时有会让主 LLM 与内层都去搜、结果重复、token 翻倍）。
+        # 非法值 fail-closed 到 external 并记 warning。
+        raw_search_mode = view.get("search.mode", default_of("search.mode", "external"))
+        self.search_mode: str = self._as_enum(
+            "search.mode", raw_search_mode, "external", ("external", "internal")
+        )
+
         # ---- tools 组（v1.5.0 路线 D）：后台任务化 ----
         # 三个工具「前台阻塞 → 后台异步」的开关与整任务预算。默认 off ⇒ 与
         # v1.4.0 行为逐字节一致（前台同步返回真实结果），这是本改动的
@@ -1286,6 +1296,72 @@ class BrowserLLMPlugin(Star):
             )
             engine = "plugin"
         self.background_engine: str = engine
+
+        # ---- agent 组（v1.7.0）：内嵌多模态子代理的 8 个键 ----
+        # 全部 hot（走既有 _refresh_config 路径）。默认值与
+        # ``core.config_map.LEAF_DEFAULTS`` 逐条相等（由 tests 钉住）。
+        self.agent_provider_id: str = str(
+            view.get("agent.provider_id", default_of("agent.provider_id", "")) or ""
+        ).strip()
+        self.agent_persona_mode: str = self._as_enum(
+            "agent.persona_mode",
+            view.get("agent.persona_mode", default_of("agent.persona_mode", "default")),
+            "default",
+            ("default", "current", "custom"),
+        )
+        self.agent_persona_prompt: str = str(
+            view.get("agent.persona_prompt", default_of("agent.persona_prompt", "")) or ""
+        )
+        self.agent_task_timeout: int = self._as_clamped_int(
+            "agent.task_timeout",
+            view.get("agent.task_timeout", default_of("agent.task_timeout", 600)),
+            600,
+        )
+        self.agent_image_max_side: int = self._as_clamped_int(
+            "agent.image_max_side",
+            view.get("agent.image_max_side", default_of("agent.image_max_side", 1280)),
+            1280,
+        )
+        self.agent_image_quality: int = self._as_clamped_int(
+            "agent.image_quality",
+            view.get("agent.image_quality", default_of("agent.image_quality", 80)),
+            80,
+        )
+        self.agent_result_max_chars: int = self._as_clamped_int(
+            "agent.result_max_chars",
+            view.get("agent.result_max_chars", default_of("agent.result_max_chars", 3000)),
+            3000,
+        )
+        self.agent_ledger_max_lines: int = self._as_clamped_int(
+            "agent.ledger_max_lines",
+            view.get("agent.ledger_max_lines", default_of("agent.ledger_max_lines", 24)),
+            24,
+        )
+
+    def _as_enum(
+        self,
+        path: str,
+        value,
+        default: str,
+        allowed: tuple[str, ...],
+    ) -> str:
+        """枚举配置解析：非法值 fail-closed 到默认并记 warning（口径同 v5 spec §6.2）。"""
+        text = str(value or default).strip().lower()
+        if text not in allowed:
+            logger.warning(
+                f"[{self.metadata_name}] {path}={value!r} 非法"
+                f"（可选 {'/'.join(allowed)}），已按 {default} 处理。"
+            )
+            return default
+        return text
+
+    def _as_clamped_int(self, path: str, value, default: int) -> int:
+        """数值配置解析：类型容错 + 按 ``core.config_map.clamp_of`` 钳制。"""
+        number = self._as_int(value, default)
+        bounds = clamp_of(path)
+        if bounds is None:
+            return number
+        return _clamp(number, bounds[0], bounds[1])
 
     def _as_int(self, value, default: int) -> int:
         """int 配置解析：委托 core 共享实现（v1.3.3 收敛双实现）。"""

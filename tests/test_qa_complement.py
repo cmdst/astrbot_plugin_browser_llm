@@ -17,6 +17,7 @@ D. 行为补测：inject_browser_instruction 黑名单/正常注入、browse_web
 """
 
 import asyncio
+import sys
 import time
 import json
 import re
@@ -220,27 +221,33 @@ def test_max_chars_invalid_str_breaks_tool():
     assert "【错误】" in result
 
 
-#: **T3 引入、T4 收口的读取点缺口**（只允许这一个组，且只能缩小）。
-#: v1.7.0 配置结构 v5 新增 ``agent`` 组，读取点由 T4 在 ``_load_config`` 里补
+#: **T3 引入、T4 收口的读取点缺口**（只允许收缩，现在是空集）。
+#: v1.7.0 配置结构 v5 新增 ``agent`` 组，读取点由 T4 在 ``_load_config`` 里补齐
 #: （``self.agent_provider_id`` 等 8 个属性 + ``search.mode``）；T3 的边界是
-#: "只写 schema / config_map / 迁移器，不写 main.py"，因此这里显式登记缺口。
-#: ``test_pending_read_groups_is_a_shrinking_allowlist`` 钉住它不许变成垃圾桶：
-#: 一旦 T4 补上读取点，这条会红，届时把集合清空即可。
-PENDING_READ_GROUPS: set[str] = {"agent"}
+#: "只写 schema / config_map / 迁移器，不写 main.py"，因此当时显式登记缺口。
+#: **T4 已补齐 ⇒ 缺口必须为空**；下面两条守卫一起钉住"只许缩小、不许塞新的"。
+PENDING_READ_GROUPS: set[str] = set()
 
 
 def test_pending_read_groups_is_a_shrinking_allowlist():
-    """缺口集合只能是 schema 里真实存在、且零读取点的组（不许顺手塞别的）。"""
+    """缺口集合不许再出现新成员：schema 里每个组都必须真的有人读。"""
     from core.config_map import GROUPS
 
     schema_path = Path(__file__).resolve().parent.parent / "_conf_schema.json"
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
     assert PENDING_READ_GROUPS <= set(GROUPS), "缺口必须是已声明的组"
     assert PENDING_READ_GROUPS <= set(schema), "缺口必须真的在 schema 里"
-    assert PENDING_READ_GROUPS == {"agent"}, (
-        "缺口集合只允许 {agent}（T4 收口）；新增缺口说明有人在 schema 里"
-        "加了没人读的组"
+    assert PENDING_READ_GROUPS == set(), (
+        "缺口集合必须为空（T4 已补齐 agent 组读取点）；新增缺口说明有人在 "
+        "schema 里加了没人读的组，请在 _load_config 里补读取点而不是登记豁免"
     )
+
+
+def test_pending_read_groups_guard_can_go_red(monkeypatch):
+    """守卫自身可红：把缺口塞回 {agent} 必须立刻失败（证明它是活闸不是恒真）。"""
+    monkeypatch.setattr(sys.modules[__name__], "PENDING_READ_GROUPS", {"agent"})
+    with pytest.raises(AssertionError):
+        sys.modules[__name__].test_pending_read_groups_is_a_shrinking_allowlist()
 
 
 def test_conf_schema_keys_match_load_config():

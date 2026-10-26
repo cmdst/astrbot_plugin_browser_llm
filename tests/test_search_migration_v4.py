@@ -312,23 +312,40 @@ def test_is_migrated_false_when_group_is_not_dict():
     assert mig.is_migrated(migrated) is False
 
 
-def test_is_migrated_follows_live_key_map_not_frozen_v4():
-    """v5 之后：``is_migrated`` 读的是活 ``KEY_MAP``（54 叶），v4 产物只有 45 叶。
+def test_is_migrated_uses_frozen_v4_map():
+    """v1.7.0：``is_migrated`` 用**冻结**的 ``GROUPS_V4`` / ``KEY_MAP_V4`` 判定。
 
-    ⇒ 它恒为 ``False``（v4 迁移器不再自称 already-migrated）。这是**已知且有意**
-    的降级：v1.7.0 起迁移通道是 ``tools/migrate_config_v5.py``（它直接吃扁平 v3），
-    v4 迁移器降级为历史步骤 —— 但它的**产物仍然合法**（6 组 45 叶、值零变化），
-    所以在需要"先把扁平 v3 变成分组 v4"的场合仍可安全使用（重跑 = 幂等内容）。
+    之前它读活 ``KEY_MAP``（v5 已 54 叶）⇒ 对自家 45 叶产物恒 ``False``
+    （永远自称"还没迁移"，``--apply`` 每次白写一份内容等价的文件、也不再打印
+    already-migrated）。现在：
+
+    - 自家产物 ⇒ **True**（幂等，且 CLI 会说 already migrated）；
+    - 已经是 v5 的配置（多 ``agent`` 组 + ``search.mode``）⇒ 也是 **True**
+      （v4 这一步做完了，多出来的是"更新形态"而不是"未知键"）；
+    - 缺组 / 缺叶 / 有扁平旧键 ⇒ 仍为 **False**（坑③的回归不能丢）。
     """
+    assert tuple(mig.V4_PATHS) == tuple(KEY_MAP_V4)
+    assert tuple(mig.V4_GROUP_ORDER) == tuple(GROUPS_V4)
     produced = mig.migrate(flat_v3())
-    assert mig.is_migrated(produced) is False
+    assert mig.is_migrated(produced) is True
     # 产物本身仍是一个 shape 合法的 v4 配置：6 组 45 叶、每组叶名与冻结表一致
     assert list(produced) == list(GROUPS_V4)
     assert sum(len(leaves) for leaves in produced.values()) == 45
     for group, leaves in V4_LEAF_ORDER.items():
         assert tuple(produced[group]) == leaves, group
-    # 而"真的已经是 v5 形态"的配置同样不满足 v4 的判定（54 ≠ 45）
-    assert mig.is_migrated({**produced, "agent": {"provider_id": ""}}) is False
+    # v5 形态（多 1 组 + 9 叶）：v4 意义上仍是"已迁移"
+    v5_like = {
+        **produced,
+        "agent": {"provider_id": "", "persona_mode": "default"},
+        "search": {**produced["search"], "mode": "external"},
+    }
+    assert mig.is_migrated(v5_like) is True
+    # 真的未知键仍判未迁移（缺口不许变成垃圾桶）
+    assert mig.is_migrated({**produced, "browser": {"future_key": 1}}) is False
+    # 缺口/缺叶回归
+    missing = dict(produced)
+    missing.pop("agent", None)
+    assert mig.is_migrated(missing) is True  # v4 形态本来就没有 agent 组
 
 
 # ---------------------------------------------------------------

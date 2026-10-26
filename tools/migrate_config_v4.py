@@ -57,7 +57,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from core.config_map import GROUPS, KEY_MAP  # noqa: E402
+from core.config_map import GROUPS, GROUPS_V4, KEY_MAP, KEY_MAP_V4  # noqa: E402
 
 BOM = "utf-8-sig"
 
@@ -116,8 +116,20 @@ DEFAULTED_PATHS: dict[str, Any] = {**SEARCH_DEFAULTS, **TOOLS_DEFAULTS}
 #: 必须有值的叶集合：v3 的 25 条（迁移基线）。缺任一条 = 迁移源不完整。
 LEGACY_PATHS: tuple[str, ...] = tuple(sorted(_PATH_TO_FLAT))
 
-#: 全部当前路径（45 条）。
-V4_PATHS: tuple[str, ...] = tuple(KEY_MAP)
+#: v4 的 45 条路径（**冻结**，来自 ``core.config_map.KEY_MAP_V4``）。
+#:
+#: v1.7.0 起这个列表**不能再跟活 ``KEY_MAP`` 走**：活表已经 54 条（v5 新增
+#: ``search.mode`` + ``agent.*`` 9 条），跟着走会让 ``is_migrated()``
+#: 对**它自己产出的 45 叶 v4 配置**恒返回 ``False``（永远自称"还没迁移"），
+#: 于是 ``--apply`` 每次都白写一次内容等价的文件、也不再打印 already-migrated。
+V4_PATHS: tuple[str, ...] = tuple(KEY_MAP_V4)
+
+#: v4 的 6 个组（**冻结**）：``is_migrated()`` 的"组齐全"判定只用它。
+V4_GROUP_ORDER: tuple[str, ...] = tuple(GROUPS_V4)
+
+#: 活表里"v4 之后新增"的路径（v5 的 9 条）。``is_migrated()`` 对它们**不敏感**：
+#: 一份已经是 v5 的配置在 v4 意义上同样是"v4 迁移做完了"，不该被判成未迁移。
+POST_V4_PATHS: frozenset[str] = frozenset(KEY_MAP) - frozenset(KEY_MAP_V4)
 
 
 def _load_leaf_order() -> dict[str, tuple[str, ...]]:
@@ -257,7 +269,15 @@ def migrate(config: dict, *, allow_unknown: bool = False) -> dict:
 
 
 def is_migrated(config: dict) -> bool:
-    """是否已是完整当前结构：无扁平旧键 + 6 组齐全 + 45 条路径全在。
+    """是否已是完整 **v4** 结构：无扁平旧键 + 6 组齐全 + 45 条路径全在。
+
+    三条判定都用**冻结**表（``V4_GROUP_ORDER`` / ``V4_PATHS``）：
+
+    - 归档边界：v4 迁移器是"历史步骤"，它的"已迁移"必须按它自己那版结构判，
+      否则（跟着活 ``KEY_MAP`` 走）它对自家产物恒 ``False``；
+    - 向前兼容：一份已经是 v5（7 组 / 54 叶）的配置在 v4 意义上**也是**
+      "v4 迁移做完了" ⇒ 多出来的 ``agent`` 组与 ``search.mode`` 不算未知键
+      （它们出现在活 ``KEY_MAP`` 里，由 ``flatten`` 归一为已知路径）。
 
     坑（audit §7.4-③）：v3 时代只要求"无扁平键 + 已存在的组是 dict"，于是
     "缺 search 组的 4 组配置"被判成已迁移、新增组永远进不了迁移。这里对
@@ -267,13 +287,15 @@ def is_migrated(config: dict) -> bool:
         return False
     if any(key in config for key in _FLAT_TO_PATH):
         return False
-    if set(GROUP_ORDER) - set(config):
+    if set(V4_GROUP_ORDER) - set(config):
         return False
-    for group in GROUP_ORDER:
+    for group in V4_GROUP_ORDER:
         value = config.get(group)
         if not isinstance(value, dict):
             return False
     canonical, unknown = flatten(config)
+    # 只对"v4 之后新增"的路径免疫；真正的未知键仍然判未迁移。
+    unknown = [item for item in unknown if item[0] not in POST_V4_PATHS]
     if unknown:
         return False
     return all(path in canonical for path in V4_PATHS)
