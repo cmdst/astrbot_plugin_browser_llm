@@ -25,7 +25,7 @@
    被替代的旧内层方法（`browse_open` / `browse_get_text` / `browse_click_text` / `browse_click_coords` /
    `browse_checkbox` / `browse_input` / `browse_select_option` / `browse_set_slider` / `browse_press_key` /
    `browse_scroll` / tab 系列 …）**删除而不是保留薄壳**。
-4. **配置结构 v6**：7 组 / **配置叶 58 条** = **JSON 叶子键 60 个**（差 2 = `resources.viewport` 1 ↔ 3）。
+4. **配置结构 v6**：7 组 / **配置叶 57 条** = **JSON 叶子键 59 个**（差 2 = `resources.viewport` 1 ↔ 3）。
    v5 的 54 键里 26 keep / 12 rename / 1 move / 4 merge 目标（7 源）/ 8 drop；`agent.*` 组并入 `model.*`，
    识图 provider 与内层子代理模型**合并为 `model.provider_id` 一个键**（caption 兜底整条删除）。
    `silent_mode` 改名并**取反**为 `perception.screenshot_to_chat`；`browser.timeout` 一分为
@@ -48,7 +48,7 @@ python tools/migrate_config_v6.py --dry-run
 python tools/migrate_config_v6.py --apply
 # 3) 复核：43 条承接叶值不变 + 15 条新叶存在
 python tools/migrate_config_v6.py --verify --baseline
-# 4) 到此配置已是 v6（配置叶 58 条 / JSON 叶子键 60 个）；下一步才换代码
+# 4) 到此配置已是 v6（配置叶 57 条 / JSON 叶子键 59 个）；下一步才换代码
 # 5) 换代码：覆盖插件目录 → WebUI 重载插件（不是重启服务）
 ```
 
@@ -70,7 +70,7 @@ python tools/migrate_config_v6.py --verify --baseline
   `fill` 或 `Input.insertText`（不再 `page.type`）。
 - **D9**：取消路径不吞 `CancelledError`、不 await；关页时同时摘感知层 CDP 会话与执行层缓存。
 
-### 测试网：1128 → 770 的逐主题去向（R8）
+### 测试网：1128 → 775 的逐主题去向（R8）
 
 删除过时用例本身合理，但净 −421 条里有三处**非过时**缺口，处置如下（规格勘误 E7）：
 
@@ -79,7 +79,7 @@ python tools/migrate_config_v6.py --verify --baseline
 | 删除的 v1.3–v1.7.0 用例 | −421 | 主体是被删 API：caption 链 / core 引擎 / `search.mode` / 26 个旧原语 / v5 计数 / 历史迁移器 |
 | **本轮补回** | **+58** | `test_v175_local_page.py` 16（路径穿越/软链/扩展名/黑名单，R6）、`test_v175_agent.py` 22（8 格决策/人格三档/六段/台账/归类/抽图/作用域，R7）、`test_v175_repair_r1.py` 20（R1–R4/R9/R13/R17/R20–R22 的调用级回归） |
 
-现行门禁 **770 passed / 0 failed**、ruff clean。三个"覆盖缺口"的结论：
+现行门禁 **783 passed / 0 failed**、ruff clean。三个"覆盖缺口"的结论：
 R6/R7 **已补回**（不是接受缺口）；文档⇄代码由 `tests/test_v175_docs_vs_code.py`（10 条）承接。
 规格 §12.3 的「≥1128」据此作废（勘误 E7 改为「≥760 且 0 failed + 四个守卫模块全绿」）。
 
@@ -122,6 +122,28 @@ R6/R7 **已补回**（不是接受缺口）；文档⇄代码由 `tests/test_v17
   `deliver_once` 把每任务主动投递限死 1 次；结果为空也有模板兜底。
 - **U3** 工具集收窄：后台执行体不 merge 人格工具集、不调用 `send_message_to_user`。
 - **U4** 上下文隔离：后台链不持有 `event`、不读不写会话历史，终态由**确定性模板**渲染。
+
+### 返工收口（round 3，t12 复评的 4 medium + 6 low）
+
+- **`tools.isolate_context` 从装饰变真效果**：原先 `task_key = … if isolate_context else ""`
+  后面紧跟 `claim_page(..., task_key=str(task_key or state.task_key or umo))`，那个 `or` 把
+  空串又补回去 ⇒ 开关**恒等于开**。现在关掉时 `claim_key = umo`（常量）⇒ `claim_page`
+  永不换页，**跨任务复用同一张页**；打开时按任务换页（旧页被关）。规格勘误 E10 写了语义与风险。
+- **`tools.deliver_once` 删除**（配置叶 58 → **57**、JSON 叶子键 60 → **59**、v6 新增叶 15 → **14**）：
+  U2 的"每任务恰好一条主动投递 + 一条终态"是**硬不变量**，不做开关 —— 保留它只会让人以为
+  "关掉就会重复投递"，而 tool 通道根本没有第二次投递的调用方。理由见勘误 E11。
+- **两条"字符串/恒真"守卫改成真断言**：`isolate_context` 现在用真实 `claim_page` 走两条
+  对照路径（开=换页、关=同一 page 句柄），`deliver_once` 换成"叶已删除 + registry 无开关"。
+- **README 三节重写**（仓库结构 / 感知与截图策略 / 开发与测试）并整体搬到「历史版本」标记
+  **之前**，docs-gate 因此不再豁免；16 动作清单、`browse_observe` 视图（`structure`/`text`/
+  `links`/`full`）、`browse_act` 前缀（`【动作】`）**从 `ACTION_SPEC` / `OBSERVE_VIEWS` 生成校验**。
+- **R31** `_TaskState.last_used` 接线（淘汰策略真按 LRU，而不是插入序）；**R26** 勘误里函数名
+  改为 `derive_max_steps`；**R30** 规格正文 vs 勘误的分家关系写进勘误头；**R29** t8 的
+  `test_v175_qa_recheck.py` 裁决 = 由 t11 入库（5 条，已在门禁内）。
+- **E9（规格 §10.2）**「同 UMO 不拦只 WARN」→ 与代码的**真闸**对齐（不再互相打架）：
+  第二个 `browse_web`（含后台在跑）直接回 `【拒绝】同一会话已有一个浏览任务在跑…`。
+- 本轮门禁：**783 passed / 0 failed**、ruff clean（776 → 781：+2 isolate 对照、+1 deliver_once
+  删除守卫、+4 README 生成式 docs-gate，净 +5）。
 
 ## [v1.7.0] - 2026-10-26
 

@@ -724,7 +724,6 @@ LEAVES: tuple[Leaf, ...] = (
         v5="tools.background_max_chars",
         migration=MIGRATION_KEEP,
     ),
-    Leaf("tools", "deliver_once", "bool", True, SINCE_V175, EFFECT_HOT),
     Leaf("tools", "dedupe_window_s", "int", 600, SINCE_V175, EFFECT_HOT, clamp=(0, 3600)),
     Leaf("tools", "isolate_context", "bool", True, SINCE_V175, EFFECT_HOT),
     Leaf("tools", "narrow_tools", "bool", True, SINCE_V175, EFFECT_HOT),

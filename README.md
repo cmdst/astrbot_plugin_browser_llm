@@ -2,12 +2,12 @@
 
 Agent 驱动的网页浏览插件 —— 让 LLM 通过 function-calling 自主浏览网页：导航、搜索、点击链接、填表、滚动、截图识图、下载媒体，无需用户手动指令。
 
-当前版本：**v1.7.5**（变更见 [CHANGELOG](./CHANGELOG.md)；v1.7.5 是**破坏性架构重做** —— 感知/动作/执行/验证四层整体换栈：CDP A11y 树 + 结构化动作 + Playwright locator + CDP 受信任事件 + 操作后验证，截图仅兜底且必须叠 Set-of-Mark 编号；内层工具 **26 → 5**；配置结构 **v6**：**7 组 / 配置叶 58 条 = JSON 叶子键 60 个**；平台原生后台引擎按 spec §6.6 退役。外层三个工具名一字未改）
+当前版本：**v1.7.5**（变更见 [CHANGELOG](./CHANGELOG.md)；v1.7.5 是**破坏性架构重做** —— 感知/动作/执行/验证四层整体换栈：CDP A11y 树 + 结构化动作 + Playwright locator + CDP 受信任事件 + 操作后验证，截图仅兜底且必须叠 Set-of-Mark 编号；内层工具 **26 → 5**；配置结构 **v6**：**7 组 / 配置叶 57 条 = JSON 叶子键 59 个**；平台原生后台引擎按 spec §6.6 退役。外层三个工具名一字未改）
 
-> **看不懂「配置叶 58 条 = JSON 叶子键 60 个」？** 这是同一份 schema 的两种数法，两个都对，差 2 恒来自
+> **看不懂「配置叶 57 条 = JSON 叶子键 59 个」？** 这是同一份 schema 的两种数法，两个都对，差 2 恒来自
 > `resources.viewport`（**1 条复合叶 ↔ 3 个 JSON 叶子键**：`width` / `height` / `device_scale_factor`）。
-> 说「配置叶 / 键条目」用 **58**；说「配置文件里有几个键 / schema 展平几个」用 **60**。
-> v5（v1.7.0）的对应值是 配置叶 54 条 / JSON 叶子键 55 个；v4 是 45 / 46。
+> 说「配置叶 / 键条目」用 **57**；说「配置文件里有几个键 / schema 展平几个」用 **59**。
+> v5（v1.7.0）的对应值是 54 / 55；v4 是 45 / 46。
 
 ## 🧱 v1.7.5 架构：六层，每层一个事实源
 
@@ -48,18 +48,18 @@ python tools/migrate_config_v6.py --strip-v6       # 只删 v6 新叶（成对�
 | 外层 | `browse_web` | 把整件事委托给内层子代理（唯一委派入口） | 不可信前缀 + 结论 + `【执行台账】` |
 | 外层 | `browse_local_page` | **直调**：渲染本地 HTML 并给结构视图（不进子代理） | 结构视图 + 正文摘要 +（可选）截图 |
 | 外层 | `browser_web_search` | 插件自有搜索 API 池（不启浏览器） | 结构化 JSON；后台模式回「【已受理】」 |
-| 内层 | `browse_observe` | 取 A11y 结构视图（`compact`/`full`/`text`） | `【观测 #n】…` 节点表 |
-| 内层 | `browse_act` | **一个**结构化动作（16 种） | `【执行】…` + `【验证】…` |
+| 内层 | `browse_observe` | 取 A11y 结构视图（`structure`/`text`/`links`/`full`） | `【观测 #n】…` 节点表 |
+| 内层 | `browse_act` | **一个**结构化动作（16 种） | `【动作】…` + `【验证】…` |
 | 内层 | `browse_screenshot` | Set-of-Mark 截图兜底（无文本元素专用） | 图 + mark 表 |
 | 内层 | `browse_media` | 从页面嗅探图片/视频并下载 | 媒体清单（前台直发/后台进附件） |
 | 内层 | `browse_search` | 内层检索（池搜索，不启浏览器） | 结构化 JSON 摘要 |
 
-16 个动作：`navigate` / `click` / `type` / `press` / `scroll` / `hover` / `select` /
-`check` / `uncheck` / `wait_for` / `read` / `links` / `screenshot` / `media` /
-`tab` / `back`。模型每步只输出**一个**动作对象，例：
+16 个动作（**由 `core/action_model.ACTION_SPEC` 生成**，改代码即改这里）：
+`navigate`、`click`、`type`、`select`、`check`、`press`、`scroll`、`hover`、`back`、`forward`、`tab`、`read`、`screenshot`、`wait`、`reload`、`done`。
+模型每步只输出**一个**动作对象，例：
 `{"action":"click","target":{"role":"button","name":"提交"}}`。
 
-### 配置结构 v6：7 组 / 配置叶 58 条（JSON 叶子键 60 个）
+### 配置结构 v6：7 组 / 配置叶 57 条（JSON 叶子键 59 个）
 
 | 组 | 叶数 | 键名（不含组前缀） |
 | --- | --- | --- |
@@ -69,10 +69,10 @@ python tools/migrate_config_v6.py --strip-v6       # 只删 v6 新叶（成对�
 | `actions` | 4 | `trusted_events`、`verify`、`max_retries`、`repeat_guard` |
 | `search` | 17 | `enabled`、`engine`、`providers`、`proxy`、`max_parallel`、`max_results`、`max_rounds`、`provider_timeout_s`、`total_timeout_s`、`cooldown_s`、`cache_ttl_s`、`fetch_pages`、`fetch_top_n`、`fetch_timeout_s`、`fetch_max_chars`、`region`、`safesearch` |
 | `security` | 5 | `banned_words`、`enable_banned_filter`、`block_internal_ip`、`session_whitelist`、`session_blacklist` |
-| `tools` | 6 | `background_mode`、`background_max_chars`、`deliver_once`、`dedupe_window_s`、`isolate_context`、`narrow_tools` |
+| `tools` | 5 | `background_mode`、`background_max_chars`、`dedupe_window_s`、`isolate_context`、`narrow_tools` |
 
 `resources.viewport` 是唯一的复合叶（1 条 ↔ 3 个 JSON 叶子键
-`width`/`height`/`device_scale_factor`），所以"配置叶 58 条"与"JSON 叶子键 60 个"
+`width`/`height`/`device_scale_factor`），所以"配置叶 57 条"与"JSON 叶子键 59 个"
 两个口径差恒为 2。
 
 ### 三个 v1.7.5 的行为约定
@@ -85,6 +85,83 @@ python tools/migrate_config_v6.py --strip-v6       # 只删 v6 新叶（成对�
 3. **截图只作兜底**：结构视图是主通道；`browse_screenshot` 的图必须带
    Set-of-Mark 编号，模型只回编号不回坐标。`perception.screenshot_to_chat`
    决定这张图**是否也发到会话**（默认 false = 只给模型看）。
+
+## 📁 仓库结构（v1.7.5）
+
+```text
+main.py                      唯一装配层（≤4200 行）：配置读取 + 三个外层入口 + 后台接线
+core/a11y.py                 ① 感知：CDP A11y 全树裁剪 / 文本通道 / Set-of-Mark / 帧链
+core/action_model.py         ② 动作：ACTION_SPEC 16 条 → JSON Schema + parse_action 闸门
+core/executor.py             ③ 执行：locator 定位阶梯 + CDP 受信任事件 + 16 动作矩阵
+core/verify.py               ④ 验证：期望/六类差分/【无变化】/重复守卫/观测块渲染
+core/background.py           ⑤ 后台：任务表 + 整链墙钟看门狗 + task_key 去重 + 模板终态
+core/config_map.py           ⑥ 配置：v6 单一事实源（LEAVES / KEY_MAP / ConfigView + v5 冻结视图）
+core/agent.py                内层执行体：provider 8 格决策 / 人格层 / 六段提示词 / 台账 / 归类
+core/browser.py              Playwright 驱动（headless / viewport+DPR / CJK 字体自检 / SSRF 计数）
+core/session.py              会话与标签页（claim_page 按任务取页 / on_page_closed 回调）
+core/search.py               搜索池（并行波次 / 去重合并 / TTL 缓存 / 冷却 / 脱敏）
+core/search_providers.py     brave / bocha / firecrawl / tavily / exa 五个后端
+core/crawler.py              正文抓取（逐跳 SSRF + 限长 + 文本化）
+core/extract.py              正文/链接提取
+core/http.py                 HTTP 传输层（aiohttp 优先 / 标准库兜底，均不跟随重定向）
+core/safety.py               SSRF + 内容禁词
+core/delivery.py             后台媒体登记（artifact_sink / collect_artifact / current_artifacts）
+tools/migrate_config_v6.py   配置迁移器（v3/v4/v5 → v6 单跳；五模式）
+tests/                       门禁（29 个 test_*.py + conftest.py）
+```
+
+`core/` 现有 17 个模块（`__init__.py` 之外），每个都有生产调用方（`main.py`）。
+历史迁移器（v3 / v4 / v5 三支）**已全部删除** —— 见 CHANGELOG 与规格勘误 E1：
+v6 迁移器直接吃得下三种历史形态，链式中转不再需要。
+
+## 🎯 感知与截图策略（v1.7.5）
+
+页面感知**只有一个主通道**：CDP A11y 结构视图（`- [role] name (state)`）。截图是**兜底**，
+且必须带 Set-of-Mark 编号（模型只回编号、不回坐标）。四个键控制它：
+
+| 键 | 作用 |
+| --- | --- |
+| `perception.a11y_max_nodes` | 结构视图最多保留多少节点（超出按 `+N 已裁` 标注） |
+| `perception.screenshot_fallback` | 是否允许截图兜底（关掉 ⇒ `browse_screenshot` 回【不可用】） |
+| `perception.screenshot_to_chat` | 这张图**是否也发到会话**（默认 `false` = 只给模型看，不刷屏） |
+| `perception.rules` | 按会话 UMO 子串设定：命中第一条后 `perception=text` ⇒ 该会话不开截图 |
+
+v1.7.0 的 `perception=text|text_image|image` 三档**已取消**（`browse_web` 不再解析这个前缀）。
+`browse_local_page` 仍保留一个**兼容参数** `perception`：传 `text` 时只回文本 + 结构、不截图，
+其它值等价于默认行为。
+
+## 🧪 开发与测试
+
+```bash
+cd astrbot_plugin_browser_llm
+PYTHONDONTWRITEBYTECODE=1 /root/AstrBot/.venv/bin/python -m pytest tests/ -q -p no:cacheprovider
+/root/AstrBot/.venv/bin/python -m ruff check .
+```
+
+当前门禁：**783 passed / 0 failed**（v1.7.5，含 t2–t5 的四层用例与返工用例）；
+`tests/` 下 **29 个 `test_*.py`** + `conftest.py`。四个守卫模块是"文档/配置/工具面"的主闸门，
+改任何一层都会先红：
+
+| 守卫 | 钉住什么 |
+| --- | --- |
+| `test_v175_docs_vs_code.py` | 版本四处一致、工具面 3+5、叶数口径、动作清单/observe 视图**从 ACTION_SPEC 生成**比对、README 现行部分不得出现已删键与工具名 |
+| `test_v175_tools.py` | 工具面、description 硬话、SoM 行为、单渲染处、行数预算 |
+| `test_v175_config_readpoints.py` | schema ⇄ `LEAVES` ⇄ `main.py` 读取点 ⇄ 迁移器四方一致；热开关叶必须影响控制流 |
+| `test_v175_background_wiring.py` | 后台只走 watchdog、deliver 只 `event.send`、无 core 引擎残留 |
+
+其余分组：感知（`test_v175_a11y.py`）、动作（`test_v175_action_model.py` / `test_v175_executor.py`）、
+验证（`test_v175_verify.py`）、后台（`test_v175_background.py`）、内层执行体（`test_v175_agent.py`）、
+本地页路径安全（`test_v175_local_page.py`）、配置与迁移器（`test_config_v6.py` /
+`test_migrate_config_v6.py`）、搜索与安全（`test_search_*.py` / `test_v175_security.py`）。
+
+## 🚀 使用示例
+
+群聊中直接说：
+
+- 「打开 https://example.com 看看是什么」
+- 「在这个页面上帮我填表提交」
+- 「把这个页面上的图片都下载发我」
+- 「打开这个网址，把页面上所有的商品价格读出来」
 
 ## 📜 历史版本（v1.7.0 及更早）
 
@@ -893,140 +970,6 @@ v4 迁移器 `tools/migrate_config_v4.py` 修的四个坑（组顺序与 `KEY_MA
 > 库内那份 `astrbot_plugin_browser_llm_tmp/` 副本已在 v1.4.0 删除：它的 3 个必须
 > 保留的修正（StarTools 数据目录、workspaces 回退、截图/媒体目录）已移植进
 > `main.py`，"检测原插件"的 WARN 块按 D9 不移植（正式版改名后没有检测对象）。
-
-## 📁 仓库结构（v1.4.0 清理后；v1.5.0 / v1.6.0 / v1.6.1 / v1.7.0 增补）
-
-```
-main.py                      插件入口：browse_web / browse_local_page / browser_web_search
-                              + 委派分派、后台分派、结果合成、识图缓存（七元组键）、内层 ToolSet 装配
-core/__init__.py             配置解析容错（as_int / as_float / as_bool）
-core/agent.py                v1.7.0 内嵌子代理执行体：provider 决策表(8 格) / 人格分层(L0-L4) /
-                             工具集装配 / 预算与截断 / 确定性台账 / 结果归类（不可信前缀）
-core/background.py           后台任务登记与四态文案（BackgroundRegistry / HEADERS / render_*）
-                              + v1.6.0 C 模式返回体治理（C_UNTRUSTED_PREFIX / C_MEDIA_HEADER / render_c_media_block）
-core/browser.py              Playwright 驱动（BrowserCore）
-core/config_map.py           配置键单一事实源（LEAVES / KEY_MAP / GROUPS / ConfigView / schema_leaf；
-                             54 条配置叶，其余全部派生）
-core/crawler.py              搜索正文抓取（AiohttpFetcher：逐跳 SSRF + 限长 + 文本化）
-core/delivery.py             后台媒体登记（artifact_sink / collect_artifact / current_artifacts）
-core/extract.py              正文/链接提取（ContentExtractor）
-core/http.py                 HTTP 传输层（aiohttp 优先 / 标准库兜底，均不跟随重定向）
-core/safety.py               SSRF + 内容禁词（SafetyFilter / check_url_literal / acheck_url）
-core/search.py               搜索池：并行波次、去重合并、TTL 缓存、冷却、脱敏
-core/search_providers.py     brave / bocha / firecrawl / tavily / exa 五个后端
-core/session.py              浏览会话与标签页（SessionManager）
-tools/migrate_config_v3.py   扁平 25 键 → 分组 v3（4 组）历史迁移器（保留给分组 v3 场景与既有测试）
-tools/migrate_config_v4.py   v3 → v4 历史迁移器（6 组 / 配置叶 45 条；口径已冻结，新流程别用它）
-tools/migrate_config_v5.py   v4 → v5 迁移器（7 组 / 配置叶 54 条；dry-run / apply / verify / restore-from / strip-v5；
-                             任何模式都不打印配置值）
-```
-
-每个 `core/` 模块都有**生产调用方**（`main.py` 或 `core/browser.py`），
-写入 v1.4.0 清理前的 `tasks / async_bridge / vision / pages` 四个模块
-（850 行，`main.py` 零引用、只有测试在测）已删除 —— 它们要做的能力
-（异步投递/唤醒、后台任务状态机、浏览器→爬虫自动回退、独立识图缓存）
-都是 **v5 非目标**：识图缓存已内联在 `main.py`，会话串行化由 `SessionManager`
-负责，抓正文只走 `core/crawler.py`。将来若重新引入，请按届时 spec 重写，
-不要从 v1.3.x 的历史文件里恢复。
-
-## 🎯 感知模式控制（v1.3.0）
-
-感知模式决定浏览器子代理「用文字还是截图」理解页面，三处控制点，优先级从高到低：
-
-1. **工具参数级（按任务覆盖）**：`browse_web` 的 `input` 开头加前缀
-   `perception=text|text_image|image`（大小写不敏感，后跟空格或换行再接任务描述），
-   仅本次任务生效。例：`perception=text 打开 https://example.com 读取正文`
-   （纯文字模式，绝对不触发截图识图，适合读文档/查报错/看代码）；
-   `perception=image 看看这个页面长什么样`（截图为主）。
-   非法值（如 `perception=foo`、`perception=` 等号后空值）会被忽略并记录告警，回落到规则/全局配置。
-2. **会话规则级（按 UMO 默认）**：配置 `perception_rules`，按会话 UMO 子串匹配
-   （不区分大小写）设定默认模式，命中第一条生效。例：
-   `[{"match": "tester", "perception": "text"}]` 后，UMO 含 `tester` 的会话
-   （如测试子代理）默认纯文字浏览。
-3. **全局默认**：`page_perception`（text / text_image / image）。
-
-**子代理本地页面工具（v1.3.0 补强）**：`browse_local_page` 同样支持感知模式控制。
-子代理无独立 UMO（继承调用方会话），`perception_rules` 按 UMO 子串无法区分子代理，
-故本地页面工具仅支持**工具参数级**控制：可选参数 `perception=text|text_image|image`
-（大小写不敏感，可省略；缺省或非法值时跟随全局 `page_perception`，再回落
-text_image）。全文本子代理（前端/测试/工程等）读取本地 HTML 文档、报错页时传
-`perception="text"`，仅做页面文本提取——跳过截图与识图调用，零识图耗时/token
-开销、不落盘截图文件；`text_image` 为默认（文本 + 截图识图）；`image` 以截图识图
-为主、页面文本为辅（识图缓存正常生效）。例：`browse_local_page(path=..., perception="text")`。
-
-## 🚀 使用示例
-
-群聊中直接说：
-
-- 「打开 https://example.com 看看是什么」
-- 「在这个页面上帮我填表提交」
-- 「把这个页面上的图片都下载发我」
-- 「打开这个网址，把页面上所有的商品价格读出来」
-
-## 🧪 开发与测试
-
-```bash
-cd astrbot_plugin_browser_llm
-PYTHONDONTWRITEBYTECODE=1 python -m pytest tests/ -q -p no:cacheprovider   # 1128 passed（2026-10-26，v1.7.0）
-/root/AstrBot/.venv/bin/ruff check .                                        # All checks passed!
-```
-
-测试覆盖（`tests/test_*.py` **50** 个文件 / **1128** 条用例；`tests/` 目录 .py 文件 **51** 个，含 `conftest.py`）：
-
-- **工具契约**：`browse_web` / `browse_local_page` / `browser_web_search` 的 docstring
-  与注册一致性、参数类型、入口装饰器白名单（`test_main_contract.py`、
-  `test_search_tool_contract.py`、`test_search_tool_toggle.py`）。
-- **搜索链路**：provider 实现与错误码（`test_search_providers.py`）、并行波次/去重合并/
-  缓存/冷却/预算（`test_search_service_parallel.py`）、HTTP 传输层与抓正文逐跳 SSRF
-  （`test_search_http_transport.py`）、配置 schema 与服务端一致性
-  （`test_search_config_schema.py`）、迁移器 v4 四种来源/幂等/回滚
-  （`test_search_migration_v4.py`）。
-- **配置**：schema ⇄ `KEY_MAP` ⇄ `main.py` 读取点三方一致（`test_core_config_map.py`、
-  `test_core_config_readpoints.py`、`test_qa_complement.py`）。
-- **后台执行链路**（v1.5.0 新增 `test_background_tools.py`，1568 行）：T1–T7 判据
-  （`off` 逐字节一致 / 立即返回 / 四态终态各一条消息 / 同会话单飞 <1s 拒绝 /
-  `terminate()` 不悬挂 / schema⇄KEY_MAP⇄读取点三方一致）+ F1 模式热更新、F2 媒体
-  仅成功态、F3 终态日志带 `status=`、D2 全局 4 并发；`all` 模式下的六类**同步拒绝**
-  （会话黑名单 / 含 `perception=` 前缀的禁词 / 路径不存在 / 扩展名错误 / 路径越权 /
-  搜索工具黑名单会话）、搜索终态的人读化与 `status` 映射（H1/H2）、`artifact_sink`
-  只允许出现在任务体内的 AST 守卫、投递异常后仍能再次提交（R7）；另有受理/拒绝/终态
-  文案、六前缀互斥、截断、登记表纯单测。
-- **双引擎链路**（v1.6.0 新增 `test_background_engine.py`，45 条）：E1 默认 `off × plugin`
-  与 v1.5.0 逐字节一致 + `resolve_effective_engine` 真值表；E2 置标志矩阵
-  （`engine=core` 下只有 `browse_web` 置真，`all × core` 也不放开 L/S；`off`/`plugin`
-  从不探测）；E3 重载重放（`func_list` 重建后新对象仍置真、入口触发的置位、同签名
-  至多探测一次）；E4 探测 fail-closed（"原始 True / 包装 False"的降级、包装器缺失、
-  拿不到 tool manager、同步器永不抛异常）；E5 互斥（`core` 期间插件登记表恒空、
-  `off × core` 不产生登记项）；E6 C 模式返回体（前缀 + 截断、错误文本不加前缀、
-  媒体块在截断之后仍完整、JSON 类工具永不进 C 执行体、媒体块条数有界）；E7 配置
-  五方一致（配置叶 45 条、非法 `engine` fail-closed、归一化）；E8 版本/默认值守卫（代码侧；
-  文档与代码的逐字对照由 `verification/` 探针另行覆盖）；E9 媒体边界 A（`event.send` 零调用、前台路径仍会发、
-  发布失败回落原路径、清理覆盖发布根）。
-- **内嵌子代理（v1.7.0 新增）**：`test_v170_provider_select.py`（8 格决策表 + "只有一个 provider 解析点"的
-  **AST** 判据）、`test_v170_entry_contract.py`（三入口语义、`browse_local_page` 不进子代理的三条理由）、
-  `test_v170_persona.py`（三档 × 四条取文本路径；L0 在前、L4 在后的顺序断言；人格文本不落日志）、
-  `test_v170_image_native.py`（影像原生：40 张上限、>1.5e6 丢图、压缩尺寸、只读截图目录）、
-  `test_v170_ledger.py`（台账确定性 + 前缀归类）、`test_v170_budget.py`（预算三层与截断）、
-  `test_v170_search_mode.py`（内外置两模式 + `inactivated_llm_tools` 写入/移出）、
-  `test_v170_matrix.py`（搜索模式 × 后台两键的正交矩阵）、`test_v170_primitives.py`（内层工具面 v2）、
-  `test_v170_no_rename.py`（外层工具名不改 + 装饰器 AST 守卫）、
-  `test_v170_security_probes.py`（新入口不绕过禁词/白名单/SSRF）。
-- **配置 v5（v1.7.0）**：`test_v170_config_v5_counts.py`（**配置叶 54 条 / JSON 叶子键 55 个**双口径、
-  45/46 冻结快照、9 条新增叶、0 改名）、迁移器 v5 的四模式与"不打印配置值"。
-- **事故回归（v1.6.1）**：`test_vision_cache.py` 重写（28 条，含 SPA 事故时间线两档 TTL）、
-  `test_interaction_primitives_v161.py`（41 条：多匹配 `index`、按钮式选项降级、失败候选 top-5）。
-- **文档⇄代码（v1.7.0）**：`test_v170_docs_vs_code.py` 钉住版本四处一致、工具面 26/27、
-  两种叶数口径与"必须带单位"、迁移器四模式、人格三档与搜索两模式在文档里都有落点。
-- **安全**：SSRF（含 DNS 与重定向）、禁词三处链路、点击/新标签/媒体嗅探行为级拦截。
-- **浏览**：感知模式前缀/规则/优先级、识图缓存与 provider 降级链、本地页面工具
-  （白名单/路径穿越/降级文本）、会话与标签页、浏览器资源清理。
-- **仓库卫生**（v1.4.0 新增 `test_repo_hygiene.py`）：已删模块/副本不得复活、
-  `core/delivery.py` 只含 artifact 三件套、`SearchService` 无串行入口、
-  数据目录走 `_resolve_data_dir()`、`main.py` 无"重复插件检测" WARN 块。
-
-发布流程（**v1.7.0 只走到第 2 步**）：commit → 推特性分支 → （用户授权后）合并 `main` → 打 tag（如 `v1.7.0`）
-→ release.yml 自动打包发布（zip 已排除 `dist/`、`.github/`、`data/`、`__pycache__`）。
-v1.7.0 交付时**未**合并 `main`、**未**打 tag、**未**部署生产 —— 这三件事都要用户显式授权，见交付摘要。
 
 ## 🤝 致谢
 

@@ -179,18 +179,16 @@ def test_repeat_guard_threshold_comes_from_config(tmp_path):
     assert getattr(state.guard, "threshold", None) == 7, "阈值必须来自 actions.repeat_guard"
 
 
-def test_deliver_once_reaches_the_registry_gate(tmp_path):
+def test_deliver_once_leaf_is_gone_and_gate_is_hardwired(tmp_path):
+    """t12 R4：`tools.deliver_once` 已删除 —— U2 的"每任务恰好一条"是**硬不变量**，
+    不做开关（保留它会让人以为"关掉就会重复投递"，而实际 tool 通道根本没有第二
+    次投递的调用方）。所以这里断言：① 叶不存在；② registry 上没有该开关。"""
+    from astrbot_plugin_browser_llm.core import background as bg
+
     plugin = _plugin(tmp_path)
-    plugin.deliver_once = False
-    asyncio.run(
-        plugin._submit_background(
-            event=helpers._FakeEvent(),
-            tool_name=main_module._BROWSE_WEB_TOOL_NAME,
-            runner=_ok_runner,
-            task_text="x",
-        )
-    )
-    assert plugin._watchdog.registry.deliver_once is False, "开关必须落到投递闸"
+    assert not any("deliver_once" in path for path in config_map.KEY_MAP), "叶必须已删除"
+    assert not hasattr(plugin, "deliver_once"), "main.py 不该再读这个键"
+    assert not hasattr(bg.BackgroundRegistry(), "deliver_once"), "registry 不该留开关"
 
 
 async def _ok_runner(_progress):
@@ -210,9 +208,96 @@ def test_narrow_tools_filters_and_warns(tmp_path, caplog):
     assert set(names) == set(main_module.INNER_TOOL_NAMES), names
 
 
-def test_isolate_context_switch_changes_page_claim(tmp_path):
-    src = (ROOT / "main.py").read_text(encoding="utf-8")
-    assert 'getattr(self, "isolate_context", True)' in src, "isolate_context 必须影响控制流"
+class _Page:
+    """最小 Page 桩：`goto`/`close`/`is_closed` + 一个自增 id。"""
+
+    _next = 1
+
+    def __init__(self, rec):
+        self.id = _Page._next
+        _Page._next += 1
+        self.rec = rec
+        self.url = "about:blank"
+        self.closed = False
+        rec["created"].append(self)
+
+    async def goto(self, url, **_kwargs):
+        self.url = url
+
+    async def close(self):
+        self.closed = True
+        self.rec["closed"].append(self.id)
+
+    def is_closed(self):
+        return self.closed
+
+
+class _Browser:
+    """SessionManager 需要的最小 BrowserCore（`new_page`）。"""
+
+    def __init__(self, rec):
+        self.rec = rec
+        self.browser_type = "chromium"  # `validate_browser_type` 认这个字符串
+        self.context = None
+
+    async def new_page(self):
+        return _Page(self.rec)
+
+    async def close_page(self, page):
+        """SessionManager 的关页走 `browser.close_page`（不是 `page.close`）。"""
+        await page.close()
+
+
+def _real_sessions(rec):
+    from astrbot_plugin_browser_llm.core.session import SessionManager
+
+    return SessionManager(_Browser(rec), max_pages=8, idle_timeout=60)
+
+
+def _two_tasks(plugin, event):
+    """跑两个不同任务（两次 reset_task 之间换 task_key），返回两次拿到的 page。"""
+    import asyncio
+
+    async def _run():
+        pages = []
+        for _ in range(2):
+            plugin.reset_task(plugin._umo_of(event), budget_s=30)
+            page, err = await plugin._get_page(event)
+            assert page is not None and err == "", err
+            pages.append(page)
+        return pages
+
+    return asyncio.run(_run())
+
+
+def test_isolate_context_on_switches_page_per_task(tmp_path):
+    """`isolate_context=true`（默认）：换任务换页，旧页被关。"""
+    plugin = _plugin(tmp_path)
+    plugin.isolate_context = True
+    rec = {"created": [], "closed": []}
+    plugin.sessions = _real_sessions(rec)
+    event = helpers._FakeEvent()
+    first, second = _two_tasks(plugin, event)
+    assert first.id != second.id, "开隔离时换任务必须换页"
+    assert first.closed, "旧任务的页必须被关掉"
+    assert len(rec["created"]) == 2
+
+
+def test_isolate_context_off_reuses_the_same_page(tmp_path):
+    """`isolate_context=false`：**跨任务复用同一张页**（这是开关的真效果）。
+
+    风险见规格勘误 E10：上一任务的表单值/滚动位置/登录态会带进下一任务，
+    且 mark/ref 纪元仍按任务作废 ⇒ 旧编号失效、页面却还是那一张。
+    """
+    plugin = _plugin(tmp_path)
+    plugin.isolate_context = False
+    rec = {"created": [], "closed": []}
+    plugin.sessions = _real_sessions(rec)
+    event = helpers._FakeEvent()
+    first, second = _two_tasks(plugin, event)
+    assert first is second, "关隔离时必须复用同一张页"
+    assert not first.closed
+    assert len(rec["created"]) == 1, "只应创建过一张页"
 
 
 def test_perception_rules_pick_screenshot_policy(tmp_path):
@@ -232,7 +317,6 @@ def test_every_hot_switch_leaf_is_read_in_control_flow():
     hot_switches = {
         "actions.repeat_guard": "repeat_guard_limit",
         "actions.trusted_events": "trusted_events",
-        "tools.deliver_once": "deliver_once",
         "tools.isolate_context": "isolate_context",
         "tools.narrow_tools": "narrow_tools",
         "perception.screenshot_to_chat": "screenshot_to_chat",
@@ -310,6 +394,24 @@ def test_task_state_never_evicts_a_budgeted_state(tmp_path):
     for index in range(80):
         plugin._task_state(f"idle-{index}")
     assert plugin._tasks.get("live") is live, "有预算在身的状态被踢掉了"
+
+
+def test_task_state_eviction_is_lru(tmp_path):
+    """R31：淘汰按 `last_used` 升序（最久未用先出），而不是按插入序。"""
+    import time as _time
+
+    plugin = _plugin(tmp_path)
+    plugin._tasks = {}
+    oldest = plugin._task_state("oldest")
+    oldest.last_used = _time.monotonic() - 10_000
+    newest = plugin._task_state("newest")
+    newest.last_used = _time.monotonic()
+    # 再塞 64 个，触发淘汰
+    for index in range(64):
+        state = plugin._task_state(f"filler-{index}")
+        state.last_used = _time.monotonic() - 5_000
+    assert plugin._tasks.get("newest") is newest, "最近使用的状态不该被淘汰"
+    assert plugin._tasks.get("oldest") is None, "最久未用的状态应先被淘汰"
 
 
 def test_same_session_second_browse_is_rejected(tmp_path):

@@ -143,8 +143,8 @@ def test_schema_and_leaf_table_are_in_sync():
 
     schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8-sig"))
     assert set(schema) == set(config_map.GROUPS), "schema 顶层组与 LEAVES 分组必须逐一对应"
-    assert len(config_map.KEY_MAP) == 58
-    assert len(config_map.JSON_LEAF_KEYS) == 60
+    assert len(config_map.KEY_MAP) == 57
+    assert len(config_map.JSON_LEAF_KEYS) == 59
     # 每个 v6 叶都能在 schema 里找到（schema_leaf 只有一个事实源）
     missing = [leaf.path for leaf in config_map.LEAVES
                if config_map.schema_leaf(schema, leaf.path) is None]

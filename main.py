@@ -509,6 +509,8 @@ class _TaskState:
     task_key: str = ""
     #: 本任务的墙钟截止时刻（monotonic；0 = 没有预算，不显示【预算】行）
     deadline: float = 0.0
+    #: 最后使用时刻（monotonic；R31：淘汰策略按它做 LRU，而不是按插入序）
+    last_used: float = 0.0
 
 
 def _make_browser_tool(plugin: "BrowserLLMPlugin", spec: dict):
@@ -940,9 +942,6 @@ class BrowserLLMPlugin(Star):
         self.background_mode: str = mode
         self.background_max_chars: int = _clamp(
             self._as_int(view.get("tools.background_max_chars", 1500), 1500), 200, 8000
-        )
-        self.deliver_once: bool = self._as_bool(
-            view.get("tools.deliver_once", True), True
         )
         self.dedupe_window_s: int = _clamp(
             self._as_int(view.get("tools.dedupe_window_s", 600), 600), 0, 86400
@@ -1791,14 +1790,6 @@ class BrowserLLMPlugin(Star):
             dedupe_window_s=float(self.dedupe_window_s),
             max_parallel=int(self.max_parallel),
         )
-        # R4：tools.deliver_once 决定"每任务恰好一条主动投递 + 一条终态"的闸
-        # 是否生效（生产必须开；关掉只用于对照实验）。
-        try:
-            self._watchdog.registry.deliver_once = bool(
-                getattr(self, "deliver_once", True)
-            )
-        except Exception:  # noqa: BLE001 — 老的 registry 没有该属性也不该炸
-            pass
         logger.info(
             f"[{self.metadata_name}] 后台提交 tool={tool_name} "
             f"kind={handle.decision.kind} task_id={handle.task_id or '-'} "
@@ -2045,9 +2036,12 @@ class BrowserLLMPlugin(Star):
                     )
                     text = f"【错误】浏览任务超过 {budget:.0f} 秒硬上限被中止{hint}"
                     if isinstance(progress, dict):
-                        # R11：超时也要把半成品与步数交给终态（规格 §6.2/§6.7）
+                        # R11：超时也要把半成品、步数与台账交给终态（§6.2/§6.7）
                         progress["partial"] = text
                         progress["steps"] = int(steps)
+                        progress["ledger"] = agent_core.render_ledger(
+                            scoped.ledger, int(self.ledger_max_lines)
+                        )
                     if background:
                         # R22：本工具自己的超时不能被记成"完成" —— 抛出去让
                         # watchdog 的 _run 映射成 STATUS_TIMEOUT。
@@ -2384,12 +2378,15 @@ class BrowserLLMPlugin(Star):
                 return None, str(e)
         umo = self._umo_of(event)
         state = self._task_state(umo)
-        # R4：tools.isolate_context 真正影响控制流 —— 关掉时不按任务换页
-        # （跨任务复用同一张页面，等于放弃"上下文隔离"，生产中默认开启）。
-        task_key = state.task_key if bool(getattr(self, "isolate_context", True)) else ""
-        page = await self.sessions.claim_page(
-            umo, task_key=str(task_key or state.task_key or umo)
-        )
+        # `tools.isolate_context` 真正影响控制流（t12 R4 的返工）：开 = 按任务换页
+        # （新任务关旧页）；关 = **跨任务复用同一张页**，task_key 退化成 umo 常量，
+        # `claim_page` 因此永远不会触发换页。风险见 errata E10（上一任务的表单值/
+        # 滚动位置/登录态会带进下一任务，且 mark/ref 纪元仍按任务作废 ⇒ 旧编号失效）。
+        if bool(getattr(self, "isolate_context", True)):
+            claim_key = str(state.task_key or umo)
+        else:
+            claim_key = str(umo)
+        page = await self.sessions.claim_page(umo, task_key=claim_key)
         if page is None:
             return None, "会话数已达上限或页面创建失败，请稍后再试"
         return page, ""
@@ -2437,6 +2434,8 @@ class BrowserLLMPlugin(Star):
             tasks = {}
             self._tasks = tasks
         state = tasks.get(umo)
+        if state is not None:
+            state.last_used = time.monotonic()  # R31：LRU 的"最后使用"要真的被更新
         if state is None:
             if len(tasks) > 64:  # 长跑实例的任务表不该无限增长
                 # R20：按"最后使用时间"淘汰**空闲**状态（deadline==0）；绝不踢掉
@@ -2453,7 +2452,8 @@ class BrowserLLMPlugin(Star):
                 # （0 = 关闭重复守卫，由 RepeatGuard 自己处理 <=0）。
                 guard=vf.RepeatGuard(
                     threshold=int(getattr(self, "repeat_guard_limit", 3))
-                )
+                ),
+                last_used=time.monotonic(),
             )
             tasks[umo] = state
         return state

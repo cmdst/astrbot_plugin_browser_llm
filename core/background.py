@@ -354,10 +354,6 @@ class BackgroundRegistry:
         self.clock: Callable[[], float] = clock or time.monotonic
         self.max_parallel = max(1, int(max_parallel))
         self.dedupe_window_s = max(0.0, float(dedupe_window_s))
-        #: R4：``tools.deliver_once``（默认开）。关掉 = 投递闸不计数（只给对照实验
-        #: 用，会重复投递）；生产默认必须开 —— 它是"每任务恰好一条主动投递 + 一条
-        #: 终态"的唯一实现处。
-        self.deliver_once = True
 
     def next_task_id(self) -> str:
         """短 task_id（``bg-0001`` 起自增；单实例内唯一）。"""
@@ -558,8 +554,6 @@ class BackgroundRegistry:
             job = self._jobs.get(task_id) or self._done.get(task_id)
             if job is None:
                 return False
-            if not getattr(self, "deliver_once", True):
-                return True
             if channel == DELIVERY_CHANNEL_TERMINAL:
                 if job.terminal_sent >= MAX_TERMINAL_DELIVERIES:
                     logger.warning("重复终态投递被拦截 task_id=%s（终态只允许一条）", task_id)

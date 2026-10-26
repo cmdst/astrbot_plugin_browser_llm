@@ -35,8 +35,8 @@ MIGRATOR = (ROOT / "tools" / "migrate_config_v6.py").read_text(encoding="utf-8")
 
 EXPECTED_VERSION = "v1.7.5"
 EXPECTED_OUTER = ("browse_web", "browse_local_page", "browser_web_search")
-EXPECTED_LEAVES = 58
-EXPECTED_JSON_LEAVES = 60
+EXPECTED_LEAVES = 57
+EXPECTED_JSON_LEAVES = 59
 MIGRATOR_MODES = ("--dry-run", "--apply", "--verify", "--restore-from", "--strip-v6")
 
 
@@ -99,8 +99,8 @@ def test_config_counts_match_docs_with_units():
     assert len(_flatten(SCHEMA)) == EXPECTED_JSON_LEAVES, "JSON 叶子键必须是 60"
     assert EXPECTED_JSON_LEAVES - EXPECTED_LEAVES == 2, "差 2 = resources.viewport 1↔3"
     for name, text in (("README", README), ("CHANGELOG", CHANGELOG)):
-        assert "配置叶 58 条" in text, f"{name} 缺「配置叶 58 条」"
-        assert "JSON 叶子键 60 个" in text, f"{name} 缺「JSON 叶子键 60 个」"
+        assert "配置叶 57 条" in text, f"{name} 缺「配置叶 58 条」"
+        assert "JSON 叶子键 59 个" in text, f"{name} 缺「JSON 叶子键 60 个」"
     assert "resources.viewport" in README
 
 
@@ -197,7 +197,7 @@ def test_readme_current_part_documents_v175_surface():
         assert module in current, f"README 现行部分缺六层模块 {module}"
     for tool in ("browse_observe", "browse_act", "browse_screenshot", "browse_media", "browse_search"):
         assert tool in current, f"README 现行部分缺内层工具 {tool}"
-    assert "配置叶 58 条" in current and "JSON 叶子键 60 个" in current
+    assert "配置叶 57 条" in current and "JSON 叶子键 59 个" in current
     assert "【需要网址】" in current, "必须写清无起始页后的行为"
     assert "退役" in current or "无 core 引擎" in current
     # 58 叶键表：每个组都在现行部分出现
@@ -209,3 +209,58 @@ def test_readme_history_section_is_marked_and_reachable():
     history = _readme_history_section()
     assert "v1.7.0 及更早" in history
     assert "一律以前者为准" in history or "以其为准" in history
+
+
+# ------------------------------------------------ R25：动作清单/视图/前缀必须"生成式"校验
+
+
+def test_readme_action_list_is_generated_from_action_spec():
+    """R25：README 的 16 动作清单必须是 `ACTION_SPEC` 的镜像（手抄必错）。"""
+    from astrbot_plugin_browser_llm.core import action_model
+
+    current = _readme_current_section()
+    names = [spec.name.lower() for spec in action_model.ACTION_SPEC]
+    assert len(names) == 16, names
+    for name in names:
+        assert f"`{name}`" in current, f"README 现行部分缺动作 {name}"
+    # 反向：只查"动作清单那一段"，不许残留旧清单（`links`/`media` 是 observe 视图
+    # 与工具名，不能全局禁）
+    para_start = current.index("16 个动作")
+    para = current[para_start : para_start + 500]
+    for stale in ("`uncheck`", "`wait_for`", "`links`", "`media`", "`hover``"):
+        assert stale not in para, f"README 的动作清单残留了 {stale}"
+
+
+def test_readme_observe_views_match_code():
+    """R25：`browse_observe` 的视图名必须与代码常量一致。"""
+    import main as m
+
+    current = _readme_current_section()
+    for view in m.OBSERVE_VIEWS:
+        assert f"`{view}`" in current, f"README 缺 observe 视图 {view}"
+    assert "`compact`" not in current, "`compact` 不是合法视图（v1.7.5 是 structure/text/links/full）"
+
+
+def test_readme_act_prefix_matches_code():
+    """R25：`browse_act` 的返回前缀在文档与代码里必须一致（代码是【动作】）。"""
+    current = _readme_current_section()
+    assert "【动作】" in current, "README 必须写对 browse_act 的前缀"
+    assert "【执行】" not in current, "【执行】是旧前缀，代码已改成【动作】"
+
+
+def test_readme_current_part_has_no_legacy_numbers():
+    """R25：现行部分不许再出现 v1.7.0 的数字/文件名（1128、50 文件、54 叶、v3/v4 迁移器）。"""
+    current = _readme_current_section()
+    for stale in ("1128", "配置叶 54 条", "migrate_config_v3", "migrate_config_v4"):
+        assert stale not in current, f"README 现行部分仍有旧现状：{stale}"
+    # 测试文件数必须与磁盘一致
+    on_disk = len(list((ROOT / "tests").glob("test_*.py")))
+    assert f"{on_disk} 个 `test_*.py`" in current, f"README 的测试文件数必须写 {on_disk}"
+
+
+def test_changelog_test_numbers_are_not_stale():
+    """R8：CHANGELOG 里的门禁条数必须是本轮实数（不许留上一轮的 770/775/776）。"""
+    section = _v175_changelog_section()
+    for stale in ("770 passed", "775 passed", "776 passed", "781 passed"):
+        assert stale not in section, f"CHANGELOG v1.7.5 节仍有旧数字 {stale}"
+    assert "783 passed" in section, "CHANGELOG 必须写本轮实数（781 passed）"

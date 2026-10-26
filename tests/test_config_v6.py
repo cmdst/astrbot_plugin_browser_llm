@@ -5,7 +5,7 @@
 
 1. **不漏叶**：``_conf_schema.json`` 展平后的叶子键 ⇄ ``core.config_map.KEY_MAP``
    ⇄ ``spec/v175-config-keys.json`` 三方向逐键相等（两个方向都比，缺一个就红）；
-2. **口径**：**配置叶 58 条** = **JSON 叶子键 60 个**（差 2 = ``resources.viewport``
+2. **口径**：**配置叶 57 条** = **JSON 叶子键 59 个**（差 2 = ``resources.viewport``
    1↔3），且 v5/v4/v3 的冻结视图不跟着漂移（54 / 45 / 25）；
 3. **用户点名的十项**逐条落地：模型合并、页面感知重做、资源与限制重做、搜索引擎精简、
    起始页移除、代理统一（搜索例外）、分辨率统一、总超时统一、取消步数上限、
@@ -77,7 +77,7 @@ from core.config_map import (
 ROOT = Path(__file__).resolve().parent.parent
 SCHEMA: dict = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8-sig"))
 
-#: v6 的 58 条路径（**冻结**，顺序 = schema 声明顺序）。这是规格键表的镜像，
+#: v6 的 57 条路径（**冻结**，顺序 = schema 声明顺序）。这是规格键表的镜像，
 #: 内嵌在这里是为了"没有 spec/ 目录时结构守卫照样跑"。
 EXPECTED_PATHS: tuple[str, ...] = (
     "resources.engine",
@@ -134,7 +134,6 @@ EXPECTED_PATHS: tuple[str, ...] = (
     "security.session_blacklist",
     "tools.background_mode",
     "tools.background_max_chars",
-    "tools.deliver_once",
     "tools.dedupe_window_s",
     "tools.isolate_context",
     "tools.narrow_tools",
@@ -196,12 +195,12 @@ def test_schema_leaf_keys_equal_frozen_contract():
     config_leaves = [
         f"{group}.{leaf}" for group, meta in SCHEMA.items() for leaf in meta["items"]
     ]
-    assert len(config_leaves) == 58, f"配置叶应为 58 条，实际 {len(config_leaves)}"
+    assert len(config_leaves) == 57, f"配置叶应为 57 条，实际 {len(config_leaves)}"
     assert set(config_leaves) - set(EXPECTED_PATHS) == set(), "schema 多出未登记的配置叶"
     assert set(EXPECTED_PATHS) - set(config_leaves) == set(), "schema 缺少规格要求的配置叶"
     # 展平口径（JSON 叶子键）是另一件事：60 个，多出来的 2 个全在 resources.viewport
     flattened = schema_leaf_keys()
-    assert len(flattened) == 60
+    assert len(flattened) == 59
     assert set(flattened) - set(config_leaves) == {
         "resources.viewport.width",
         "resources.viewport.height",
@@ -216,7 +215,7 @@ def test_key_map_matches_schema_bijective():
         assert meta["type"] == "object", group
         for leaf in meta["items"]:
             schema_paths.append(f"{group}.{leaf}")
-    assert len(schema_paths) == 58, "配置叶应为 58 条（object 叶按 1 条计）"
+    assert len(schema_paths) == 57, "配置叶应为 57 条（object 叶按 1 条计）"
     assert set(KEY_MAP) - set(schema_paths) == set(), "KEY_MAP 多出 schema 里没有的路径"
     assert set(schema_paths) - set(KEY_MAP) == set(), "KEY_MAP 缺少 schema 里的路径"
     assert list(KEY_MAP) == schema_paths, "KEY_MAP 顺序必须与 schema 声明顺序一致"
@@ -224,10 +223,10 @@ def test_key_map_matches_schema_bijective():
 
 
 def test_two_counting_conventions():
-    """配置叶 58 条 = JSON 叶子键 60 个；差 2 全部来自 resources.viewport。"""
-    assert len(KEY_MAP) == 58
-    assert len(schema_leaf_keys()) == 60
-    assert len(JSON_LEAF_KEYS) == 60
+    """配置叶 57 条 = JSON 叶子键 59 个；差 2 全部来自 resources.viewport。"""
+    assert len(KEY_MAP) == 57
+    assert len(schema_leaf_keys()) == 59
+    assert len(JSON_LEAF_KEYS) == 59
     assert set(JSON_LEAF_KEYS) == set(schema_leaf_keys())
     assert 60 - 58 == 2
     viewport = leaf_meta("resources.viewport")
@@ -347,8 +346,8 @@ def test_v5_disposition_arithmetic():
     assert len(V5_DROPPED_PATHS) == 8
     # v6 58 = 承接 43（46 个 v5 键落到 43 个叶）+ 新增 15
     assert len(CARRIED_PATHS) == 43
-    assert len(CONFIG_V6_NEW_PATHS) == 15
-    assert 43 + 15 == 58
+    assert len(CONFIG_V6_NEW_PATHS) == 14
+    assert 43 + 14 == 57
     assert len(V6_MERGED_PATHS) == 4
     # 7 个 merge 源落到 4 个叶上
     merge_sources = [p for p, (a, _t) in V5_DISPOSITION.items() if a == MIGRATION_MERGE]
@@ -535,8 +534,7 @@ def test_tools_group_background_governance():
     assert LEAF_ORDER["tools"] == (
         "background_mode",
         "background_max_chars",
-        "deliver_once",
-        "dedupe_window_s",
+                "dedupe_window_s",
         "isolate_context",
         "narrow_tools",
     )
@@ -597,7 +595,7 @@ def test_effect_timing_three_buckets():
     assert set(EFFECT_TIMING.values()) == {EFFECT_HOT, EFFECT_NEW_CONTEXT, EFFECT_IMPORT}
     counts = {name: sum(1 for value in EFFECT_TIMING.values() if value == name)
               for name in (EFFECT_HOT, EFFECT_NEW_CONTEXT, EFFECT_IMPORT)}
-    assert counts == {EFFECT_HOT: 53, EFFECT_NEW_CONTEXT: 1, EFFECT_IMPORT: 4}
+    assert counts == {EFFECT_HOT: 52, EFFECT_NEW_CONTEXT: 1, EFFECT_IMPORT: 4}
     assert EFFECT_TIMING["security.block_internal_ip"] == EFFECT_NEW_CONTEXT
     assert effect_of("resources.engine") == EFFECT_IMPORT
     assert effect_of("nope.nope") is None
@@ -607,7 +605,7 @@ def test_effect_timing_three_buckets():
 def test_no_flat_paths_are_declared():
     """39 条"无 v3 扁平旧键"的路径必须与 KEY_MAP 的 None 一一对应。"""
     assert set(NO_FLAT_PATHS) == {path for path, flat in KEY_MAP.items() if flat is None}
-    assert len(NO_FLAT_PATHS) == 39
+    assert len(NO_FLAT_PATHS) == 38
     assert len(FLAT_KEYS) == 25
     v6_flats = {flat for flat in KEY_MAP.values() if flat}
     assert len(v6_flats) == 19, "25 个扁平旧键只落到 19 个 v6 叶上"
@@ -639,9 +637,10 @@ def test_config_view_reads_nested_v6_paths():
     view = ConfigView({"resources": {"max_tabs": 7}, "search": {"engine": "百度搜索"}})
     assert view.get("resources.max_tabs") == 7
     assert view.lookup("search.engine") == ("百度搜索", True)
-    value, found = view.lookup("tools.deliver_once")
+    # 已删除的叶（t12 R4：`tools.deliver_once` 不做开关）读出来必须是"没这一项"
+    value, found = view.lookup("tools.nope_not_a_leaf")
     assert found is False and value is None
-    assert view.get("tools.deliver_once", "default") == "default"
+    assert view.get("tools.nope_not_a_leaf", "default") == "default"
     # 扁平兜底仍可用（v3 旧键名），且嵌套优先
     flat_view = ConfigView({"max_pages": 9})
     assert flat_view.get("resources.max_tabs") == 9

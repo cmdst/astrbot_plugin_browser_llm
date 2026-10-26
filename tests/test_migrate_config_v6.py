@@ -3,7 +3,7 @@
 对应规格 §7.6 的迁移器契约与 §7.9 的判据 5–6。四条主线：
 
 1. **可迁移**：v5（54 叶）/ v4（45 叶）/ 扁平 v3（25 键）都能一次吃到 v6
-   （7 组 / 58 叶），且**迁移结果键集 == v6 schema 键集**（drop 键不残留）；
+   （7 组 / 57 叶），且**迁移结果键集 == v6 schema 键集**（drop 键不残留）；
 2. **五模式**：``--dry-run`` / ``--apply`` / ``--verify``（``--against`` 严格、
    ``--baseline`` 43 承接叶 + 15 新叶）/ ``--restore-from``（逐字节）/ ``--strip-v6``，
    退出码与写盘行为逐条钉住；
@@ -189,9 +189,9 @@ def test_migrate_v5_produces_exact_v6_keyset():
     migrated = mig.migrate(v5_config())
     paths = set(leaves_of(migrated))
     assert paths == schema_paths()
-    assert len(paths) == 58
+    assert len(paths) == 57
     assert set(migrated) == set(GROUPS)
-    assert sum(len(group) for group in migrated.values()) == 58
+    assert sum(len(group) for group in migrated.values()) == 57
     # 组内叶顺序 = schema 声明顺序（迁移器按它写盘，避免核心白写一次配置）
     for group, meta in SCHEMA.items():
         assert list(migrated[group]) == list(meta["items"]), group
@@ -312,12 +312,12 @@ def test_silent_mode_is_inverted():
 
 
 def test_flat_v3_and_grouped_v4_inputs_migrate_to_v6():
-    """链式迁移：扁平 v3（25 键）/ 分组 v4（45 叶）都能一次吃到 v6（58 叶）。"""
+    """链式迁移：扁平 v3（25 键）/ 分组 v4（45 叶）都能一次吃到 v6（57 叶）。"""
     for config in (flat_v3_config(), v4_config()):
         migrated = mig.migrate(config)
         paths = set(leaves_of(migrated))
         assert paths == schema_paths()
-        assert len(paths) == 58
+        assert len(paths) == 57
     # 扁平 v3 里 browser.type 等旧键名搬到了 v6 叶上
     leaves = leaves_of(mig.migrate(flat_v3_config()))
     assert leaves["resources.engine"] == "chromium"
@@ -517,8 +517,8 @@ def test_dry_run_on_empty_config_is_ok(capsys):
     rc = run_cli("--dry-run", "--config", os.devnull)
     out = capsys.readouterr().out
     assert rc == 0
-    assert "RESULT mode=dry-run keys=58 groups=7" in out
-    assert "new=15" in out
+    assert "RESULT mode=dry-run keys=57 groups=7" in out
+    assert "new=14" in out
 
 
 # ---------------------------------------------------------------------------
@@ -640,15 +640,14 @@ def test_migrator_does_not_import_astrbot():
 def test_coerce_types_reports_paths_only():
     canonical = {
         "resources.max_tabs": "7",
-        "tools.deliver_once": "off",
+        "tools.narrow_tools": "off",
         "perception.rules": "not-a-list",
         "resources.engine": "firefox",
     }
     out, fixed, failed = mig.coerce_types(canonical)
     assert out["resources.max_tabs"] == 7
-    assert out["tools.deliver_once"] is False
     assert out["perception.rules"] == "not-a-list"  # 不做类型归一
-    assert fixed == ["resources.max_tabs", "tools.deliver_once"]
+    assert fixed == ["resources.max_tabs", "tools.narrow_tools"]
     assert failed == []
 
 
