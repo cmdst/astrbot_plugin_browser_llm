@@ -413,7 +413,6 @@ def test_t4_plugin_own_failure_is_still_reported_as_failure():
     text = message_text(ctx.sent[0][1])
     assert text.startswith(HEADERS[STATUS_FAILED]), text
     assert "无法确定当前对话模型" in text
-    assert "无法确定当前对话模型" in text
 
 
 def test_t4_cancelled_sends_interrupt_message():

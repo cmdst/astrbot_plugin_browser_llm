@@ -181,7 +181,10 @@ def test_task_timeout_returns_error_with_steps(monkeypatch):
     plugin.agent_task_timeout = 1
     out = _run(plugin._browse_web_run(_Event(), "长任务", "text"))
     assert out.startswith("【错误】浏览任务超过 1 秒硬上限被中止")
-    assert "已完成 0 步" in out
+    # T12/R13：0 步时不再写「已完成 0 步，见台账」（台账块是空串 ⇒ 那是断链），
+    # 改成如实说明"还没产生任何工具调用"；有步数时才写「已完成 N 步，见台账」。
+    assert "尚未产生任何内层工具调用" in out
+    assert "见台账" not in out
 
 
 def test_cancelled_browser_error_is_swallowed_as_error_text():

@@ -634,6 +634,8 @@ def test_v4_model_text_always_prefixed_at_source():
     执行体的工具），不会再被页面回声触发。
     """
     src = (main_module._PLUGIN_DIR / "main.py").read_text(encoding="utf-8")
-    assert "text = agent_core.with_untrusted_prefix(text)" in src, "源侧必须加前缀"
-    assert "meta[\"plugin_failure\"] = plugin_failure" in src.replace("'", "\"")
+    # T12/R12：前缀套的是**整段 payload**（【注意】+ 结论），不是只套结论 ——
+    # 这样前缀永远在整段返回体的第一个字节（首行语义）。
+    assert "payload = agent_core.with_untrusted_prefix(payload)" in src, "源侧必须加前缀"
+    assert 'meta["plugin_failure"] = plugin_failure' in src
     assert "plugin_failure" in src

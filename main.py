@@ -3038,14 +3038,18 @@ class BrowserLLMPlugin(Star):
                 parts.append(C_UNTRUSTED_PREFIX)
                 body = prefixed[len(C_UNTRUSTED_PREFIX) :].lstrip("\n")
         parts.append(body)
-        if ok_text:
-            ledger_block = agent_core.render_ledger(
-                meta.get("ledger"), min(int(self.agent_ledger_max_lines), _C_MODE_LEDGER_MAX_LINES)
-            )
-            if ledger_block:
-                # 台账在**截断之后**拼接（理由见 docstring）：它有独立行数上限，
-                # 不受 ``background_max_chars`` 裁切。
-                parts.append(ledger_block)
+        ledger_block = agent_core.render_ledger(
+            meta.get("ledger"),
+            min(int(self.agent_ledger_max_lines), _C_MODE_LEDGER_MAX_LINES),
+        )
+        if ledger_block:
+            # 台账在**截断之后**拼接（理由见 docstring）：它有独立行数上限，
+            # 不受 ``background_max_chars`` 裁切。
+            #
+            # R13（round 2）：**失败态也拼**。``_browse_web_run`` 的超时文案写着
+            # "（已完成 N 步，见台账）" —— 旧实现只给成功态台账，于是"见台账"
+            # 指向一个不存在的块（断链）。失败时那几步恰恰是唯一线索。
+            parts.append(ledger_block)
         if paths and ok_text:
             # 媒体只附成功态（与 v1.5.0 同口径）；媒体块同样在截断之后拼接，
             # 否则绝对路径会被砍断（"媒体只给路径"方案的致命细节）。
@@ -3244,7 +3248,14 @@ class BrowserLLMPlugin(Star):
             #    说明把它钉成"原文"，否则人读起来仍像插件在报错（旧 test_t4 的
             #    关切仍然成立，只是判定依据从"文本前缀"换成了"结构化来源"）。
             stripped = body[len(C_UNTRUSTED_PREFIX) :].lstrip("\n")
-            if stripped.startswith(_TRUSTED_LOOKING_PREFIXES):
+            # R12（round 2 的第二个后果）：payload 现在可能是
+            # `【注意】…\n\n【错误】…`（通知行在模型结论之前），所以不能只看
+            # 整段开头 —— 只要**任何一行**以"像插件的错误前缀"开头就加消歧说明。
+            if any(
+                line.startswith(_TRUSTED_LOOKING_PREFIXES)
+                for line in stripped.splitlines()
+                if line.strip()
+            ):
                 stripped = f"{_ECHO_NOTE}\n{stripped}"
             return STATUS_OK, stripped, ""
         if tool_name != _SEARCH_TOOL_NAME:
@@ -3543,7 +3554,8 @@ class BrowserLLMPlugin(Star):
             # 「不可信外部内容」前缀（规格 §1.2.3）。前缀由执行体在**源侧**加
             # （见 ``_browse_web_run`` 的 ``meta`` 契约）：这样"这是模型说的话"
             # 是结构化事实，不必靠嗅探文本前缀 —— 页面回声以【错误】开头时也
-            # 不会被误判成插件自己的失败（评审 R6/V4）。这里的 wrap 是幂等的。
+            # 不会被误判成插件自己的失败（评审 R6/V4）。前缀由执行体在源侧加，
+            # 这里**不再** wrap 一次（R15：那层 wrap 曾是死代码，注释还谎称"幂等"）。
             meta: dict = {}
             body = await self._browse_web_run(
                 event, task_input, perception_mode, meta=meta
@@ -3558,11 +3570,6 @@ class BrowserLLMPlugin(Star):
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{self.metadata_name}] browse_web 执行异常: {e}")
             return f"【错误】浏览器子代理执行失败：{e}"
-
-    @staticmethod
-    def _with_untrusted_prefix(text: str) -> str:
-        """给前台返回体套「不可信外部内容」前缀（错误/拒绝不加）。"""
-        return agent_core.with_untrusted_prefix(text)
 
     async def _browse_web_run(
         self,
@@ -3625,6 +3632,14 @@ class BrowserLLMPlugin(Star):
                 self._rebuild_browser_toolset()
             decision = await self._resolve_agent_provider(event)
             if not decision.ok:
+                # R11（round 2 回归）：配置错误（内层 provider 未加载/被删/缺
+                # tool_use）也是**插件自述的失败**，必须经结构化通道告知调用方。
+                # 旧实现直接 return，C 模式拿不到 plugin_failure ⇒ 把这段
+                # 【错误】当成模型结论套上「不可信外部内容」前缀，唤醒轮看到的是
+                # "外部网页说的错误"，而真相是"你自己配置错了"。
+                if meta is not None:
+                    meta["plugin_failure"] = True
+                    meta["ledger"] = None
                 return decision.error
             base_instruction = self._build_subagent_instruction(perception_mode)
             instruction = await self._compose_inner_prompt(
@@ -3659,9 +3674,17 @@ class BrowserLLMPlugin(Star):
                     text = text or "（浏览器子代理未返回内容）"
                 except asyncio.TimeoutError:
                     plugin_failure = True
+                    # R13：文案里承诺"见台账"就必须真的有台账 —— 0 步时台账块
+                    # 是空串（``render_ledger`` 对无条目的 Ledger 返回 ""），
+                    # 再写"见台账"就是断链。
+                    steps = scoped.ledger.steps
+                    hint = (
+                        f"（已完成 {steps} 步，见台账）"
+                        if steps
+                        else "（尚未产生任何内层工具调用）"
+                    )
                     text = (
-                        f"【错误】浏览任务超过 {budget:.0f} 秒硬上限被中止"
-                        f"（已完成 {scoped.ledger.steps} 步，见台账）"
+                        f"【错误】浏览任务超过 {budget:.0f} 秒硬上限被中止{hint}"
                     )
                 except Exception as e:  # noqa: BLE001 — 取消/浏览器已关等
                     logger.warning(
@@ -3678,13 +3701,20 @@ class BrowserLLMPlugin(Star):
             if meta is not None:
                 meta["plugin_failure"] = plugin_failure
                 meta["ledger"] = ledger_obj
-            parts: list[str] = []
+            # R12（round 2 回归）：**先拼 payload，再整体套一次前缀**。
+            # 旧实现是"先给结论套前缀、再把【注意】插到它前面"，两个后果：
+            # ① 前台成功返回体的**首行**变成【注意】，把「不可信外部内容」挤出
+            #    第一行（规格 §1.2.3 要求前缀首行，唤醒轮/主 LLM 靠它分流）；
+            # ② plugin 引擎后台的人读终态以【注意】开头 ⇒
+            #    ``_background_user_text`` 的 ``startswith(C_UNTRUSTED_PREFIX)``
+            #    不再命中 ⇒ 模型侧前缀残留、回声消歧失效。
+            # 一处改动同时修好两条：前缀永远是整段 payload 的第一个字节。
+            payload = "\n\n".join(
+                part for part in (decision.notice, text) if part and not plugin_failure
+            ) or text
             if not plugin_failure:
-                # 源侧加前缀（幂等）：下游不必再猜"这句话是谁说的"。
-                text = agent_core.with_untrusted_prefix(text)
-            if decision.notice and not plugin_failure:
-                parts.append(decision.notice)
-            parts.append(text)
+                payload = agent_core.with_untrusted_prefix(payload)
+            parts: list[str] = [payload]
             if meta is None:
                 # 直接调用者（含 plugin 引擎后台 runner）：照旧自带台账。
                 ledger_block = agent_core.render_ledger(
@@ -4545,6 +4575,38 @@ class BrowserLLMPlugin(Star):
             logger.warning(f"[{METADATA_NAME}] browse_get_text 失败: {e}")
             return f"【错误】提取正文失败：{e}"
 
+    def _filter_banned_link_lines(self, links: str, note: bool = True) -> str:
+        """按 ``security.banned_words`` **逐行**过滤链接列表（R16）。
+
+        与 ``browse_get_interactive`` 完全同口径：命中的那一行被丢弃并计数
+        （``note=True`` 时附一行说明），其余行原样保留、**编号不变**——编号是
+        ``browse_click_link(index=…)`` 的唯一落点，重排会让模型点错链接。
+
+        Args:
+            links: ``extract_links`` 产出的 ``[n] 文本 → url`` 多行文本。
+            note: 是否在输出末尾追加"另有 N 个链接命中禁词"的说明行。
+                ``browse_click_link`` 解析时传 ``False``（说明行不是链接）。
+        """
+        body = str(links or "")
+        if not body:
+            return body
+        kept: list[str] = []
+        dropped = 0
+        for line in body.splitlines():
+            # 说明行 / 超限提示行原样保留。
+            if not line.startswith("["):
+                kept.append(line)
+                continue
+            if self._check_banned(line):
+                dropped += 1
+                continue
+            kept.append(line)
+        if dropped and note:
+            kept.append(
+                f"（另有 {dropped} 个链接的文本命中禁词，已按 security.banned_words 略去）"
+            )
+        return "\n".join(kept)
+
     async def browse_get_links(
         self, event: AstrMessageEvent, max_items: int = 0
     ) -> str:
@@ -4566,7 +4628,10 @@ class BrowserLLMPlugin(Star):
                 links = await self.extractor.extract_links(page, max_links=limit)
                 if not links:
                     return "当前页面没有可点击的链接。"
-                return links
+                # R16（round 2）：与 browse_get_interactive 同一口径 —— 逐行过禁词、
+                # **丢掉命中的那一条并计数**，不整段拒绝（整段拒绝会让页面上出现一个
+                # 违禁词就把"看链接→点链接"这条动线废掉）。
+                return self._filter_banned_link_lines(links)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{METADATA_NAME}] browse_get_links 失败: {e}")
             return f"【错误】提取链接失败：{e}"
@@ -4585,6 +4650,9 @@ class BrowserLLMPlugin(Star):
                 links = await self.extractor.extract_links(
                     page, max_links=int(self.max_links)
                 )
+                # R16：与 browse_get_links 用**同一个**过滤器，否则被丢掉的条目会
+                # 让 index 与模型看到的编号错位（模型点 [3]，这里按未过滤列表取第 3 条）。
+                links = self._filter_banned_link_lines(links, note=False)
                 # 健壮解析（v1.3.1）：链接可见文本可能含换行（innerText 保留
                 # 换行），若按 splitlines 整段解析，编号行会被换行拆散导致
                 # 无法还原 target。改为按「换行 + 编号行开头」切分条目——

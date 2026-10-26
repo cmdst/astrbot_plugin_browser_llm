@@ -385,9 +385,22 @@ def extract_persona_text(system_prompt: str | None) -> str:
     if pos < 0:
         return ""
     rest = text[pos + len(PERSONA_MARKER) :]
-    cut = rest.find("\n\n#")
-    if cut >= 0:
-        rest = rest[:cut]
+    # R14（round 2）：切界**不能**用 `\n\n#`（会连 `## 语气设定` 这种人格自带的
+    # 二级标题一起切掉 —— 而"规则/默认选人格"时 ``conversation.persona_id`` 为空，
+    # 这条回退路径是**常见路径**，不是边缘情况）。只认两件事：
+    #   ① 核心真正追加的那一段：``\n\n## Skills``；
+    #   ② 一级标题 ``\n\n# ``（带空格）：将来核心若再追加新段也切得干净，
+    #      而 `## x` 因为 `#` 后面不是空格，不会误命中。
+    cuts = [
+        idx
+        for idx in (
+            rest.find("\n\n## Skills"),
+            rest.find("\n\n# "),
+        )
+        if idx >= 0
+    ]
+    if cuts:
+        rest = rest[: min(cuts)]
     return rest.strip()
 
 
