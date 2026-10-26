@@ -94,7 +94,7 @@ def test_orphan_data_assets_are_gone():
     """
     gi = (ROOT / ".gitignore").read_text(encoding="utf-8")
     assert "data/" in gi
-    for rel in ("main.py", "core/search.py", "core/crawler.py", "tools/migrate_config_v4.py"):
+    for rel in ("main.py", "core/search.py", "core/crawler.py", "tools/migrate_config_v6.py"):
         src = (ROOT / rel).read_text(encoding="utf-8")
         assert "t2i" not in src, f"{rel} 不应引用 t2i 模板"
         assert "cmd_config" not in src, f"{rel} 不应读取核心 cmd_config"
