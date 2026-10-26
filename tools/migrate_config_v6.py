@@ -240,7 +240,15 @@ def latest_backup(path: Path | str, tag: str = "pre-v6") -> Path | None:
         source.parent.glob(f"{source.name}.bak-{tag}-*"),
         key=lambda item: item.stat().st_mtime,
     )
-    return candidates[-1] if candidates else None
+    # R12：只认**非 v6 形态**的备份（v6 备份当基线会让校验恒真）。
+    for item in reversed(candidates):
+        try:
+            data = read_config(item)
+        except Exception:  # noqa: BLE001 — 读不了的备份跳过
+            continue
+        if not is_migrated(data):
+            return item
+    return None
 
 
 def fingerprint(value: Any) -> str:
@@ -708,6 +716,11 @@ def diff_values(left: dict, right: dict) -> list[str]:
     return sorted(path for path in common if l6[path] != r6[path])
 
 
+def baseline_is_v6(baseline: dict) -> bool:
+    """基线是否已经是 v6 形态（R12：这种基线做校验没有意义）。"""
+    return bool(is_migrated(baseline))
+
+
 def baseline_report(actual: dict, baseline: dict) -> dict[str, Any]:
     """``--verify --baseline`` 的判定：**43 条承接叶值不变 + 15 条新叶存在**。
 
@@ -716,6 +729,7 @@ def baseline_report(actual: dict, baseline: dict) -> dict[str, Any]:
     15 条新叶的**值**允许是默认或被运营改过（新键本来就没有"迁移前值"），
     只要求"存在"。
     """
+    # R12：基线若已经是 v6，`migrate(v6)==v6` 让本函数恒真 ⇒ 必须在调用方拒绝。
     expected = migrate(baseline, allow_unknown=True)
     a6, _a5, _au = flatten(actual)
     e6, _e5, _eu = flatten(expected)
@@ -974,7 +988,18 @@ def run(args: argparse.Namespace) -> int:
                 )
                 _emit_result(args, config=actual, rc=RC_REFUSE)
                 return RC_REFUSE
-            report = baseline_report(actual, read_config(baseline_path))
+            baseline_data = read_config(baseline_path)
+            if baseline_is_v6(baseline_data):
+                # R12：基线已是 v6 ⇒ 校验恒真，必须明确拒绝（不能静默 OK）
+                print(
+                    f"[ERR] --baseline {baseline_path.name} 已经是 v6 形态："
+                    "用 v6 配置当基线等于校验自己（恒真）。请指定 v5/v4/v3 的备份，"
+                    "或改用 --verify --against <期望文件>。",
+                    file=sys.stderr,
+                )
+                _emit_result(args, config=actual, rc=RC_REFUSE)
+                return RC_REFUSE
+            report = baseline_report(actual, baseline_data)
             bad = bool(
                 report["value_diff"]
                 or report["carried_missing"]
@@ -1098,7 +1123,9 @@ def run(args: argparse.Namespace) -> int:
         return RC_OK
 
     target.parent.mkdir(parents=True, exist_ok=True)
-    saved = backup(target, "pre-v6") if target.is_file() else None
+    # R12：**幂等就不备份** —— 否则"再跑一次 apply 确认幂等"会留下一个 v6 内容的
+    # `*.bak-pre-v6-*`，随后 `--verify --baseline` 挑中它，43 叶值校验就恒真。
+    saved = backup(target, "pre-v6") if (target.is_file() and changed) else None
     if changed:
         write_atomic(target, payload)
         wrote = 1
