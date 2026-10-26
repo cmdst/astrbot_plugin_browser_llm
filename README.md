@@ -2,12 +2,42 @@
 
 Agent 驱动的网页浏览插件 —— 让 LLM 通过 function-calling 自主浏览网页：导航、搜索、点击链接、填表、滚动、截图识图、下载媒体，无需用户手动指令。
 
-当前版本：**v1.7.0**（变更见 [CHANGELOG](./CHANGELOG.md)；v1.7.0 是**破坏性重构** —— 主 LLM 只做委派，网页交互/爬取/搜索由插件**内置的多模态子代理**承接；配置结构 v5：**7 组 / 配置叶 54 条 = JSON 叶子键 55 个**（旧 6 组 / 配置叶 45 条 / JSON 叶子键 46 个）。`v1.6.0` 是**已上生产**的版本，因此本次抬 minor 而不是发 patch）
+当前版本：**v1.7.5**（变更见 [CHANGELOG](./CHANGELOG.md)；v1.7.5 是**破坏性架构重做** —— 感知/动作/执行/验证四层整体换栈：CDP A11y 树 + 结构化动作 + Playwright locator + CDP 受信任事件 + 操作后验证，截图仅兜底且必须叠 Set-of-Mark 编号；内层工具 **26 → 5**；配置结构 **v6**：**7 组 / 配置叶 58 条 = JSON 叶子键 60 个**；平台原生后台引擎按 spec §6.6 退役。外层三个工具名一字未改）
 
-> **看不懂「配置叶 54 条 = JSON 叶子键 55 个」？** 这是同一份 schema 的两种数法，两个都对，差 1 恒来自
-> `browser.viewport`（**1 条复合叶 ↔ 2 个 JSON 叶子键**）。说「配置叶 / 键条目」用 54；说「配置文件里有几个键 /
-> schema 展平几个」用 55。定义与复算命令见规格 `spec/20261026-v170-embedded-agent-spec.md` §6.1a。
-> v1.6.0 的对应值是 **配置叶 45 条 / JSON 叶子键 46 个**。
+> **看不懂「配置叶 58 条 = JSON 叶子键 60 个」？** 这是同一份 schema 的两种数法，两个都对，差 2 恒来自
+> `resources.viewport`（**1 条复合叶 ↔ 3 个 JSON 叶子键**：`width` / `height` / `device_scale_factor`）。
+> 说「配置叶 / 键条目」用 **58**；说「配置文件里有几个键 / schema 展平几个」用 **60**。
+> v5（v1.7.0）的对应值是 配置叶 54 条 / JSON 叶子键 55 个；v4 是 45 / 46。
+
+## 🧱 v1.7.5 架构：六层，每层一个事实源
+
+| # | 层 | 模块 | 一句话职责 |
+| --- | --- | --- | --- |
+| ① | 感知 | `core/a11y.py` | CDP `Accessibility.getFullAXTree` → 裁剪 → `- [role] name (state)`；文本通道；SoM 截图与 mark 表 |
+| ② | 动作 | `core/action_model.py` | 16 个动作 + JSON Schema + `R-A1..R-A14` 拒绝码（唯一闸门） |
+| ③ | 执行 | `core/executor.py` | target → Playwright locator（定位阶梯）+ CDP `Input.*` 受信任事件 |
+| ④ | 验证 | `core/verify.py` | expect / 六类差分 / `【无变化】` / 重复守卫 / 观测块**唯一**渲染处 |
+| ⑤ | 后台 | `core/background.py` | 任务表 + 整链墙钟看门狗 + `task_key` 去重 + `deliver_once` + 模板终态 |
+| ⑥ | 配置 | `core/config_map.py` | v6 叶子唯一事实源 + `ConfigView` + v5 冻结视图 |
+
+**工具面**：外层 3 个（`browse_web` / `browse_local_page` / `browser_web_search`，名字不变）+ 内层 5 个
+（`browse_observe` / `browse_act` / `browse_screenshot` / `browse_media` / `browse_search`）。
+内层模型每步只输出**一个**动作对象，例：`{"action":"click","target":{"role":"button","name":"提交"}}`、
+`{"action":"type","target":{"label":"搜索"},"value":"北京 天气","submit":true}`。
+
+**配置迁移（顺序写死：先迁配置、再换代码；配置与代码成对回滚）**：
+
+```bash
+python tools/migrate_config_v6.py --dry-run        # 1) 干跑：只看键名计划
+python tools/migrate_config_v6.py --apply          # 2) 落盘（自动再备份 + 原子替换）
+python tools/migrate_config_v6.py --verify --baseline   # 3) 复核承接叶值 + 新叶
+python tools/migrate_config_v6.py --restore-from <备份>  # 回滚：逐字节恢复
+python tools/migrate_config_v6.py --strip-v6       # 只删 v6 新叶（成对回滚的第一步）
+```
+
+**为什么必须先迁配置**：v6 schema 会把 schema 之外的键判为 stale 从配置里删掉 —— `search.providers` 的
+`api_key` 一旦被删就是**永久丢失（不可恢复）**。只回滚其一（只回代码或只回配置）会静默丢设置，因此
+**配置与代码必须成对回滚**。
 
 ## ✨ 功能特性
 
@@ -17,11 +47,11 @@ Agent 驱动的网页浏览插件 —— 让 LLM 通过 function-calling 自主�
 - **内层人格三档（v1.7.0）**：`agent.persona_mode = default / current / custom` —— 默认只有工具提示词、`current` 注入当前会话人格、`custom` 用自定义提示词；三层只改语气，**结构上改不了红线、工具清单与输出契约**，见下文「内层人格三档」
 - **确定性执行台账（v1.7.0）**：`browse_web` 的返回体末尾附 `【执行台账】`，由插件按**真实发生**的工具调用生成（内层模型改不了），并给成功正文加 `【不可信外部内容】` 前缀 —— 页面里的"指令"不会被当成指令执行
 - **完整网页交互**：打开网页、提取正文/链接、按文本/坐标/选择器点击、填表、按键、滚动、滑块、下拉框、复选框、标签页管理；v1.6.1 起多匹配控件可指定 `index`，失败时给「相近可点击文本 top-5」；v1.7.0 新增 `browse_get_interactive`（枚举可交互元素，含可直接点 `selector`）与 `browse_click_selector`（给上面那份枚举一个确定性落点）
-- **识图辅助**：接入多模态模型对截图做视觉理解，支持区域裁剪放大识图（`browse_zoom_crop`）
-- **媒体嗅探**：从页面嗅探图片/视频资源，下载并发送到群聊（`browse_sniff_media`）
+- **看图兜底（Set-of-Mark）**：`browse_screenshot` 给可点元素叠编号，模型只回编号不回坐标；`target` 给元素时只截该元素局部（旧 `browse_zoom_crop` 的能力并入这一个工具）
+- **媒体嗅探**：从页面嗅探图片/视频资源，下载并发送到群聊（`browse_media`，旧名 `browse_sniff_media`）
 - **本地页面自检**：`browse_local_page` 渲染查看本地 HTML 供子代理/开发者自检页面（无头渲染 + 截图 + 视觉描述，视觉不可用时降级文本提取；路径白名单为工作区（AstrBot 工作区 + 平台工作区，如 `/root/workspace`）+ 插件 data 目录，可用环境变量 `BROWSER_LLM_EXTRA_LOCAL_ROOTS`（按系统路径分隔符分隔，Linux/macOS 为冒号、Windows 为分号）追加额外根目录；支持 `perception` 参数按任务控制感知方式——全文本子代理读文档/报错页可传 `perception="text"` 跳过截图识图）
-- **静默模式**：浏览截图仅内部识图，不往群聊刷图（`silent_mode`）
-- **感知模式精细化**：页面感知方式可精确控制——`browse_web` 参数级前缀 `perception=text|text_image|image` 按任务覆盖、`perception_rules` 按会话（UMO 子串匹配）设定默认、全局 `page_perception` 兜底；全文本子代理（前端/测试等）不再为每次浏览付出截图识图开销
+- **截图是否进群聊**：`perception.screenshot_to_chat`（v5 的 `silent_mode` **取反**：默认 false = 不进群聊；SoM 图始终会交给内层模型，留不留在会话里由这个键决定）
+- **页面感知**（v6）：不再有 text/text_image/image 三档"感知模式"——结构视图永远是主通道，`perception.screenshot_fallback`（默认开）只决定**截图兜底**能不能用；`perception.rules` 仍可按会话（UMO）做细粒度设定
 - **识图缓存（v1.6.1 换键，事故修复）**：缓存键从「同 URL」升级为**七元组** —— `(会话, 规范化URL, 工具种类, 裁剪参数, **图像内容哈希**, 提示词哈希, provider 哈希)`；同一 URL 换了画面**不再**返回旧描述。`vision_cache_ttl` 内同画面重复识图仍复用结果（带 `[缓存]` 前缀），`0` = 关闭
 - **配置热更新**：会话黑白名单、内容禁词、内网拦截开关、截图开关、识图 Provider、感知规则、内层模型/人格档/搜索模式等修改后无需重启，下次工具调用即生效（Dashboard 保存即同步）
 - **后台异步执行（v1.5.0，默认关闭）**：`tools.background_mode` 打开后，`browse_web` / `browse_local_page` / `browser_web_search` 三个 LLM 工具**立刻**返回「已受理 + task_id」，真正的任务在后台跑，结果**单独作为一条消息**发到本会话（四态前缀、部分结果规则、并发上限、回滚见下文「后台异步执行」一节）；默认 `off` 与 v1.4.0 行为一致

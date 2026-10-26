@@ -4,6 +4,79 @@
 `data/` 目录（主仓库 .gitignore 忽略）迁移初始化而来。仅跟踪插件源码与测试，运行时
 数据（`data/`：截图、运行时配置、临时文件）一律不入库。
 
+## [v1.7.5] - 2026-10-27
+
+> **为什么抬到 `v1.7.5`**：本版是**破坏性架构重做**（感知/动作/执行/验证四层整体换栈、内层工具面 26 → 5、
+> 配置结构 v5 → v6、平台原生后台引擎退役）。外层三个工具名一字未改（生产人格按名硬白名单），但**内层工具面、
+> 配置键、后台投递机制都变了**，因此按语义化版本抬 minor，并把 v1.7.5 记为本轮架构冻结的终点版本号。
+
+### 破坏性变更（升级前必读）
+
+1. **感知换栈：CDP A11y 树成为唯一状态来源**。`browse_get_interactive` / `browse_click_selector` 那条
+   "DOM 枚举 → 给模型 selector → 按 selector 点"的链路**整条删除**（它是 D1/D8 的根因：`Page.evaluate`
+   只接受一个位置参数，v1.6.0 的三个注入 JS 传了三个，生产上必然 `TypeError`）。现在给模型的是
+   `- [role] name (state)` 结构视图，截图只作**兜底**且必须叠 Set-of-Mark 编号。
+2. **动作换栈：16 个结构化动作 + Playwright locator + CDP 受信任事件**。模型每步只输出**一个**动作对象
+   （`{"action":"click","target":{"role":"button","name":"提交"}}`），插件侧做定位阶梯
+   （role/label/text/testid/css/mark）→ 受信任事件 → **操作后验证**（期望 / 六类差分 / `【无变化】` /
+   重复守卫）。像素坐标不再是模型接口：无文本元素走 `browse_screenshot` 的 mark 编号。
+3. **内层工具 26 → 5**：`browse_observe` / `browse_act` / `browse_screenshot` / `browse_media` /
+   `browse_search`（外层仍是 `browse_web` / `browse_local_page` / `browser_web_search`，名字不变）。
+   被替代的旧内层方法（`browse_open` / `browse_get_text` / `browse_click_text` / `browse_click_coords` /
+   `browse_checkbox` / `browse_input` / `browse_select_option` / `browse_set_slider` / `browse_press_key` /
+   `browse_scroll` / tab 系列 …）**删除而不是保留薄壳**。
+4. **配置结构 v6**：7 组 / **配置叶 58 条** = **JSON 叶子键 60 个**（差 2 = `resources.viewport` 1 ↔ 3）。
+   v5 的 54 键里 26 keep / 12 rename / 1 move / 4 merge 目标（7 源）/ 8 drop；`agent.*` 组并入 `model.*`，
+   识图 provider 与内层子代理模型**合并为 `model.provider_id` 一个键**（caption 兜底整条删除）。
+   `silent_mode` 改名并**取反**为 `perception.screenshot_to_chat`；`browser.timeout` 一分为
+   `resources.goto_timeout_s` / `resources.action_timeout_s`；`limits.agent_max_steps` **取消**（预算只按墙钟）。
+5. **平台原生后台引擎（`tools.background_engine=core`）退役**：U1（3600s 硬编码 + 无墙钟唤醒轮）、
+   U3（人格工具集 merge）、U4（共享 `conv.history`）三项缺陷全在核心侧、插件侧无法闭环，因此只保留插件自管引擎。
+   **这是行为变化**：生产现值 `all × core` 升级后**变成 `all × plugin`**，投递由「核心唤醒一轮主 LLM 生成」
+   变为「**插件模板生成的一条终态消息**」（四态前缀 + task_id + 耗时 + 可选附件，`deliver_once` 限死 1 条）。
+   不再需要核心补丁，也不再写 `is_background_task`。
+6. **起始页移除**：v5 的 `browser.default_url` 删除。没有显式网址且会话里没有活页面时，`browse_web`
+   回`【需要网址】…`并**不打开任何默认站点**（不再静默开百度）。
+
+### 迁移（顺序写死：先迁配置、再换代码）
+
+```bash
+# 0) 手工备份插件目录 + 配置（迁移器也会备份，这一步保证"换代码前一定存在备份"）
+# 1) 干跑：只看计划（叶数/分组/改名/合并/删除的键名，不看值）
+python tools/migrate_config_v6.py --dry-run
+# 2) 落盘：自动再备份 + 原子替换 + 保 BOM/0600
+python tools/migrate_config_v6.py --apply
+# 3) 复核：43 条承接叶值不变 + 15 条新叶存在
+python tools/migrate_config_v6.py --verify --baseline
+# 4) 到此配置已是 v6（配置叶 58 条 / JSON 叶子键 60 个）；下一步才换代码
+# 5) 换代码：覆盖插件目录 → WebUI 重载插件（不是重启服务）
+```
+
+- 迁移器**五模式**：`--dry-run` / `--apply` / `--verify` / `--restore-from`（逐字节回滚）/ `--strip-v6`。
+- **必须配置先动、代码后换，且配置与代码成对回滚**：v6 schema 会把 schema 之外的键判为 stale 从配置里**删掉**
+  （`search.providers` 的 `api_key` 一旦被删就是**永久丢失**，不可恢复）。只回滚其一会静默丢设置。
+- 历史迁移链（v3 → v4 → v5）的脚本与用例按 spec 判定**退役**：本版只保留 v6 单跳（v3/v4/v5 形态都能被
+  `migrate_config_v6.py` 直接读入并迁到 v6，无需链式中转）。
+
+### 修复（ops 报错合集 D1–D9）
+
+- **D1/D8**：三个注入 JS（`maxItems/roleFilter`、`x/y`、候选枚举）整条删除；新增 AST 门禁
+  `tests/test_v175_no_multiarg_evaluate.py`（任何 `evaluate` 调用位置实参 > 2 即失败）。
+- **D2**：隐藏节点过滤 + 歧义候选表 + `【无变化】` + 重复守卫（同一动作连续 3 次无变化即拒绝）。
+- **D3/D7**：单步超时与导航超时分开，`elapsed_ms` 固定进返回体；超时但有正文 ⇒ `【超时但有内容】`。
+- **D4/D5/D6**：候选清单/勾选态三路读回（`aria-checked` → 原生 `checked` → `data-state`）/ 输入走
+  `fill` 或 `Input.insertText`（不再 `page.type`）。
+- **D9**：取消路径不吞 `CancelledError`、不 await；关页时同时摘感知层 CDP 会话与执行层缓存。
+
+### 群聊缺陷（U1–U4）
+
+- **U1** 整链墙钟预算：提交时快照 `resources.total_budget_s` 派生 deadline → 执行体 `wait_for(remaining)` →
+  独立看门狗到点取消、再过一个宽限期仍不收尾就补投终态（三层收口，恰好一条终态）。
+- **U2** 去重：`task_key = sha1(umo|tool|规范化任务文本)[:16]`，窗口内重复提交回【重复请求】并附已完成结果；
+  `deliver_once` 把每任务主动投递限死 1 次；结果为空也有模板兜底。
+- **U3** 工具集收窄：后台执行体不 merge 人格工具集、不调用 `send_message_to_user`。
+- **U4** 上下文隔离：后台链不持有 `event`、不读不写会话历史，终态由**确定性模板**渲染。
+
 ## [v1.7.0] - 2026-10-26
 
 > **为什么编号是 `v1.7.0`，而不是在 `v1.6.0` 后面接 `v1.6.1`**：`v1.6.0` 是**已经上了生产**的版本
