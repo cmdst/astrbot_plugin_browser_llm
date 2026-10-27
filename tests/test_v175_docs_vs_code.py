@@ -264,3 +264,50 @@ def test_changelog_test_numbers_are_not_stale():
     for stale in ("770 passed", "775 passed", "776 passed", "781 passed", "783 passed"):
         assert stale not in section, f"CHANGELOG v1.7.5 节仍有旧数字 {stale}"
     assert "785 passed" in section, "CHANGELOG 必须写本轮实数（781 passed）"
+
+
+def test_user_visible_docs_carry_current_leaf_counts():
+    """t18：**用户可见**文档里的配置叶口径必须等于 `config_map` 的实数。
+
+    这类漂移不会被任何功能用例抓到，但插件管理器/插件市场会**原样展示**
+    `metadata.yaml` 的 `desc`（v1.7.5 终稿校验时就在那里发现「58 条 / 60 个」的旧数字）。
+    因此这里按"已知过期串必须绝迹 + 当前口径必须出现"两侧夹住，不用正则抓数字
+    （`58`/`60`/`57`/`59` 在别处有正常用法，正则一定会误伤）。
+    """
+    leaves = len(config_map.LEAVES)
+    json_leaves = len(config_map.JSON_LEAF_KEYS)
+    assert leaves == 57 and json_leaves == 59, (leaves, json_leaves)
+
+    stale = ("58 条", "60 个", "15 条新叶", "15 条 v6 新叶", "58 叶", "60 个 JSON")
+
+    metadata = (ROOT / "metadata.yaml").read_text(encoding="utf-8")
+    current_readme = _readme_current_section()
+    changelog_175 = _v175_changelog_section()
+    migrator = (ROOT / "tools" / "migrate_config_v6.py").read_text(encoding="utf-8")
+
+    # CHANGELOG 允许"点名说这个数字过期并已统一到新值"的行（那是变更记录，
+    # 不是把旧数字当现状展示）；其余三处严格。
+    exempt = ("统一到", "旧口径", "过期", "纠正")
+    for name, text in (
+        ("metadata.yaml", metadata),
+        ("README.md（现行部分）", current_readme),
+        ("CHANGELOG.md（v1.7.5 节）", changelog_175),
+        ("tools/migrate_config_v6.py", migrator),
+    ):
+        for needle in stale:
+            for line in text.splitlines():
+                if needle not in line:
+                    continue
+                if name.startswith("CHANGELOG") and any(word in line for word in exempt):
+                    continue
+                raise AssertionError(f"{name} 仍出现过期口径「{needle}」：{line.strip()[:120]}")
+
+    # 当前口径必须在"用户第一眼看到"的地方出现（metadata desc + README 现行部分）
+    assert f"配置叶 {leaves} 条" in metadata, metadata[:400]
+    assert f"JSON 叶子键 {json_leaves} 个" in metadata
+    assert f"配置叶 {leaves} 条" in current_readme
+    assert f"JSON 叶子键 {json_leaves} 个" in current_readme
+    assert f"配置叶 {leaves} 条" in changelog_175
+    # 迁移器的帮助/文档串必须写 57 叶与 14 条新增叶
+    assert "57 叶" in migrator or "57 leaves" in migrator
+    assert "14 条新叶" in migrator or "14 new paths" in migrator

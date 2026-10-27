@@ -26,9 +26,9 @@
                        **键名** / 未知键名 / 是否幂等
 ``--apply``            先备份（同目录 ``*.bak-pre-v6-<TS>``，0600）-> 原子替换 是      0/2/3
 ``--verify``           ``--against`` 严格（键集合 + 值全等）/ ``--baseline``     否      0/2/3
-                       只要求 43 条承接叶值不变 + 15 条新叶存在
+                       只要求 43 条承接叶值不变 + 14 条新叶存在
 ``--restore-from``     用备份**逐字节**重建（不校验 schema；回滚用）          是      0/2
-``--strip-v6``         删掉 15 条 v6 新叶（无备份时的降级方向）                是*     0/2/3
+``--strip-v6``         删掉 14 条 v6 新叶（无备份时的降级方向）                是*     0/2/3
 =====================  ==================================================  ======  =====
 
 ``*`` ``--strip-v6`` 默认写盘（先备份）；加 ``--dry-run`` 只报计划。
@@ -521,7 +521,7 @@ def migrate(
     - 承接自 v5 的 43 条路径：**值原样搬运**（rename / move 直搬；merge 按
       :data:`MERGE_RULES` 求值）；已存在的 v6 值**只补不覆盖**（尤其
       ``search.providers[*].api_key``）；
-    - v6 新增的 15 条源里没有 ⇒ 取默认值（``core.config_map`` 的同一份默认）；
+    - v6 新增的 14 条源里没有 ⇒ 取默认值（``core.config_map`` 的同一份默认）；
     - v5 的 8 个 drop 键**不写盘**（v6 schema 里没有它们）；
     - 未知键默认拒绝；``allow_unknown=True`` 时原样保留（分组键放回组内）。
     """
@@ -567,7 +567,7 @@ def migrate(
                 fixed.append(path)
         _ = (fixed, failed)  # 报告由 coerce_types() 单独算（保持纯函数无副作用）
 
-    # ④ 缺叶补默认（含 v6 新增的 15 条）
+    # ④ 缺叶补默认（含 v6 新增的 14 条）
     for path in V6_PATHS:
         if path not in filled:
             filled[path] = default_of(path)
@@ -624,7 +624,7 @@ def coerce_types(canonical: dict[str, Any]) -> tuple[dict[str, Any], list[str], 
 
 
 def strip_v6(config: dict) -> dict:
-    """降级方向（无备份时用）：删掉 15 条 v6 新叶，其余（含顺序）原样保留。
+    """降级方向（无备份时用）：删掉 14 条 v6 新叶，其余（含顺序）原样保留。
 
     **注意这不是 v5 降级**：v6 的 46 个键名与 v5 不同（rename/move/merge），
     删掉新叶之后仍是 v6 键名，只有 v1.7.5 代码能加载。真正的降级请用
@@ -722,11 +722,11 @@ def baseline_is_v6(baseline: dict) -> bool:
 
 
 def baseline_report(actual: dict, baseline: dict) -> dict[str, Any]:
-    """``--verify --baseline`` 的判定：**43 条承接叶值不变 + 15 条新叶存在**。
+    """``--verify --baseline`` 的判定：**43 条承接叶值不变 + 14 条新叶存在**。
 
     基线可以是 v5 配置（``.bak-pre-v6-*``）也可以是 v6 配置：都先过一遍
     :func:`migrate` 得到"期望的 v6 值"，再只比 :data:`CARRIED_PATHS`。
-    15 条新叶的**值**允许是默认或被运营改过（新键本来就没有"迁移前值"），
+    14 条新叶的**值**允许是默认或被运营改过（新键本来就没有"迁移前值"），
     只要求"存在"。
     """
     # R12：基线若已经是 v6，`migrate(v6)==v6` 让本函数恒真 ⇒ 必须在调用方拒绝。
@@ -786,7 +786,7 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument(
         "--verify",
         action="store_true",
-        help="与 --against（严格：键 + 值全等）或 --baseline（只查 43 旧叶值 + 15 新叶存在）比对",
+        help="与 --against（严格：键 + 值全等）或 --baseline（只查 43 旧叶值 + 14 新叶存在）比对",
     )
     mode.add_argument(
         "--restore-from",
@@ -852,7 +852,7 @@ def _emit_result(
 
 
 def _print_leaf_fingerprints(config: dict) -> None:
-    """``--verify --baseline`` 的逐叶指纹（43 承接叶 + 15 新叶的存在性）。"""
+    """``--verify --baseline`` 的逐叶指纹（43 承接叶 + 14 新叶的存在性）。"""
     v6, _v5, _unknown = flatten(config)
     for path in CARRIED_PATHS:
         if path in v6:
@@ -1177,7 +1177,7 @@ def run(args: argparse.Namespace) -> int:
         _emit_result(args, config=reread, rc=RC_MISMATCH)
         return RC_MISMATCH
     print(
-        "[OK] post-write verify: 43 carried paths present, 15 new paths present "
+        "[OK] post-write verify: 43 carried paths present, 14 new paths present "
         f"(carried_fingerprint={_subset_fingerprint(on_disk, CARRIED_PATHS)})"
     )
     _emit_result(args, config=reread, rc=RC_OK, idempotent=idempotent)

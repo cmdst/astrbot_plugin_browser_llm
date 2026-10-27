@@ -1,6 +1,6 @@
 name: astrbot_plugin_browser_llm
 display_name: LLM浏览器
-desc: Agent 驱动的网页浏览插件。v1.7.5 起底层架构整体换栈：感知走 CDP A11y 全树（role/name 结构化视图）+ Set-of-Mark 截图兜底，动作走 16 个结构化动作 + Playwright locator 定位 + CDP 受信任事件，每步操作后做确定性验证（期望/差分/无变化/重复守卫）；内层工具 26 → 5（browse_observe / browse_act / browse_screenshot / browse_media / browse_search），外层 3 个工具名不变；配置结构 v6（7 组 / 配置叶 58 条 = JSON 叶子键 60 个）并带五模式迁移器；后台只剩插件自管引擎（平台原生 core 引擎按 spec §6.6 退役），整链墙钟预算 + task_key 去重 + 恰好一条模板终态；截图仅兜底且必须带 Set-of-Mark 编号，像素坐标不再是模型接口。
+desc: Agent 驱动的网页浏览插件。v1.7.5 起底层架构整体换栈：感知走 CDP A11y 全树（role/name 结构化视图）+ Set-of-Mark 截图兜底，动作走 16 个结构化动作 + Playwright locator 定位 + CDP 受信任事件，每步操作后做确定性验证（期望/差分/无变化/重复守卫）；内层工具 26 → 5（browse_observe / browse_act / browse_screenshot / browse_media / browse_search），外层 3 个工具名不变；配置结构 v6（7 组 / 配置叶 57 条 = JSON 叶子键 59 个）并带五模式迁移器（v3/v4/v5 → v6 单跳）；后台只剩插件自管引擎（平台原生 core 引擎按 spec §6.6 退役，每任务恰好一条模板终态），整链墙钟预算 + task_key 去重；截图仅兜底且必须带 Set-of-Mark 编号，像素坐标不再是模型接口。
 short_desc: Agent 自主浏览网页（内嵌多模态子代理）
 version: v1.7.5
 author: AstrBot Community

@@ -46,7 +46,7 @@
 python tools/migrate_config_v6.py --dry-run
 # 2) 落盘：自动再备份 + 原子替换 + 保 BOM/0600
 python tools/migrate_config_v6.py --apply
-# 3) 复核：43 条承接叶值不变 + 15 条新叶存在
+# 3) 复核：43 条承接叶值不变 + 14 条新叶存在
 python tools/migrate_config_v6.py --verify --baseline
 # 4) 到此配置已是 v6（配置叶 57 条 / JSON 叶子键 59 个）；下一步才换代码
 # 5) 换代码：覆盖插件目录 → WebUI 重载插件（不是重启服务）
