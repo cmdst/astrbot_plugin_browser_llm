@@ -523,13 +523,23 @@ def test_browse_web_own_timeout_maps_to_status_timeout(tmp_path, monkeypatch):
             event, "打开 https://example.com/x", progress=progress, background=True
         )
 
+    # v1.7.6：终态投递走 core.active_send（快照 + 平台回退句柄），替身框架注入后
+    # 走"平台找不到 ⇒ event.send 回退"这条分支 —— 正是本用例要看的终态正文。
+    sys.path.insert(0, str(ROOT / "tests"))
+    import test_v176_delivery_parity as v176
+
+    v176.install_framework(monkeypatch)
+    # 别覆盖 `_InnerContext`（内层子代理要用它）；只补投递层要的两件：
+    # 平台表为空 ⇒ 平台找不到 ⇒ 走 event.send 回退，正是本用例要看的终态正文。
+    delivery_ctx = v176.FakeContext(platform_insts=[])
+    plugin.context.send_message = delivery_ctx.send_message
+    plugin.context.platform_manager = delivery_ctx.platform_manager
+
     async def _run() -> object:
         plugin._submit_background  # noqa: B018 — 确认走真实提交路径
         handle = plugin._watchdog.submit(
             runner=_runner,
-            deliver=lambda job, status, body: plugin._deliver_terminal(
-                event, job, status, body
-            ),
+            deliver=plugin._terminal_deliverer(event),
             umo=plugin._umo_of(event),
             tool=main_module._BROWSE_WEB_TOOL_NAME,
             task_text="timeout-case",

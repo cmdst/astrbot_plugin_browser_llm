@@ -41,6 +41,7 @@ from core.background import (
     STATUS_RUNNING,
     STATUS_TIMEOUT,
     TERMINAL_STATUSES,
+    ERROR_DELIVERY_UNREPORTED,
     BackgroundJob,
     BackgroundRegistry,
     BudgetWatchdog,
@@ -694,13 +695,19 @@ def test_deliver_only_once_even_if_finalize_called_twice():
         await settle(handle.task, handle.guard_task)
         await wd._finalize(handle, STATUS_OK, "手工第二次", "", "", deliver_to(sink))
         assert sink.count == 1
-        assert handle.job.terminal_sent == 1
+        assert handle.finalized is True
+        assert handle.outcome is not None
+        # v1.7.6：终态额度由**投递回调自己取**（``main._deliver_terminal`` 调
+        # ``note_delivery(channel="terminal")``）。这里的替身回调不走闸，所以
+        # ``terminal_sent`` 保持 0 —— 「恰好一条」的闸在
+        # ``tests/test_v176_delivery_parity.py`` 里用真投递入口钉住。
+        assert handle.job.terminal_sent == 0
 
     asyncio.run(main())
 
 
-def test_delivery_failure_still_counts_once():
-    """投递抛错不重试也不重发（重试就会变成「多发」）。"""
+def test_delivery_failure_is_recorded_once_and_not_retried():
+    """投递抛错：只试一次、不重发，且**不**冒充发送成功（v1.7.6 记账拆分）。"""
 
     async def main():
         clock = FakeClock()
@@ -719,9 +726,39 @@ def test_delivery_failure_still_counts_once():
             tool="browse_web", task_text="投递失败",
         )
         await settle(handle.task, handle.guard_task)
-        assert attempts["n"] == 1
-        assert handle.outcome.delivered is True  # 计一次，不重试
-        assert handle.job.terminal_sent == 1
+        assert attempts["n"] == 1, "失败不重试（重试 = 多发）"
+        outcome = handle.outcome
+        assert outcome.attempted is True
+        assert outcome.succeeded is False and outcome.accepted_by_platform is False
+        assert outcome.error == "DeliveryError:RuntimeError"
+        assert outcome.sent_via == "none"
+        assert outcome.delivered is False, "这个替身回调不走闸 ⇒ 额度没被消耗"
+        assert handle.job.terminal_sent == 0
+
+    asyncio.run(main())
+
+
+def test_unreported_delivery_is_not_counted_as_success():
+    """旧回调只返回 ``None``：记 ``DeliveryUnreported``，绝不当成"平台已接收"。"""
+
+    async def main():
+        clock = FakeClock()
+        wd = watchdog(clock)
+        sink = Sink()
+
+        async def runner(progress):
+            return "结果"
+
+        handle = wd.submit(
+            runner=runner, deliver=deliver_to(sink), umo=UMO,
+            tool="browse_web", task_text="没回报",
+        )
+        await settle(handle.task, handle.guard_task)
+        assert sink.count == 1
+        outcome = handle.outcome
+        assert outcome.error == ERROR_DELIVERY_UNREPORTED
+        assert outcome.accepted_by_platform is False
+        assert outcome.attempted is True
 
     asyncio.run(main())
 

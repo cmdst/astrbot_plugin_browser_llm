@@ -9,11 +9,22 @@
 ``GRACE`` 仍不收尾就补投终态。三条路径都由 :meth:`BackgroundRegistry.note_delivery`
 收口，所以**恰好一条**终态消息。
 
-**U2 投递归属**：``task_key = sha1(umo|tool|normalize(任务文本))[:16]``，同键任务在
-``dedupe_window_s`` 内只允许一次主动投递（已完成 ⇒ 回【重复请求】并附结果，在跑 ⇒
-回【已受理】）；投递由 :meth:`BackgroundRegistry.note_delivery` 限死（**每任务恰好
-一条主动投递 + 一条终态，硬不变量、不做开关**）；结果为空也发一条模板
-兜底终态（对应核心 "finished, but nothing was sent" 的反向缺口）。
+**U2 投递归属**：``task_key = sha1(umo|tool|normalize(任务文本))[:16]``（"同一措辞"），
+v1.7.6 起再加一条**触发消息 ID 通道** ``trigger_key = sha1(umo|tool|message_id)[:16]``
+（"同一句话"，spec §7）：先查 trigger、再查 task_key；同键任务在 ``dedupe_window_s``
+内只允许一次主动投递（已完成 ⇒ 回【重复请求】并附结果，在跑 ⇒ 回【已受理】）；
+投递由 :meth:`BackgroundRegistry.note_delivery` 限死（**每任务恰好一条主动投递 +
+一条终态，硬不变量、不做开关**）；结果为空也发一条模板兜底终态（对应核心
+"finished, but nothing was sent" 的反向缺口）。
+
+**U2 记账（v1.7.6 拆账）**：投递回调（生产 = ``main._deliver_terminal`` →
+``core.active_send.deliver``）**回报** :class:`core.active_send.DeliveryOutcome`；
+:class:`TerminalOutcome` 把它记在 ``delivery`` 上，并直读 ``attempted`` /
+``succeeded`` / ``accepted_by_platform`` / ``error`` / ``sent_via`` 五字段。
+``delivered`` 保留但**语义收窄**为「终态投递额度被放行过」（恰好一条的闸），
+**不再**代表"发送成功"：闸放行但平台没收到时 ``delivered=True`` 而
+``accepted_by_platform=False``，日志按级分流（未投递 / 投递失败 / 已投递）。
+回调没回报真账（旧回调、测试替身）记 ``error=DeliveryUnreported``，不冒充成功。
 
 **U3/U4**：终态由**确定性模板**渲染（不经 LLM），首行带 ``task_id``/``tool``/耗时；
 本模块不 import astrbot、不持有 event、不读也不写会话历史 —— 后台链没有可自主
@@ -30,11 +41,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 import re
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Iterable
+
+from .active_send import CHANNEL_NONE, DeliveryReceipt
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +94,11 @@ DELIVERY_CHANNEL_TOOL = "tool"  #: 主动投递通道
 DELIVERY_CHANNEL_TERMINAL = "terminal"  #: 终态投递通道
 MAX_TOOL_DELIVERIES = 1  #: 每任务主动投递上限（U2）
 MAX_TERMINAL_DELIVERIES = 1  #: 每任务终态投递上限
+#: 投递回调**没回报真账**（旧回调 / 测试替身）时的占位错误码：
+#: 它不是"发送成功"，只是"没人告诉我们发没发"（v1.7.6 记账拆分）。
+ERROR_DELIVERY_UNREPORTED = "DeliveryUnreported"
+#: 投递回调抛错时的错误码前缀（后面接异常类型名）。
+ERROR_DELIVERY_CALLBACK = "DeliveryError:"
 
 _REASON_LIMIT = 300  # 失败原因展示上限
 _MAX_DONE_RECORDS = 64  # 已完成任务的内存保留上限
@@ -97,6 +116,20 @@ def normalize_task_text(text: Any) -> str:
 def task_key(umo: Any, tool: Any, task_text: Any) -> str:
     """去重键 ``sha1(umo|tool|normalize(text))[:16]``：只留摘要，不留正文。"""
     base = f"{umo or ''}|{tool or ''}|{normalize_task_text(task_text)}"
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()[:16]
+
+
+def trigger_key(umo: Any, tool: Any, message_id: Any) -> str:
+    """触发消息去重键 ``sha1(umo|tool|message_id)[:16]``（spec §7.2）。
+
+    ``message_id`` 取不到（空串 / ``None``）时返回空串 ⇒ 调用方退回
+    :func:`task_key` 的内容指纹语义。**同一句话 = 至多一个后台任务**：模型换个
+    措辞再调一次也能拦住（``task_key`` 拦不住这个）。
+    """
+    raw = str(message_id or "").strip()
+    if not raw:
+        return ""
+    base = f"{umo or ''}|{tool or ''}|{raw}"
     return hashlib.sha1(base.encode("utf-8")).hexdigest()[:16]
 
 
@@ -120,6 +153,22 @@ def truncate_result(text: Any, limit: int) -> tuple[str, bool, int]:
         return raw, False, 0
     omitted = len(raw) - limit
     return raw[:limit] + "\n" + _TRUNCATION_NOTE.format(omitted=omitted), True, omitted
+
+
+def count_artifacts(paths: Any) -> tuple[int, int]:
+    """媒体快照盘点：返回 ``(仍存在, 已缺失)``（v1.7.6 / F-G4 的 ``artifact_count`` 生产者）。
+
+    缺失文件**不拖垮终态**：只计数、进渲染文案，由投递层跳过该附件。
+    """
+    present = missing = 0
+    for path in list(paths or []):
+        if not str(path or "").strip():
+            continue
+        if os.path.isfile(str(path)):
+            present += 1
+        else:
+            missing += 1
+    return present, missing
 
 
 def render_accepted_text(*, task_id: str, tool: str, budget_s: float) -> str:
@@ -255,8 +304,13 @@ class BackgroundJob:
 
     快照（``budget_s`` / ``max_chars`` / ``dedupe_window_s``）在**提交那一刻**复制：
     运行中改配置既不会掐断在跑任务，也不会被放大。任务表口径：``task_id`` /
-    ``umo`` / ``tool`` / ``task_key`` / ``deadline``（属性）/ ``status`` /
-    ``delivered`` / ``result_digest``；聊天正文只在内存，日志与快照只走摘要。
+    ``umo`` / ``tool`` / ``task_key`` / ``trigger_key``（v1.7.6，触发消息 ID 通道）/
+    ``deadline``（属性）/ ``status`` / ``delivered``（工具侧额度）/ ``terminal_sent``
+    （终态额度）/ ``result_digest``；聊天正文只在内存，日志与快照只走摘要。
+
+    ``progress`` 是执行体就地更新的快照通道（v1.7.6 起承载 ``artifacts``：
+    媒体路径由后台执行体登记在这里，投递层只读它拼附件 —— 跨任务的 ContextVar
+    不可靠，快照才是事实源）。
     """
 
     task_id: str
@@ -267,6 +321,7 @@ class BackgroundJob:
     max_chars: int = DEFAULT_BACKGROUND_MAX_CHARS
     task: asyncio.Task | None = field(default=None, repr=False)
     task_key: str = ""
+    trigger_key: str = ""
     dedupe_window_s: float = DEFAULT_DEDUPE_WINDOW_S
     status: str = STATUS_RUNNING
     delivered: int = 0
@@ -301,6 +356,7 @@ class BackgroundJob:
         """进度视图（U1 二次证据）：elapsed / budget / remaining 三件套齐备、无正文。"""
         current = float(now) if now is not None else time.monotonic()
         remaining = 0.0 if self.is_terminal else self.remaining_s(current)
+        present, missing = count_artifacts(self.progress.get("artifacts"))
         return {
             "task_id": self.task_id,
             "tool": self.tool,
@@ -311,6 +367,9 @@ class BackgroundJob:
             "delivered": int(self.delivered),
             "terminal_sent": int(self.terminal_sent),
             "task_key": self.task_key,
+            "trigger_key": self.trigger_key,
+            "artifact_count": present,
+            "artifact_missing": missing,
             "umo_digest": digest_text(self.umo),
             "result_digest": self.result_digest,
         }
@@ -331,6 +390,8 @@ class SubmitDecision:
     task_id: str = ""
     text: str = ""
     duplicate_of: str = ""
+    trigger_hit: bool = False
+    """命中"同一句话"通道（``trigger_key``）——日志据此写 ``kind=duplicate_trigger``。"""
 
     @property
     def accepted(self) -> bool:
@@ -458,7 +519,28 @@ class BackgroundRegistry:
     def find_by_key(
         self, key: str, window_s: float | None = None, *, now: float | None = None
     ) -> BackgroundJob | None:
-        """按去重键找任务：**先看在跑**，再看窗口内刚完成的（取最近一个）。
+        """按 ``task_key``（同一措辞）找任务：**先看在跑**，再看窗口内刚完成的。"""
+        return self._find_match("task_key", key, window_s, now=now)
+
+    def find_by_trigger(
+        self, key: str, window_s: float | None = None, *, now: float | None = None
+    ) -> BackgroundJob | None:
+        """按 ``trigger_key``（同一句话 / 触发消息 ID）找任务（spec §7.2）。
+
+        与 :meth:`find_by_key` 同口径：**在跑的那条永远命中（不受窗口限制）**，
+        已完成的只在 ``window_s`` 内命中；``key`` 为空（没有 message_id）时永远不命中。
+        """
+        return self._find_match("trigger_key", key, window_s, now=now)
+
+    def _find_match(
+        self,
+        field_name: str,
+        key: str,
+        window_s: float | None = None,
+        *,
+        now: float | None = None,
+    ) -> BackgroundJob | None:
+        """去重查找的公共实现（``field_name`` 是 ``task_key`` 或 ``trigger_key``）。
 
         ``window_s <= 0`` ⇒ 关掉「已完成」去重（排障开关，与 ``repeat_guard=0``
         同口径）；「同键正在跑」的那道闸始终生效，它防的是重复提交。
@@ -469,18 +551,32 @@ class BackgroundRegistry:
         current = self.clock() if now is None else float(now)
         with self._lock:
             for job in self._jobs.values():
-                if job.task_key == key and self._is_live(job):
+                if getattr(job, field_name, "") == key and self._is_live(job):
                     return job
             if window <= 0:
                 return None
             best: BackgroundJob | None = None
             for job in self._done.values():
                 started = job.started_at or job.finished_at
-                if job.task_key != key or current - started > window:
+                if getattr(job, field_name, "") != key or current - started > window:
                     continue
                 if best is None or float(started) > float(best.started_at):
                     best = job
             return best
+
+    def _dedupe_hit(
+        self, job: BackgroundJob, window: float
+    ) -> tuple[BackgroundJob | None, str]:
+        """去重命中顺序（spec §7.2 ③）：**先 trigger（同一句话）、后 task_key（同一措辞）**。
+
+        返回 ``(命中任务, "trigger" | "task_key")``；两条都没命中时返回
+        ``(None, "task_key")``。
+        """
+        if job.trigger_key:
+            hit = self.find_by_trigger(job.trigger_key, window)
+            if hit is not None:
+                return hit, "trigger"
+        return self.find_by_key(job.task_key, window), "task_key"
 
     def submit(
         self,
@@ -501,12 +597,14 @@ class BackgroundRegistry:
             else max(0.0, float(dedupe_window_s))
         )
         with self._lock:
-            hit = self.find_by_key(job.task_key, window)
+            hit, matched = self._dedupe_hit(job, window)
+            trigger_hit = matched == "trigger"
             if hit is not None and self._is_live(hit):
                 return SubmitDecision(
                     kind=SUBMIT_DUPLICATE_RUNNING,
                     task_id=hit.task_id,
                     duplicate_of=hit.task_id,
+                    trigger_hit=trigger_hit,
                     text=render_duplicate_text(
                         task_id=hit.task_id, tool=hit.tool, elapsed_s=0.0, running=True
                     ),
@@ -516,6 +614,7 @@ class BackgroundRegistry:
                     kind=SUBMIT_DUPLICATE_DONE,
                     task_id=hit.task_id,
                     duplicate_of=hit.task_id,
+                    trigger_hit=trigger_hit,
                     text=render_duplicate_text(
                         task_id=hit.task_id,
                         tool=hit.tool,
@@ -607,7 +706,13 @@ def _busy_text(limit: int) -> str:
 
 @dataclass(frozen=True)
 class TerminalOutcome:
-    """一条任务的终态：``elapsed_s`` / ``budget_s`` / ``remaining_s`` 三件套齐备。"""
+    """一条任务的终态：``elapsed_s`` / ``budget_s`` / ``remaining_s`` 三件套齐备 + 投递真账。
+
+    v1.7.6 起投递记账拆开（spec §4.4 / §5.3）：``delivery`` 是适配器回报的
+    :class:`core.active_send.DeliveryReceipt`，下面五个属性是它的直读镜像。
+    ``delivered`` **只剩闸语义**（终态额度是否被放行过 = 恰好一条），
+    **不等于**"发送成功" —— 见 :attr:`accepted_by_platform`。
+    """
 
     task_id: str
     tool: str
@@ -617,8 +722,36 @@ class TerminalOutcome:
     elapsed_s: float = 0.0
     budget_s: float = 0.0
     remaining_s: float = 0.0
+    delivery: DeliveryReceipt = field(default_factory=DeliveryReceipt)
     delivered: bool = False
+    """**闸**语义：``note_delivery(terminal)`` 放行过（每任务最多一次）。"""
     task_key: str = ""
+
+    # —— 五字段直读（v1.7.6 拆账；``delivered`` 不再冒充发送成功）——
+    @property
+    def attempted(self) -> bool:
+        """是否真的进入发送阶段（装饰方压制时为 False）。"""
+        return bool(self.delivery.attempted)
+
+    @property
+    def succeeded(self) -> bool:
+        """整体判定（本版恒等于 :attr:`accepted_by_platform`）。"""
+        return bool(self.delivery.succeeded)
+
+    @property
+    def accepted_by_platform(self) -> bool:
+        """通道报告成功（``Context.send_message`` 为真或回退句柄未抛错）。"""
+        return bool(self.delivery.accepted_by_platform)
+
+    @property
+    def error(self) -> str:
+        """第一处失败/跳过原因；``""`` = 通道未报告任何失败。"""
+        return str(self.delivery.error or "")
+
+    @property
+    def sent_via(self) -> str:
+        """实际走的腿：``context.send_message`` / ``platform_fallback`` / ``decorator`` / ``none``。"""
+        return str(self.delivery.sent_via or CHANNEL_NONE)
 
 
 @dataclass
@@ -657,7 +790,8 @@ class BudgetedJob:
 
 #: 执行体签名：``async def runner(progress: dict) -> str``（progress 可就地更新）。
 Runner = Callable[[dict], Awaitable[str]]
-#: 投递回调签名：``async def deliver(job, status, text)``（终态只调一次）。
+#: 投递回调签名：``async def deliver(job, status, text) -> DeliveryReceipt | None``
+#: （终态只调一次；返回真账才是"投递层跑过并回报了通道结果"，``None`` = 旧回调）。
 Deliver = Callable[..., Awaitable[Any]]
 
 
@@ -710,10 +844,15 @@ class BudgetWatchdog:
         task_id: str | None = None,
         dedupe_window_s: float | None = None,
         max_parallel: int | None = None,
+        trigger_message_id: str | None = None,
     ) -> BudgetedJob:
         """提交后台任务：先过三闸，受理则起执行体 + 看门狗（同步、不 await）。
 
         与 ``asyncio.create_task`` 同形态：调用方拿着 ``reply_text`` 立刻同步返回。
+
+        ``trigger_message_id``（v1.7.6 / spec §7）：触发这次调用的**用户消息 ID**，
+        用来拦"同一句话换个措辞再调一次"；取不到（``None``/空）则只按 ``task_key``
+        的内容指纹去重（现状语义守恒）。
         """
         job = BackgroundJob(
             task_id=task_id or self.registry.next_task_id(),
@@ -723,6 +862,7 @@ class BudgetWatchdog:
             budget_s=self.budget_s if budget_s is None else max(1.0, float(budget_s)),
             max_chars=self.max_chars if max_chars is None else int(max_chars),
             task_key=task_key(umo, tool, task_text),
+            trigger_key=trigger_key(umo, tool, trigger_message_id),
             dedupe_window_s=(
                 self.dedupe_window_s if dedupe_window_s is None else dedupe_window_s
             ),
@@ -805,17 +945,11 @@ class BudgetWatchdog:
         job = self.registry.finish(job.task_id, status) or job
         handle.job = job
         body = self._renderer(job, status, text, reason, partial)
-        delivered = self.registry.note_delivery(
-            job.task_id, channel=DELIVERY_CHANNEL_TERMINAL
-        )
-        if delivered:
-            try:
-                await deliver(job, status, body)
-            except Exception as exc:  # noqa: BLE001 — 投递失败只记录，不重试
-                logger.warning(
-                    "后台任务终态投递失败 task_id=%s status=%s: %s",
-                    job.task_id, status, exc,
-                )
+        # v1.7.6：**闸由投递回调自己取**（``main._deliver_terminal`` 调
+        # ``note_delivery(channel="terminal")``，spec §3.2 步骤 0：闸在前保证"不重"，
+        # 真账在后保证"可证"）。这里只回收账并把结果记进 TerminalOutcome；
+        # 回调没回报（旧回调/测试替身）时记 DeliveryUnreported，**不冒充成功**。
+        receipt = await self._invoke_deliver(deliver, job, status, body)
         handle.outcome = TerminalOutcome(
             task_id=job.task_id,
             tool=job.tool,
@@ -825,14 +959,78 @@ class BudgetWatchdog:
             elapsed_s=job.elapsed_s(self.clock()),
             budget_s=float(job.budget_s),
             remaining_s=max(0.0, job.remaining_s(self.clock())),
-            delivered=delivered,
+            delivery=receipt,
+            delivered=int(getattr(job, "terminal_sent", 0)) > 0,
             task_key=job.task_key,
         )
+        self._log_outcome(handle.outcome)
+
+    async def _invoke_deliver(
+        self, deliver: Deliver, job: BackgroundJob, status: str, body: str
+    ) -> DeliveryReceipt:
+        """调**一次**投递回调并折成真账：不重试（重试 = 多发），异常也折成 receipt。
+
+        回调的契约（v1.7.6）：返回 :class:`core.active_send.DeliveryReceipt` 表示
+        "真的跑了投递层并回报了通道结果"；返回 ``None`` 表示旧回调（没回报），
+        记 ``error=DeliveryUnreported``；抛错记 ``error=DeliveryError:<Type>``。
+        """
+        try:
+            reported = await deliver(job, status, body)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — 投递失败只记录，不重试
+            logger.warning(
+                "后台任务终态投递抛错 task_id=%s status=%s error=%s",
+                job.task_id,
+                status,
+                f"{type(exc).__name__}: {exc}",
+            )
+            return DeliveryReceipt(
+                attempted=True,
+                error=f"{ERROR_DELIVERY_CALLBACK}{type(exc).__name__}",
+                sent_via=CHANNEL_NONE,
+            )
+        if isinstance(reported, DeliveryReceipt):
+            return reported
+        return DeliveryReceipt(
+            attempted=True, error=ERROR_DELIVERY_UNREPORTED, sent_via=CHANNEL_NONE
+        )
+
+    @staticmethod
+    def _log_outcome(outcome: TerminalOutcome) -> None:
+        """按级分流（spec §4.4）：未投递 / 投递失败 / 已投递。
+
+        旧契约把"闸放行"当成功写 INFO，掩盖了"平台没收到"；现在只有
+        ``accepted_by_platform`` 才写 INFO，其余两档都是 WARNING（不静默）。
+        """
+        if not outcome.attempted:
+            logger.warning(
+                "后台任务终态未投递 task_id=%s status=%s reason=%s",
+                outcome.task_id,
+                outcome.status,
+                outcome.error or "DecoratorSuppressed",
+            )
+            return
+        if not outcome.accepted_by_platform:
+            logger.warning(
+                "后台任务终态投递失败 task_id=%s status=%s error=%s sent_via=%s gate=%d",
+                outcome.task_id,
+                outcome.status,
+                outcome.error or "DeliveryUnaccounted",
+                outcome.sent_via,
+                int(outcome.delivered),
+            )
+            return
         logger.info(
             "后台任务终态 status=%s task_id=%s tool=%s elapsed_s=%.1f budget_s=%.0f "
-            "delivered=%s",
-            status, job.task_id, job.tool, handle.outcome.elapsed_s,
-            float(job.budget_s), delivered,
+            "attempted=1 accepted=1 sent_via=%s gate=%d",
+            outcome.status,
+            outcome.task_id,
+            outcome.tool,
+            outcome.elapsed_s,
+            float(outcome.budget_s),
+            outcome.sent_via,
+            int(outcome.delivered),
         )
 
     async def _guard(self, handle: BudgetedJob) -> None:
@@ -922,6 +1120,7 @@ class BudgetWatchdog:
         progress = getattr(job, "progress", None) or {}
         steps = int(progress.get("steps") or 0)
         ledger = str(progress.get("ledger") or "")
+        present, missing = count_artifacts(progress.get("artifacts"))
         return render_terminal_text(
             task_id=job.task_id,
             tool=job.tool,
@@ -934,6 +1133,8 @@ class BudgetWatchdog:
             diagnostics=True,
             steps=steps,
             ledger=truncate_result(ledger, int(job.max_chars))[0] if ledger else "",
+            artifact_count=present,
+            missing_files=missing,
         )
 
     @staticmethod
@@ -996,8 +1197,9 @@ __all__ = [
     "C_MEDIA_MAX_LIST", "DEFAULT_TOTAL_BUDGET_S", "DEFAULT_BACKGROUND_MAX_CHARS",
     "DEFAULT_MAX_PARALLEL", "DEFAULT_DEDUPE_WINDOW_S", "DEFAULT_GRACE_S",
     "WATCHDOG_POLL_S", "DELIVERY_CHANNEL_TOOL", "DELIVERY_CHANNEL_TERMINAL",
-    "MAX_TOOL_DELIVERIES", "MAX_TERMINAL_DELIVERIES", "normalize_task_text",
-    "task_key", "digest_text", "shorten", "truncate_result", "render_accepted_text",
+    "MAX_TOOL_DELIVERIES", "MAX_TERMINAL_DELIVERIES", "ERROR_DELIVERY_UNREPORTED",
+    "ERROR_DELIVERY_CALLBACK", "normalize_task_text", "task_key", "trigger_key",
+    "digest_text", "shorten", "truncate_result", "count_artifacts", "render_accepted_text",
     "render_rejected_text", "render_duplicate_text", "render_terminal_text",
     "render_c_media_block", "BackgroundJob", "BackgroundRegistry", "SubmitDecision",
     "SUBMIT_ACCEPTED", "SUBMIT_SINGLE_FLIGHT", "SUBMIT_BUSY",

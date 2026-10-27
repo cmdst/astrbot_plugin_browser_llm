@@ -92,13 +92,30 @@ def test_three_entries_submit_through_the_watchdog():
         assert f"_background_enabled_for({tool})" in src, f"{tool} 没有后台分支"
 
 
-def test_deliver_only_sends_a_message():
-    src = _src("main.py")
-    body = src[src.index("    async def _deliver_terminal("):]
-    body = body[: body.index("\n    def ", 10)]
-    assert "event.send(" in body
+def test_deliver_terminal_goes_through_active_send(tmp_path, monkeypatch):
+    """执行级（v1.7.6 取代旧的 `"event.send(" in body` 源码断言）：
+
+    终态不再直捅适配器，而是走 ``core.active_send``（钩子重放 + ``Context.send_message``），
+    平台可用时**一次** ``event.send`` 都不调用；U3/U4 红线靠"这些能力根本不存在"兜住。
+    """
+    sys.path.insert(0, str(ROOT / "tests"))
+    import test_v176_delivery_parity as v176  # 复用假框架 / 假 Context / 装配
+
+    v176.install_framework(monkeypatch)
+    context = v176.FakeContext()
+    plugin = v176.make_plugin(tmp_path, context)
+    event = v176.RealEventStub()
+    job = v176.make_job()
+
+    receipt = v176.deliver_once(plugin, event, job, body="【后台任务完成】真投递")
+
+    assert len(context.send_calls) == 1, "终态必须走 L1（Context.send_message）"
+    assert event.send_calls == 0, "平台可用时不得 event.send 直捅适配器"
+    assert receipt.accepted_by_platform is True
+    assert receipt.sent_via == "context.send_message"
+    assert job.terminal_sent == 1, "恰好一条：额度被消耗"
     for forbidden in ("send_message_to_user", "persist_agent_history", "build_main_agent"):
-        assert forbidden not in body, f"deliver 里出现 {forbidden}（U3/U4 红线）"
+        assert not hasattr(plugin, forbidden), f"插件上不该存在 {forbidden}（U3/U4 红线）"
 
 
 def test_terminate_uses_watchdog_shutdown():

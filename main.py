@@ -19,6 +19,13 @@
 像素坐标、selector 枚举、截图识图描述三条旧链（v1.7.0 的三段注入 JS）已整条
 删除 —— 它们是 D1/D8 的根因（``Page.evaluate`` 只收一个位置参数）。
 
+**终态投递（v1.7.6 起）**：后台终态不再 ``event.send`` 直捅适配器，而是走
+``self._deliver_terminal`` → :func:`core.active_send.deliver`（合成事件 +
+重放 ``on_decorating_result``/``on_after_message_sent`` + ``Context.send_message``，
+平台不可用时才用提交时抓下的 ``event.send`` 回退）。记账拆成
+``attempted`` / ``succeeded`` / ``accepted_by_platform`` / ``error`` / ``sent_via``，
+回给 ``core.background`` 的 ``TerminalOutcome.delivery``。
+
 **导入纪律**：本文件一律用**包内相对导入**（``from .core.x import …``）。测试用
 ``astrbot_plugin_browser_llm`` 包名 + 顶层别名统一实例；写成 ``from core.x``
 会造出第二份模块对象，``Rejection`` 之类的 ``isinstance`` 会静默失效。
@@ -36,8 +43,9 @@ import weakref
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 from urllib.parse import quote, urljoin, urlsplit
 
 if __package__ in ("", None):  # pragma: no cover — 裸 `python -c "import main"` 冒烟
@@ -52,7 +60,7 @@ if __package__ in ("", None):  # pragma: no cover — 裸 `python -c "import mai
     __package__ = _pkg_name
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Image, Plain, Video
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
@@ -62,11 +70,13 @@ from .core import action_model as am
 from .core import agent as agent_core
 from .core import executor as ex
 from .core import verify as vf
-from .core.background import BudgetWatchdog
+from .core.background import DELIVERY_CHANNEL_TERMINAL, BudgetWatchdog
 from .core.browser import BrowserCore, validate_browser_type
 from .core.config_map import ConfigView, clamp_of, default_of, schema_leaf
 from .core.crawler import AiohttpFetcher, CrawlerLimits, FetchOutcome
-from .core.delivery import collect_artifact, current_artifacts
+from .core import active_send
+from .core.active_send import DeliveryReceipt
+from .core.delivery import artifact_sink, collect_artifact
 from .core.extract import ContentExtractor
 from .core.safety import SafetyFilter, check_url_literal
 from .core.search import (
@@ -1732,6 +1742,9 @@ class BrowserLLMPlugin(Star):
     #: 统一按 Image 发会失败，必须按扩展名分流 —— 见 ``_deliver_terminal``）。
     _VIDEO_SUFFIXES = (".mp4", ".webm", ".mov", ".m4v", ".mkv")
 
+    #: 终态链最多携带的媒体附件数（spec §14-F-4：``progress["artifacts"]`` ≤12 条）。
+    _MAX_TERMINAL_ARTIFACTS = 12
+
     def _background_enabled_for(self, tool_name: str) -> bool:
         """该工具本次是否走 **plugin 引擎**的后台路径（v1.5.0 语义 + 一条新闸）。
 
@@ -1773,21 +1786,19 @@ class BrowserLLMPlugin(Star):
         runner: Callable[[dict], Awaitable[str]],
         task_text: str = "",
     ) -> str:
-        """提交后台任务：三闸（同会话单飞 / 全局并发 / task_key 去重）全在 watchdog 里。
+        """提交后台任务：三闸（单飞/并发/去重）全在 watchdog 里，返回受理文案（spec §6）。
 
-        返回 ```handle.reply_text``（受理/单飞/并发/重复四种文案之一）。**不再**
-        自己登记任务或起协程：执行体、看门狗、终态渲染与「恰好一次投递」都由
-        ``core.background.BudgetWatchdog`` 持有（spec §6，U1/U2 的唯一实现处）。
+        预算口径：``resources.total_budget_s`` 一个值同时供前台 ``wait_for`` 与后台预算；
+        ``tools.background_max_chars`` 只截断终态；去重两把钥匙（v1.7.6）：触发消息 ID
+        （"同一句话"）+ ``task_key`` 内容指纹（"同一措辞"）。
 
-        预算口径（v1.7.5 统一项）：``resources.total_budget_s`` 一个值同时供
-        前台 ``wait_for`` 与后台预算；``tools.background_max_chars`` 只决定
-        终态文本截断；``resources.max_parallel`` 是全局并发闸。
+        **事件生命周期纪律（§6 C1/C3）**：这里只做两件与事件相关的事 —— 抓一次
+        :class:`core.active_send.DeliverySnapshot`、抓 ``event.send`` 当平台回退句柄；
+        此后后台只读快照，投递层不持有事件、不调 ``get_group``/``bot.api.*``。
         """
         handle = self._watchdog.submit(
-            runner=runner,
-            deliver=lambda job, status, body: self._deliver_terminal(
-                event, job, status, body
-            ),
+            runner=self._artifact_collecting(runner),
+            deliver=self._terminal_deliverer(event),
             umo=self._umo_of(event),
             tool=tool_name,
             task_text=task_text,
@@ -1795,27 +1806,108 @@ class BrowserLLMPlugin(Star):
             max_chars=int(self.background_max_chars),
             dedupe_window_s=float(self.dedupe_window_s),
             max_parallel=int(self.max_parallel),
+            trigger_message_id=self._trigger_message_id(event),
         )
+        kind = "duplicate_trigger" if handle.decision.trigger_hit else handle.decision.kind
         logger.info(
-            f"[{self.metadata_name}] 后台提交 tool={tool_name} "
-            f"kind={handle.decision.kind} task_id={handle.task_id or '-'} "
+            f"[{self.metadata_name}] 后台提交 tool={tool_name} kind={kind} "
+            f"task_id={handle.task_id or '-'} "
             f"umo={self._umo_digest(self._umo_of(event))} "
             f"budget={float(self.total_budget_s):.0f}s"
         )
         return handle.reply_text
 
-    async def _deliver_terminal(self, event, job, status: str, body: str) -> None:
-        """终态投递：**只做 event.send**（U4：不读会话历史、不改上下文、不 merge 工具集）。
+    @staticmethod
+    def _trigger_message_id(event: AstrMessageEvent) -> Optional[str]:
+        """触发消息 ID（去重键，spec §7.2）：取不到给 ``None``（退回 ``task_key``）。"""
+        message_obj = getattr(event, "message_obj", None)
+        raw = str(getattr(message_obj, "message_id", "") or "").strip()
+        return raw or None
 
-        ``body`` 已由 watchdog 的模板渲染好（首行带四态前缀 + task_id + 耗时）；
-        这里只把本任务收集到的媒体（``artifact_sink`` 里的路径）作为附件一并发出。
+    def _terminal_deliverer(
+        self, event: AstrMessageEvent
+    ) -> Callable[..., Awaitable[Any]]:
+        """把投递所需的一切固定成回调：快照 + 平台回退句柄（§6 C1/C3）。
+
+        回调里**没有** ``event``：后台拿不到事件对象，就不可能误用它的平台能力。
+        唯一跨轮持有的是 ``fallback_send``（``event.send`` 绑定方法），只在
+        ``_deliver_terminal`` 里、L1 不可用时用一次。
         """
-        chain: list = [Plain(body)]
-        for path in current_artifacts():
+        snapshot = active_send.snapshot_from_event(event, umo=self._umo_of(event))
+        return partial(
+            self._deliver_terminal, snapshot=snapshot, fallback_send=event.send
+        )
+
+    @classmethod
+    def _artifact_collecting(cls, runner: Callable[[dict], Awaitable[str]]):
+        """执行体包一层 artifact 收集（F-G4）：后台媒体只登记路径，不发。
+
+        路径写进 ``progress``（= job 快照），**不靠 ContextVar 跨任务隐式传递**；
+        取消/异常同样落盘（``finally``），中断前的截图也会随终态一条发出。
+        """
+
+        async def run(progress: dict) -> str:
+            with artifact_sink() as bucket:
+                try:
+                    return await runner(progress)
+                finally:
+                    if bucket:
+                        progress["artifacts"] = [
+                            str(path) for path in bucket
+                        ][: cls._MAX_TERMINAL_ARTIFACTS]
+
+        return run
+
+    def _terminal_artifacts(self, job) -> list:
+        """终态附件组件：从 job 快照的 ``artifacts`` 造（缺失/构造失败只跳过）。"""
+        components: list = []
+        progress = getattr(job, "progress", None) or {}
+        for path in list(progress.get("artifacts") or []):
+            if not os.path.isfile(str(path)):
+                continue
             component = self._media_component(path)
             if component is not None:
-                chain.append(component)
-        await event.send(MessageChain(chain=chain))
+                components.append(component)
+        return components
+
+    async def _deliver_terminal(
+        self, job, status: str, body: str, *, snapshot, fallback_send
+    ) -> DeliveryReceipt:
+        """终态投递：**闸 → 适配器（合成事件 + 钩子重放 + L1/回退）→ 真账**（v1.7.6）。
+
+        顺序即契约（spec §3.2）：① ``note_delivery(terminal)`` 先取额度（取不到直接
+        返回：不建事件、不重放钩子、不发送）；② ``core.active_send.deliver`` 重放
+        ``on_decorating_result`` → ``Context.send_message``（失败/不可用才回退）→
+        条件重放 ``on_after_message_sent``；③ 返回 ``DeliveryOutcome`` 交给后台记账。
+
+        旧契约"终态只做 ``event.send``"已作废（spec §16 取代声明）：``event.send``
+        只在**平台回退**分支用一次（``fallback_send``，§6 C3 唯一例外）；本函数
+        **没有** ``event`` 参数 —— 投递层只读提交时快照（§6 C1/C2）。
+        """
+        granted = self._watchdog.registry.note_delivery(
+            job.task_id, channel=DELIVERY_CHANNEL_TERMINAL
+        )
+        if not granted:
+            logger.warning(
+                f"[{self.metadata_name}] 后台终态额度已用尽 task_id={job.task_id}"
+                "（终态只允许一条，本次不再发送）"
+            )
+            return DeliveryReceipt(
+                attempted=False,
+                error="DeliveryBlocked",
+                sent_via=active_send.CHANNEL_NONE,
+                task_id=str(job.task_id),
+            )
+        chain: list = [Plain(body), *self._terminal_artifacts(job)]
+        return await active_send.deliver(
+            self.context,
+            snapshot,
+            chain=chain,
+            fallback_send=fallback_send,
+            log=logger,
+            task_id=str(job.task_id),
+            status=status,
+        )
 
     def _media_component(self, path: str):
         """媒体路径 → 消息链组件（视频走 ``Video``，其余走 ``Image``；失败返回 None）。"""
@@ -2994,8 +3086,9 @@ class BrowserLLMPlugin(Star):
     ) -> None:
         """媒体发送出口（T-M0）。
 
-        后台任务（artifact_sink 生效）只登记路径，由投递层统一发送；
-        前台保持原有行为：截图/媒体立即发到当前会话。
+        **后台**（``_submit_background`` 已进 ``artifact_sink`` 上下文）**只登记路径**、
+        绝不 ``event.send``：媒体随终态那**一条**消息作为附件发出（F-G4 / spec §6 C5）。
+        前台保持原有行为：截图/媒体立即发到当前会话（行为不变，回归用例钉住）。
         """
         if collect_artifact(path):
             return

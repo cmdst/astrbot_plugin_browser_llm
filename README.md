@@ -107,7 +107,7 @@ core/http.py                 HTTP 传输层（aiohttp 优先 / 标准库兜底�
 core/safety.py               SSRF + 内容禁词
 core/delivery.py             后台媒体登记（artifact_sink / collect_artifact / current_artifacts）
 tools/migrate_config_v6.py   配置迁移器（v3/v4/v5 → v6 单跳；五模式）
-tests/                       门禁（29 个 test_*.py + conftest.py）
+tests/                       门禁（32 个 test_*.py + conftest.py）
 ```
 
 `core/` 现有 17 个模块（`__init__.py` 之外），每个都有生产调用方（`main.py`）。
@@ -138,8 +138,9 @@ PYTHONDONTWRITEBYTECODE=1 /root/AstrBot/.venv/bin/python -m pytest tests/ -q -p 
 /root/AstrBot/.venv/bin/python -m ruff check .
 ```
 
-当前门禁：**786 passed / 0 failed**（v1.7.5，含 t2–t5 的四层用例与返工用例）；
-`tests/` 下 **29 个 `test_*.py`** + `conftest.py`。四个守卫模块是"文档/配置/工具面"的主闸门，
+当前门禁：**854 passed / 0 failed**（v1.7.6 新增投递层/媒体投递用例后的实测数；
+v1.7.5 的 786 见 CHANGELOG）；`tests/` 下 **32 个 `test_*.py`** + `conftest.py`。
+守卫模块是"文档/配置/工具面"的主闸门，
 改任何一层都会先红：
 
 | 守卫 | 钉住什么 |
