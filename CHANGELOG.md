@@ -84,7 +84,8 @@ python tools/migrate_config_v6.py --verify --baseline
 | t13 返工 | **+7** | 2 isolate 对照 + 1 deliver_once 删除 + 1 LRU + 1「禁旧数字」+ 2 README 生成式守卫 |
 | 小计 | **783** | t13 门禁 |
 | t15 收尾返工 | **+2** | 1 前台**执行级**超时（替换掉原来只读源码字符串的那条）+ 1「全 live 硬上限」（R31） |
-| **现行门禁** | **785** | **785 passed / 0 failed**、ruff clean、无 skip/xfail |
+| t18 终稿勘误 | **+1** | 用户可见文档的叶数口径守卫（`test_user_visible_docs_carry_current_leaf_counts`） |
+| **现行门禁** | **786** | **786 passed / 0 failed**、ruff clean、无 skip/xfail |
 
 三个"覆盖缺口"的结论：R6 路径安全与 R7 内层执行体**已补回**（不是接受缺口）；
 文档⇄代码由 `tests/test_v175_docs_vs_code.py` 承接。规格 §12.3 的「≥1128」据此作废
@@ -136,7 +137,7 @@ python tools/migrate_config_v6.py --verify --baseline
 - **R4-deliver**：README 架构表不再把 `deliver_once` 当模块职责；`core/background.py`
   docstring 与迁移器的「58 叶 / 15 条新增」文案统一到 **57 叶 / 14 条新增**。
 - **R8**：测试数字改 **785** 并给出**可复算的算术**（1128 −421 → 707 → t11 +69 → 776 →
-  t13 +7 → 783 → t15 +2 → 785）；「禁旧数字」门禁同步（770/775/776/781/783 全禁）。
+  t13 +7 → 783 → t15 +2 → 785 → t18 +1 → 786）；「禁旧数字」门禁同步（770/775/776/781/783 全禁）。
 - **R31**：任务状态表补**硬上限**（软 64 → 硬 256）：先淘汰空闲状态（`deadline<=0`），
   若仍超硬上限就按 `last_used` LRU 兜底淘汰并记 WARN ⇒ 全 live 场景也不会无限增长，
   用例 `test_task_state_has_hard_cap_even_when_all_live` 覆盖（400 个 live 状态 ⇒ ≤256）。

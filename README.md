@@ -138,7 +138,7 @@ PYTHONDONTWRITEBYTECODE=1 /root/AstrBot/.venv/bin/python -m pytest tests/ -q -p 
 /root/AstrBot/.venv/bin/python -m ruff check .
 ```
 
-当前门禁：**785 passed / 0 failed**（v1.7.5，含 t2–t5 的四层用例与返工用例）；
+当前门禁：**786 passed / 0 failed**（v1.7.5，含 t2–t5 的四层用例与返工用例）；
 `tests/` 下 **29 个 `test_*.py`** + `conftest.py`。四个守卫模块是"文档/配置/工具面"的主闸门，
 改任何一层都会先红：
 
