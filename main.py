@@ -1796,9 +1796,10 @@ class BrowserLLMPlugin(Star):
         :class:`core.active_send.DeliverySnapshot`、抓 ``event.send`` 当平台回退句柄；
         此后后台只读快照，投递层不持有事件、不调 ``get_group``/``bot.api.*``。
         """
+        snapshot = active_send.snapshot_from_event(event, umo=self._umo_of(event))
         handle = self._watchdog.submit(
-            runner=self._artifact_collecting(runner),
-            deliver=self._terminal_deliverer(event),
+            runner=self._artifact_collecting(runner, snapshot),
+            deliver=self._terminal_deliverer(snapshot, event.send),
             umo=self._umo_of(event),
             tool=tool_name,
             task_text=task_text,
@@ -1809,10 +1810,10 @@ class BrowserLLMPlugin(Star):
             trigger_message_id=self._trigger_message_id(event),
         )
         kind = "duplicate_trigger" if handle.decision.trigger_hit else handle.decision.kind
+        dup = f" dup_of={handle.decision.duplicate_of or '-'}" if handle.decision.trigger_hit else ""
         logger.info(
             f"[{self.metadata_name}] 后台提交 tool={tool_name} kind={kind} "
-            f"task_id={handle.task_id or '-'} "
-            f"umo={self._umo_digest(self._umo_of(event))} "
+            f"task_id={handle.task_id or '-'}{dup} umo={self._umo_digest(self._umo_of(event))} "
             f"budget={float(self.total_budget_s):.0f}s"
         )
         return handle.reply_text
@@ -1825,31 +1826,29 @@ class BrowserLLMPlugin(Star):
         return raw or None
 
     def _terminal_deliverer(
-        self, event: AstrMessageEvent
+        self, snapshot: Any, fallback_send: Any
     ) -> Callable[..., Awaitable[Any]]:
         """把投递所需的一切固定成回调：快照 + 平台回退句柄（§6 C1/C3）。
 
         回调里**没有** ``event``：后台拿不到事件对象，就不可能误用它的平台能力。
-        唯一跨轮持有的是 ``fallback_send``（``event.send`` 绑定方法），只在
+        唯一跨轮持有的是 ``fallback_send``（``event.send`` 绑定方法，提交时抓），只在
         ``_deliver_terminal`` 里、L1 不可用时用一次。
         """
-        snapshot = active_send.snapshot_from_event(event, umo=self._umo_of(event))
-        return partial(
-            self._deliver_terminal, snapshot=snapshot, fallback_send=event.send
-        )
+        return partial(self._deliver_terminal, snapshot=snapshot, fallback_send=fallback_send)
 
     @classmethod
-    def _artifact_collecting(cls, runner: Callable[[dict], Awaitable[str]]):
+    def _artifact_collecting(cls, runner: Callable[..., Awaitable[str]], snapshot: Any):
         """执行体包一层 artifact 收集（F-G4）：后台媒体只登记路径，不发。
 
-        路径写进 ``progress``（= job 快照），**不靠 ContextVar 跨任务隐式传递**；
-        取消/异常同样落盘（``finally``），中断前的截图也会随终态一条发出。
+        执行体拿到的是 :class:`core.active_send.BackgroundEventView`（只读快照视图，
+        **不是原事件**，spec §6 C2）。路径写进 ``progress``（= job 快照），不靠
+        ContextVar 跨任务传递；取消/异常同样落盘（``finally``）。
         """
 
         async def run(progress: dict) -> str:
             with artifact_sink() as bucket:
                 try:
-                    return await runner(progress)
+                    return await runner(active_send.BackgroundEventView(snapshot), progress)
                 finally:
                     if bucket:
                         progress["artifacts"] = [
@@ -2028,8 +2027,8 @@ class BrowserLLMPlugin(Star):
                 return await self._submit_background(
                     event=event,
                     tool_name=_BROWSE_WEB_TOOL_NAME,
-                    runner=lambda progress: self._browse_web_run(
-                        event,
+                    runner=lambda view, progress: self._browse_web_run(
+                        view,
                         input,
                         progress=progress,
                         background=True,
@@ -2228,8 +2227,8 @@ class BrowserLLMPlugin(Star):
                 return await self._submit_background(
                     event=event,
                     tool_name=_LOCAL_PAGE_TOOL_NAME,
-                    runner=lambda progress: self._local_page_render(
-                        event, target, full_page, wait_ms, text_only, progress
+                    runner=lambda view, progress: self._local_page_render(
+                        view, target, full_page, wait_ms, text_only, progress
                     ),
                     # R3：task_key = sha1(umo|tool|task_text) —— 不带 path 时同会话
                     # 所有本地页共用一个键，all 模式会把别人的结果投给当前用户。
@@ -3744,9 +3743,9 @@ class BrowserLLMPlugin(Star):
                 ),
             )
         if self._background_enabled_for(_SEARCH_TOOL_NAME):
-            async def _search_job(progress: dict) -> str:
+            async def _search_job(view: Any, progress: dict) -> str:
                 raw = await self._run_browser_web_search(
-                    event,
+                    view,
                     query=query,
                     max_results=max_results,
                     rounds=rounds,

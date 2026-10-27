@@ -179,9 +179,28 @@ def test_changelog_documents_known_boundaries():
         "provider_ltm_settings",
         "qq_official",
         "回退",
-        "HookTimeout",
+        "hook_errors",  # R9：钩子问题落在 hook_errors，不是 error
+        "HookTimeout:<plugin>.<handler>",  # 与 spec §5.2 逐字一致（不许是幻影串）
+        "HookError:<plugin>.<handler>",
+        "webchat_persisted=1",  # R6：落库场景的可辨识标记
+        "继承核心的行为",  # 发两次是继承核心，不是本版缺陷
     ):
         assert needle in section, f"CHANGELOG v1.7.6 节的已知边界缺「{needle}」"
+
+    # R13：不许把"恰好一条"绝对化（装了分段插件的部署会被分成多段）
+    assert "恰好一条终态投递" in section
+    assert "恰好一条**消息" not in section and "恰好一条消息" not in section, (
+        "「恰好一条消息」是绝对化表述：分段插件在场时会被分成多段（spec §5.5/B-3）"
+    )
+
+
+def test_docs_explain_fallback_accounting_split():
+    """R5：文档必须写清「平台缺失」与「回退已救回」是两件事（否则用户会读成失败）。"""
+    readme = _readme_current_section()
+    section = _changelog_section(EXPECTED_VERSION)
+    for name, text in (("README", readme), ("CHANGELOG", section)):
+        assert "Recovered:" in text, f"{name} 没写「回退救回」在 notes 里留因"
+        assert "error" in text, f"{name} 没写 error 的语义"
 
 
 def test_readme_documents_v176_behaviour():

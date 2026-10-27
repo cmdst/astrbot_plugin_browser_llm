@@ -998,13 +998,15 @@ class BudgetWatchdog:
 
     @staticmethod
     def _log_outcome(outcome: TerminalOutcome) -> None:
-        """按级分流（spec §4.4）：未投递 / 投递失败 / 已投递。
+        """**诊断用**：终态账打到 DEBUG（spec §4.4 的"一档一条"归投递层）。
 
-        旧契约把"闸放行"当成功写 INFO，掩盖了"平台没收到"；现在只有
-        ``accepted_by_platform`` 才写 INFO，其余两档都是 WARNING（不静默）。
+        同一次终态曾被两层各打一条 INFO/WARNING（措辞与字段不同），ops 按 ``grep``
+        统计会**双计**。因此 §4.4 的四条文案只在 ``core.active_send._log_outcome``
+        落一次（那里有 attempted/accepted/error/sent_via/shape 全套字段）；
+        后台这层只留 DEBUG 冒烟，便于排障时看 TerminalOutcome 的装配结果。
         """
         if not outcome.attempted:
-            logger.warning(
+            logger.debug(
                 "后台任务终态未投递 task_id=%s status=%s reason=%s",
                 outcome.task_id,
                 outcome.status,
@@ -1012,7 +1014,7 @@ class BudgetWatchdog:
             )
             return
         if not outcome.accepted_by_platform:
-            logger.warning(
+            logger.debug(
                 "后台任务终态投递失败 task_id=%s status=%s error=%s sent_via=%s gate=%d",
                 outcome.task_id,
                 outcome.status,
@@ -1021,7 +1023,7 @@ class BudgetWatchdog:
                 int(outcome.delivered),
             )
             return
-        logger.info(
+        logger.debug(
             "后台任务终态 status=%s task_id=%s tool=%s elapsed_s=%.1f budget_s=%.0f "
             "attempted=1 accepted=1 sent_via=%s gate=%d",
             outcome.status,

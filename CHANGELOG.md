@@ -23,16 +23,18 @@
    在主动链上会退化）。
 2. **后台媒体不再各自一条消息**（F-G4 修复）：后台 `_emit_media` 只登记路径、**绝不**
    `event.send`；截图/视频随**终态那一条**作为附件发出（`progress["artifacts"]` ≤12 条，
-   缺失文件只计数、不拖垮终态）。升级后观感：一次后台任务 = **恰好一条**消息（含附件），
-   不再是"每条截图一条裸消息 + 一条终态"。
+   缺失文件只计数、不拖垮终态）。升级后观感：一次后台任务 = **恰好一条终态投递**（含附件；
+   装了分段插件的部署可能被分成多段，见「已知边界」），不再是"每条截图一条裸消息 + 一条终态"。
 3. **触发消息 ID 去重**：同一句用户消息（`message_id`）在同一会话同一工具下只允许一个
    后台任务 —— 模型换个措辞再调一次也会被拦（日志 `kind=duplicate_trigger`）；取不到
    `message_id` 时退回原有的内容指纹 + `tools.dedupe_window_s`（默认 600s）；**在途任务
    不受窗口限制**。
 4. **平台回退**：`qq_official` / `qq_official_webhook` 等主动发送受限的平台，或平台实例
    缺失、平台抛错、`umo` 不可解析时，回退到**提交时捕获**的 `event.send` 绑定方法
-   （唯一例外，只调一次），日志带 `sent_via=platform_fallback`；回退也失败则记 `error`，
-   **不重试、不静默**。
+   （唯一例外，只调一次），日志带 `sent_via=platform_fallback`。**回退救回时 `error` 留空**
+   （通道没报告失败），L1 腿为什么没用上记进 `notes`（`Recovered:PlatformNotFound` /
+   `Recovered:BadSession` / `Recovered:PlatformSendError:…`）并打 WARN；回退也失败才记
+   `error`，**不重试、不静默**。
 
 ### 记账变化（日志 / 调用方可见）
 
@@ -58,21 +60,29 @@
    长期记忆的群消息历史（`role="bot"`）。受核心配置控制，插件侧不改；不接受就关掉该核心开关。
 3. **`qq_official` 的"静默跳过"无法从插件侧判定**：群场景拿不到 `msg_id`/`scene` 时适配器
    会跳过发送但仍返回成功；插件只能打 `platform_hint=qq_official_group_scene_unset` 的 WARN。
-4. **钩子重放有超时上限**（10s/个、20s/段、整条 30s）：极慢的第三方钩子会被跳过并记
-   `HookTimeout`，不阻塞终态。
+4. **钩子重放有超时上限**（10s/个、20s/段、整条 30s）：极慢的第三方钩子会被跳过，记进
+   `hook_errors`（制式 `HookTimeout:<plugin>.<handler>` / `HookError:<plugin>.<handler>`，
+   与 spec §5.2 逐字一致），WARN 可见、**不污染** `error`（否则不变量 4 会被钩子问题打破），
+   也不阻塞终态。
+5. **装饰方"发了一部分 + 剩下还留链"时，我们也发**（形态 A）⇒ 用户会看到两条消息。
+   这是**继承核心的行为**（核心的 `RespondStage` 同样对剩余链再发一次），不是本版引入的
+   缺陷，也不做特殊处理；要避免就让装饰方把链清空（那就是形态 B，只发它那一条）。
+6. **webchat 的"已投递"是落库，不是即时可见**：无活跃流时消息写库、用户刷新才看到；
+   已投递 INFO 行会带只读标记 `webchat_persisted=1`（`splitter` 装了补丁时另有
+   `splitter_patch=1`），**只影响日志可读性，不改任何决策**。
 
 ### 门禁与版本
 
 - 版本四处同一笔：`metadata.yaml` / `main._PLUGIN_VERSION_FALLBACK` / 本 CHANGELOG 首节 /
   README「当前版本」= **v1.7.6**。
-- 全量门禁 **865 passed / 0 failed**、`ruff check .` clean、配置叶 **57 条 / JSON 叶子键
+- 全量门禁 **879 passed / 0 failed**、`ruff check .` clean、配置叶 **57 条 / JSON 叶子键
   59 个**（**零配置变更**：`_conf_schema.json` 与 `tools/` 零 diff）。
 - 新增守卫 `tests/test_v176_docs_vs_code.py`（版本 / 叶数 / 工具面 / 新行为 / 记账 / 边界，
   且文档里的标识符必须与代码常量一致）+ 投递层执行级用例
   `tests/test_v176_active_send.py` / `tests/test_v176_delivery_parity.py` /
-  `tests/test_v176_media_delivery.py`。
+  `tests/test_v176_media_delivery.py` / `tests/test_v176_lifecycle.py`（事件生命周期纪律）。
 - `main.py` 行数守则（代码侧）从 4200 对齐到 **4300**（spec §3.1 与 v1.7.5 勘误 E6 既有口径；
-  本版实测 4197 行）。
+  本版实测 4196 行）。
 
 ## [v1.7.5] - 2026-10-27
 

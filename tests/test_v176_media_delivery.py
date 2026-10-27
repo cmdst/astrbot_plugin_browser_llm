@@ -25,7 +25,7 @@ for _path in (str(ROOT.parent), str(ROOT), str(ROOT / "tests")):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
-import test_v176_delivery_parity as v176  # noqa: E402 — 复用假框架 / 假 Context / 装配
+import v176_fakes as v176  # noqa: E402 — 共用假件（假框架 / 假 Context / 装配）
 import main as main_module  # noqa: E402
 
 
@@ -47,7 +47,7 @@ def _submit_and_wait(plugin, event, runner, *, task_text="媒体任务"):
         )
         handles = list(plugin._watchdog._handles.values())
         assert handles, "提交后应立刻有 handle（受理文案要求任务真的起来了）"
-        return reply, await v176._wait_handle(handles[-1])
+        return reply, await v176.wait_handle(handles[-1])
 
     return asyncio.run(_main())
 
@@ -69,7 +69,7 @@ def test_background_task_sends_exactly_one_terminal_with_media(tmp_path, monkeyp
     first = _make_file(tmp_path, "shot1")
     second = _make_file(tmp_path, "shot2")
 
-    async def runner(progress):
+    async def runner(view, progress):
         await plugin._emit_media(event, first, "image")
         await plugin._emit_media(event, second, "image")
         return "看完了：页面标题是「确认订单」"
@@ -112,7 +112,7 @@ def test_artifact_count_and_missing_files_fed_into_body(tmp_path, monkeypatch):
     present = _make_file(tmp_path, "present")
     gone = str(tmp_path / "never-existed.png")
 
-    async def runner(progress):
+    async def runner(view, progress):
         await plugin._emit_media(event, present, "image")
         await plugin._emit_media(event, gone, "image")
         return "结果"
@@ -132,7 +132,7 @@ def test_missing_artifact_does_not_break_terminal(tmp_path, monkeypatch):
     plugin = v176.make_plugin(tmp_path, context)
     event = v176.RealEventStub()
 
-    async def runner(progress):
+    async def runner(view, progress):
         await plugin._emit_media(event, str(tmp_path / "ghost.png"), "image")
         return "只有一条文本"
 
@@ -167,7 +167,7 @@ def test_artifacts_capped_at_twelve(tmp_path, monkeypatch):
     event = v176.RealEventStub()
     paths = [_make_file(tmp_path, f"shot{i:02d}") for i in range(20)]
 
-    async def runner(progress):
+    async def runner(view, progress):
         for path in paths:
             await plugin._emit_media(event, path, "image")
         return "截图有点多"
@@ -189,7 +189,7 @@ def test_artifact_snapshot_survives_runner_error(tmp_path, monkeypatch):
     event = v176.RealEventStub()
     path = _make_file(tmp_path, "before-crash")
 
-    async def runner(progress):
+    async def runner(view, progress):
         await plugin._emit_media(event, path, "image")
         raise RuntimeError("页面崩了")
 
@@ -210,7 +210,7 @@ def test_video_suffix_uses_video_component(tmp_path, monkeypatch):
     event = v176.RealEventStub()
     video = _make_file(tmp_path, "clip", suffix=".mp4")
 
-    async def runner(progress):
+    async def runner(view, progress):
         await plugin._emit_media(event, video, "video")
         return "下载好了"
 

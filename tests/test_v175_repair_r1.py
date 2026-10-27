@@ -96,12 +96,24 @@ def test_screenshot_sent_to_chat_when_enabled(tmp_path, monkeypatch):
     assert len(sent) == 1, "screenshot_to_chat=true 才发群"
 
 
-def test_sent_to_user_flag_matches_reality(tmp_path):
+def test_sent_to_user_flag_matches_reality(tmp_path, monkeypatch):
+    """R15：执行级 —— 开关真决定发不发（取代"源码里有没有 ``sent_to_user=``"的两条断言）。"""
     plugin = _plugin(tmp_path)
+    sent: list = []
+
+    async def _fake_emit(_event, path, kind):
+        sent.append(path)
+
+    monkeypatch.setattr(plugin, "_emit_media", _fake_emit)
+
+    plugin.screenshot_to_chat = True
+    asyncio.run(plugin.browse_screenshot(helpers._FakeEvent()))
+    assert len(sent) == 1, "打开时发一条"
+
+    sent.clear()
     plugin.screenshot_to_chat = False
-    src = (ROOT / "main.py").read_text(encoding="utf-8")
-    assert "sent_to_user=bool(self.screenshot_to_chat)" in src
-    assert "if bool(self.screenshot_to_chat):" in src
+    asyncio.run(plugin.browse_screenshot(helpers._FakeEvent()))
+    assert sent == [], "关掉时一条都不许发（与日志里的 sent_to_user 语义一致）"
 
 
 # ---------------------------------------------------------------- R3
@@ -163,10 +175,34 @@ def test_same_task_text_is_still_deduped(tmp_path):
     assert second != first, "同键重复提交必须给出不同文案"
 
 
-def test_local_page_task_text_includes_params():
-    src = (ROOT / "main.py").read_text(encoding="utf-8")
-    assert 'f"{target}|full_page={full_page}|wait_ms={wait_ms}"' in src
-    assert 'f"|perception={perception}"' in src
+def test_local_page_task_text_includes_params(tmp_path, monkeypatch):
+    """R15：执行级 —— 后台化本地页时 ``task_text`` 真的带上四个参数（键才不撞）。"""
+    plugin = _plugin(tmp_path)
+    monkeypatch.setattr(plugin, "_background_enabled_for", lambda _tool: True)
+    captured = []
+
+    async def _fake_submit(**kwargs):
+        captured.append(kwargs)
+        return "【已受理】替身"
+
+    monkeypatch.setattr(plugin, "_submit_background", _fake_submit)
+    page = tmp_path / "a.html"
+    page.write_text("<html><body>hello</body></html>", encoding="utf-8")
+    plugin._local_page_allowed_roots = (tmp_path,)
+    event = helpers._FakeEvent()
+
+    asyncio.run(
+        plugin.browse_local_page(event, path=str(page), full_page=True, wait_ms=10, perception="text")
+    )
+    asyncio.run(
+        plugin.browse_local_page(event, path=str(page), full_page=False, wait_ms=10, perception="structure")
+    )
+
+    assert len(captured) == 2
+    first, second = captured[0]["task_text"], captured[1]["task_text"]
+    for needle in (str(page), "full_page=True", "wait_ms=10", "perception=text"):
+        assert needle in first, (needle, first)
+    assert first != second, "参数不同 ⇒ task_text 必须不同（否则 task_key 会撞）"
 
 
 # ---------------------------------------------------------------- R4
@@ -311,9 +347,15 @@ def test_perception_rules_pick_screenshot_policy(tmp_path):
     assert plugin._screenshot_allowed_for("any") is False
 
 
-def test_every_hot_switch_leaf_is_read_in_control_flow():
-    """R4 的守卫：`effect=热` 的开关型叶必须在**非测试代码**里"读值并影响控制流"。"""
-    src = (ROOT / "main.py").read_text(encoding="utf-8")
+def test_every_hot_switch_leaf_is_read_in_control_flow(tmp_path):
+    """R15：执行级 —— 热开关叶必须在**实例上真的有对应属性**，且改它真能改变判定。
+
+    旧版是"源码里有没有 ``self.<attr>`` 这个串"，改一行注释都能骗过它。现在改成：
+    ①装配出来的实例必须有这个属性（配置白名单漏了就会红）；②对**有判定的**几个热开关
+    逐个改值断言行为翻转（``test_v175_config_readpoints.py`` 另有"热开关必须影响控制流"
+    的四方一致守卫）。
+    """
+    plugin = _plugin(tmp_path)
     hot_switches = {
         "actions.repeat_guard": "repeat_guard_limit",
         "actions.trusted_events": "trusted_events",
@@ -326,23 +368,18 @@ def test_every_hot_switch_leaf_is_read_in_control_flow():
         meta = config_map.leaf_meta(leaf) if hasattr(config_map, "leaf_meta") else None
         if meta is not None:
             assert meta.effect == config_map.EFFECT_HOT or leaf in hot_switches
-        assign = f"self.{attr}"
-        assert assign in src, f"{leaf} 没有对应的实例属性 {attr}"
-        # 读值必须出现在 if/比较里（不是只赋值/只打印）
-        assert any(
-            pattern in src
-            for pattern in (
-                f"if bool({assign}",
-                f"if {assign}",
-                f"getattr(self, \"{attr}\"",
-                f"int({assign}",
-                f"{assign} else",
-            )
-        ), f"{leaf} 读了但没影响控制流"
+        assert hasattr(plugin, attr), f"{leaf} 没有对应的实例属性 {attr}（配置白名单漏了？）"
 
+    # 行为面：至少验证两个热开关"改值 ⇒ 判定翻转"
+    plugin.enable_screenshot = True
+    assert plugin._screenshot_allowed_for("aiocqhttp:FriendMessage:1") is True
+    plugin.enable_screenshot = False
+    assert plugin._screenshot_allowed_for("aiocqhttp:FriendMessage:1") is False
 
-# ---------------------------------------------------------------- R9 / R13 / R17
-
+    plugin.repeat_guard_limit = 7
+    assert plugin._task_state("umo-guard").guard.threshold == 7
+    plugin.repeat_guard_limit = 2
+    assert plugin._task_state("umo-guard-2").guard.threshold == 2
 
 def test_candidate_render_has_no_pixel_coordinates():
     """R9：候选表进模型可见的观测块，绝不给像素坐标（to_payload 里仍有）。"""
@@ -526,7 +563,7 @@ def test_browse_web_own_timeout_maps_to_status_timeout(tmp_path, monkeypatch):
     # v1.7.6：终态投递走 core.active_send（快照 + 平台回退句柄），替身框架注入后
     # 走"平台找不到 ⇒ event.send 回退"这条分支 —— 正是本用例要看的终态正文。
     sys.path.insert(0, str(ROOT / "tests"))
-    import test_v176_delivery_parity as v176
+    import v176_fakes as v176
 
     v176.install_framework(monkeypatch)
     # 别覆盖 `_InnerContext`（内层子代理要用它）；只补投递层要的两件：
@@ -537,9 +574,12 @@ def test_browse_web_own_timeout_maps_to_status_timeout(tmp_path, monkeypatch):
 
     async def _run() -> object:
         plugin._submit_background  # noqa: B018 — 确认走真实提交路径
+        from astrbot_plugin_browser_llm.core import active_send
+
+        snapshot = active_send.snapshot_from_event(event, umo=plugin._umo_of(event))
         handle = plugin._watchdog.submit(
             runner=_runner,
-            deliver=plugin._terminal_deliverer(event),
+            deliver=plugin._terminal_deliverer(snapshot, event.send),
             umo=plugin._umo_of(event),
             tool=main_module._BROWSE_WEB_TOOL_NAME,
             task_text="timeout-case",

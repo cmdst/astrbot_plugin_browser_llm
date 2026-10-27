@@ -27,7 +27,6 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -39,288 +38,26 @@ for _path in (str(ROOT.parent), str(ROOT)):
 import core.active_send as active_send  # noqa: E402
 
 
-# ---------------------------------------------------------------------------
-# 假框架（事件 / 消息 / 链 / 结果）与假 registry / 假 context
-# ---------------------------------------------------------------------------
-
-
-class _FakeContentType:
-    """``ResultContentType`` 替身：只需要 LLM_RESULT 一个成员。"""
-
-    LLM_RESULT = "LLM_RESULT"
-    GENERAL_RESULT = "GENERAL_RESULT"
-
-
-class _FakePlatformMeta:
-    def __init__(self, name="aiocqhttp", description="", id="aiocqhttp-1"):
-        self.name = name
-        self.description = description
-        self.id = id
-
-
-class _FakePlatformInst:
-    def __init__(self, meta):
-        self._meta = meta
-
-    def meta(self):
-        return self._meta
-
-
-class _FakeChain:
-    def __init__(self, chain=None, **kwargs):
-        self.chain = list(chain or [])
-
-    def __repr__(self):
-        return f"MessageChain({self.chain!r})"
-
-
-class _FakePlain:
-    def __init__(self, text=""):
-        self.text = text
-
-    def __repr__(self):
-        return f"Plain({self.text!r})"
-
-
-class _FakeMessage:
-    def __init__(self):
-        self.type = None
-        self.session_id = ""
-        self.message_id = ""
-        self.self_id = ""
-        self.group = None
-        self.sender = None
-        self.message = []
-        self.message_str = ""
-        self.raw_message = None
-
-
-class _FakeGroup:
-    def __init__(self, group_id=""):
-        self.group_id = group_id
-
-
-class _FakeMember:
-    def __init__(self, user_id="", nickname=None):
-        self.user_id = user_id
-        self.nickname = nickname
-
-
-class _FakeSession:
-    """``MessageSession`` 替身：``from_str`` 与 ``str()`` 与核心同形。"""
-
-    def __init__(self, platform_name, message_type, session_id):
-        self.platform_name = platform_name
-        self.platform_id = platform_name
-        self.message_type = message_type
-        self.session_id = session_id
-
-    def __str__(self):
-        return f"{self.platform_id}:{self.message_type}:{self.session_id}"
-
-    @staticmethod
-    def from_str(value):
-        platform_id, message_type, session_id = value.split(":", 2)
-        if not platform_id or not message_type:
-            raise ValueError(f"bad session: {value}")
-        return _FakeSession(platform_id, message_type, session_id)
-
-
-class _FakeResult:
-    def __init__(self, chain=None):
-        self.chain = list(chain or [])
-        self.result_content_type = None
-        self.stopped = False
-
-    def set_result_content_type(self, value):
-        self.result_content_type = value
-        return self
-
-    def is_llm_result(self):
-        return self.result_content_type == _FakeContentType.LLM_RESULT
-
-    def is_model_result(self):
-        return self.is_llm_result()
-
-    def stop_event(self):
-        self.stopped = True
-        return self
-
-    def is_stopped(self):
-        return self.stopped
-
-
-class _FakeEvent:
-    """合成事件替身：与 :class:`core.active_send.Framework` 文档的契约同形。"""
-
-    def __init__(self, *, context, umo, message_str, message_obj, platform_meta, session_id):
-        self.context = context
-        self.message_str = message_str
-        self.message_obj = message_obj
-        self.platform_meta = platform_meta
-        self.session = _FakeSession.from_str(umo)
-        self.session_id = session_id
-        self.plugins_name = None
-        self.side_send_started = False
-        self.side_send_error = ""
-        self._result = None
-        self._stopped = False
-
-    @property
-    def unified_msg_origin(self):
-        return str(self.session)
-
-    def get_platform_name(self):
-        return self.platform_meta.name
-
-    def get_result(self):
-        return self._result
-
-    def set_result(self, result):
-        self._result = result
-
-    def stop_event(self):
-        self._stopped = True
-
-    def is_stopped(self):
-        return self._stopped
-
-    async def send(self, message):
-        """装饰方经 ``event.send`` 发送：记 side-send 账后委托 L1（与生产同形）。"""
-        self.side_send_started = True
-        components = list(getattr(message, "chain", None) or [])
-        try:
-            found = await self.context.send_message(self.unified_msg_origin, _FakeChain(components))
-        except Exception as exc:  # noqa: BLE001 — 与生产一致：记 code 后上抛
-            self.side_send_error = type(exc).__name__
-            raise
-        if not found:
-            self.side_send_error = active_send.ERROR_PLATFORM_NOT_FOUND
-
-    async def send_streaming(self, generator, use_fallback=False):
-        async for chunk in generator:
-            await self.send(chunk)
-
-
-def _fake_framework(registry=None):
-    return active_send.Framework(
-        event_cls=_FakeEvent,
-        message_cls=_FakeMessage,
-        group_cls=_FakeGroup,
-        member_cls=_FakeMember,
-        session_cls=_FakeSession,
-        platform_meta_cls=_FakePlatformMeta,
-        chain_cls=_FakeChain,
-        result_cls=_FakeResult,
-        content_type_cls=_FakeContentType,
-        plain_cls=_FakePlain,
-        registry=registry,
-        event_types={
-            active_send.HOOK_DECORATING: "OnDecoratingResultEvent",
-            active_send.HOOK_AFTER_SENT: "OnAfterMessageSentEvent",
-        },
-    )
-
-
-class _FakeHandler:
-    def __init__(self, name, fn, *, plugin="plugin_a", priority=0, enabled=True, activated=True):
-        self.handler_name = name
-        self.handler_module_path = f"data.plugins.{plugin}.main"
-        self.plugin_name = plugin
-        self.handler = fn
-        self.enabled = enabled
-        self.activated = activated
-        self.extras_configs = {"priority": priority}
-
-
-class _FakeRegistry:
-    """按核心语义过滤：事件类型 / enabled / only_activated / plugins_name（含 ``["*"]``）。"""
-
-    def __init__(self, *, decorating=(), after_sent=()):
-        self.handlers = {
-            "OnDecoratingResultEvent": sorted(
-                decorating, key=lambda h: -h.extras_configs["priority"]
-            ),
-            "OnAfterMessageSentEvent": sorted(
-                after_sent, key=lambda h: -h.extras_configs["priority"]
-            ),
-        }
-        self.calls = []
-
-    def get_handlers_by_event_type(self, event_type, only_activated=True, plugins_name=None):
-        hook = str(getattr(event_type, "name", event_type))
-        self.calls.append(
-            {"hook": hook, "plugins_name": None if plugins_name is None else list(plugins_name)}
-        )
-        selected = []
-        for handler in self.handlers.get(hook, []):
-            if not handler.enabled:
-                continue
-            if only_activated and not handler.activated:
-                continue
-            if plugins_name is not None and plugins_name != ["*"]:
-                if handler.plugin_name not in plugins_name:
-                    continue
-            selected.append(handler)
-        return selected
-
-
-class _RecordingLog:
-    """记录 (level, text) 的日志器替身（取代 caplog，避免受 root logger 配置影响）。"""
-
-    def __init__(self):
-        self.records = []
-
-    def _add(self, level, message, args):
-        self.records.append((level, message % args if args else str(message)))
-
-    def info(self, message, *args, **kwargs):
-        self._add("INFO", message, args)
-
-    def warning(self, message, *args, **kwargs):
-        self._add("WARNING", message, args)
-
-    def error(self, message, *args, **kwargs):
-        self._add("ERROR", message, args)
-
-    def debug(self, message, *args, **kwargs):
-        self._add("DEBUG", message, args)
-
-    def texts(self, level=None):
-        return [text for lv, text in self.records if level is None or lv == level]
-
-
-class _FakeContext:
-    """假 Context：``send_message`` 可配成功/失败/抛错，并记录每次调用的链。"""
-
-    def __init__(
-        self,
-        *,
-        platform_name="aiocqhttp",
-        platform_id="aiocqhttp-1",
-        send_ok=True,
-        raise_error=None,
-        has_platform=True,
-        on_send=None,
-    ):
-        self.send_calls = []
-        self._send_ok = send_ok
-        self._raise = raise_error
-        self.on_send = on_send
-        insts = []
-        if has_platform and platform_name:
-            insts.append(
-                _FakePlatformInst(_FakePlatformMeta(name=platform_name, id=platform_id))
-            )
-        self.platform_manager = SimpleNamespace(platform_insts=insts)
-
-    async def send_message(self, umo, chain):
-        self.send_calls.append((umo, list(getattr(chain, "chain", []) or [])))
-        if self.on_send is not None:
-            self.on_send()
-        if self._raise is not None:
-            raise self._raise
-        return self._send_ok
+# ---- 共用假件（R14：假框架/假 Context/假 registry/假日志只在 tests/v176_fakes.py 一份）----
+import v176_fakes as v176  # noqa: E402
+
+_FakeContentType = v176.FakeContentType
+_FakePlatformMeta = v176.FakePlatformMeta
+_FakePlatformInst = v176.FakePlatformInst
+_FakeChain = v176.FakeChain
+_FakePlain = v176.FakePlain
+_FakeMessage = v176.FakeMessage
+_FakeGroup = v176.FakeGroup
+_FakeMember = v176.FakeMember
+_FakeSession = v176.FakeSession
+_FakeResult = v176.FakeResult
+_FakeEvent = v176.SyntheticEvent
+_FakeAt = v176.FakeAt
+_fake_framework = v176.make_framework
+_FakeHandler = v176.FakeHandler
+_FakeRegistry = v176.FakeRegistry
+_RecordingLog = v176.RecordingLog
+_FakeContext = v176.FakeContext
 
 
 def _snapshot(**overrides):
@@ -401,7 +138,10 @@ def test_choose_channel_matrix():
         ([1], True, True, "RuntimeError", active_send.SHAPE_B_PRIME, False, True, "decorator", "SideSend:"),
         ([], True, False, "", active_send.SHAPE_C, False, False, "none", "DecoratorSuppressed"),
         ([], False, False, "", active_send.SHAPE_D, False, False, "none", "DecoratorSuppressed"),
-        ([1], True, False, "", active_send.SHAPE_C_PRIME, False, False, "none", "DecoratorStopped"),
+        # R1：stop 但没发、链还在 ⇒ 照发（部署核心零 yield 时 stop 不生效，RespondStage 照发）
+        ([1], True, False, "", active_send.SHAPE_C_PRIME, True, True, "context.send_message", ""),
+        # R2：side_started 优先 —— 已发过 + 链空 + 未 stop 也认 B（不许落 DecoratorSuppressed）
+        ([], False, True, "", active_send.SHAPE_B, False, True, "decorator", ""),
     ],
 )
 def test_classify_shapes(chain, stopped, side_started, side_err, shape, send, attempted, via, error):
@@ -691,7 +431,16 @@ def test_decorating_then_send_then_after_sent_order():
     ]
 
 
-def test_stop_event_stops_remaining_decorators():
+def test_stop_event_without_side_send_still_sends_the_chain():
+    """R1：装饰钩子只 ``stop_event()``、不改链 ⇒ **照发**（与部署核心的实际行为一致）。
+
+    依据（部署核心 ``db4ce0c4b``，只读核对 + ``test_real_core_scheduler_sends_when_zero_yield_stage_stops``
+    实测）：``ResultDecorateStage.process`` 在 ``content_safety.also_use_in_response=False``（默认）
+    时是**零 yield 的异步生成器**（``result_decorate/stage.py:156`` 是唯一 ``yield``，被内容安全
+    开关包着），而 ``PipelineScheduler`` 的 ``is_stopped()`` 检查写在 ``async for`` 的**循环体内**
+    （``scheduler.py:53-70``）⇒ 循环体一次都不进、stop 检查被跳过，``RespondStage``（无
+    ``is_stopped`` 检查）对非空链**照发**。后台若判「不发」，就是前台发、后台丢。
+    """
     order = []
 
     async def first(event):
@@ -707,11 +456,72 @@ def test_stop_event_stops_remaining_decorators():
             _FakeHandler("second", second, priority=0),
         ]
     )
-    out = _run(_deliver(_FakeContext(), registry))
+    context = _FakeContext()
+    out = _run(_deliver(context, registry))
 
-    assert order == ["first"]
-    assert out.shape == active_send.SHAPE_C_PRIME, "stop 但没发、链还在 ⇒ 不静默（核心同样不发）"
-    assert out.error == active_send.ERROR_DECORATOR_STOPPED
+    assert order == ["first"], "stop 之后不再跑后续装饰钩子（§5.2）"
+    assert out.shape == active_send.SHAPE_C_PRIME
+    assert out.attempted is True and out.accepted_by_platform is True, "链非空 ⇒ 必须发出去"
+    assert out.sent_via == active_send.CHANNEL_CONTEXT and out.error == ""
+    assert len(context.send_calls) == 1, "与前台同权：这条链只发一次"
+    assert [c.text for c in context.send_calls[0][1]] == ["终态正文"]
+
+
+def test_partial_side_send_plus_remaining_chain_sends_twice_like_core():
+    """**继承核心的行为**（不是 bug）：装饰方发了一部分、链里还剩内容、也没 stop。
+
+    核心在这种情况下同样会两条都发（装饰方那条 + ``RespondStage`` 对剩余链那条），
+    我们按形态 A 处置（发剩余链）—— 用户会看到两条消息，与前台一致。
+    这是 R1/R2 判序的**已知代价**，登记在 README/CHANGELOG 的「已知边界」，不做特殊处理。
+    """
+
+    async def decorate(event):
+        await event.send(_FakeChain([_FakePlain("装饰方发的第一段")]))
+        event.set_result(_FakeResult([_FakePlain("剩下的第二段")]))
+
+    registry = _FakeRegistry(decorating=[_FakeHandler("decorate", decorate)])
+    context = _FakeContext()
+    out = _run(_deliver(context, registry))
+
+    assert len(context.send_calls) == 2, "装饰方一次 + 我们发剩余链一次（与核心同形）"
+    assert [c.text for c in context.send_calls[0][1]] == ["装饰方发的第一段"]
+    assert [c.text for c in context.send_calls[1][1]] == ["剩下的第二段"]
+    assert out.shape == active_send.SHAPE_A and out.accepted_by_platform is True
+
+
+def test_side_send_then_clear_without_stop_is_success():
+    """R2：``event.send`` 已发 + 清空链 + **未** stop ⇒ 认成功（§5.3 处置 1）。
+
+    旧判序会落到 ``DecoratorSuppressed``（账说"没投递"，用户其实已经收到了）。
+    现在 ``side_started`` 优先：attempted=True、accepted=not side_err、sent_via=decorator、
+    不重发；**after-sent 照常重放**（用户确实收到过这条，下游写记忆/写统计该跑；captain
+    round-2 裁定推翻评审「链空不重放」的措辞）。
+    """
+
+    async def decorate(event):
+        await event.send(_FakeChain([_FakePlain("装饰方发出去的内容")]))
+        event.set_result(_FakeResult([]))
+        # 故意不 stop：模拟"发完就清链"的装饰方
+
+    after_calls = []
+
+    async def after(event):
+        after_calls.append("after")
+
+    registry = _FakeRegistry(
+        decorating=[_FakeHandler("decorate", decorate)],
+        after_sent=[_FakeHandler("after", after)],
+    )
+    context = _FakeContext()
+    out = _run(_deliver(context, registry))
+
+    assert out.shape == active_send.SHAPE_B and out.attempted is True
+    assert out.accepted_by_platform is True and out.error == ""
+    assert out.sent_via == active_send.CHANNEL_DECORATOR
+    assert len(context.send_calls) == 1, "装饰方那一次；不再重发（不重复打扰用户）"
+    assert [c.text for c in context.send_calls[0][1]] == ["装饰方发出去的内容"]
+    assert after_calls == ["after"], "after-sent 照常重放（用户收到过这条）"
+    assert len(context.send_calls) == 1, "platform_sent==1：不重复打扰"
 
 
 def test_plugins_name_filters_handlers():
@@ -798,7 +608,9 @@ def test_handler_exception_does_not_stop_replay():
 
     assert ran == ["boom", "fix"], "单钩子异常只记日志、不中断（核心同款）"
     assert out.accepted_by_platform is True and out.error == ""
-    assert any("boom" in item for item in out.hook_errors)
+    assert f"{active_send.ERROR_HOOK_FAILED}:plugin_a.boom" in out.hook_errors, (
+        "单钩子异常记 HookError:<plugin>.<handler>，不污染 error（§5.2）"
+    )
     assert [c.text for c in context.send_calls[0][1]] == ["后面的钩子救回来了"]
 
 
@@ -819,7 +631,9 @@ def test_hook_timeout_continues_and_is_reported():
     log = _RecordingLog()
     out = _run(_deliver(context, registry, log=log, hook_timeout_s=0.02, hook_total_timeout_s=5.0))
 
-    assert any("slow" in item for item in out.hook_errors), "超时要留痕（不静默）"
+    assert f"{active_send.ERROR_HOOK_TIMEOUT}:plugin_a.slow" in out.hook_errors, (
+        "spec §5.2 的制式是 HookTimeout:<plugin>.<handler>（R9：不许是幻影串）"
+    )
     assert out.accepted_by_platform is True
     assert [c.text for c in context.send_calls[0][1]] == ["超时后仍然发出去"]
     assert any("钩子超时" in text for text in log.texts("WARNING"))
@@ -864,7 +678,8 @@ def test_platform_not_found_uses_fallback_and_warns():
     log = _RecordingLog()
     out = _run(_deliver(context, _FakeRegistry(), snapshot=snap, log=log, fallback_send=fallback))
 
-    assert out.error == active_send.ERROR_PLATFORM_NOT_FOUND
+    assert out.error == "", "回退救回 ⇒ 通道没报告失败（R5）"
+    assert "Recovered:PlatformNotFound" in out.notes, "L1 腿没走的原因留 notes（与服务分离）"
     assert out.attempted is True and out.dispatched is True
     assert out.sent_via == active_send.CHANNEL_FALLBACK and out.accepted_by_platform is True
     assert context.send_calls == [], "平台找不到时不走 L1"
@@ -928,7 +743,8 @@ def test_qq_official_l1_failure_falls_back_with_error(send_ok, raise_error, expe
     log = _RecordingLog()
     out = _run(_deliver(context, _FakeRegistry(), snapshot=snap, log=log, fallback_send=fallback))
 
-    assert out.error == expected, "qq 官方系 L1 不可用时必须给出明确 error"
+    assert out.error == "", "回退救回 ⇒ 账上不记失败（R5）"
+    assert f"Recovered:{expected}" in out.notes, "但 L1 腿为什么不可用必须留痕"
     assert out.sent_via == active_send.CHANNEL_FALLBACK and out.accepted_by_platform is True
     assert len(sent) == 1, "回退分支必须真的把消息发出去（不静默丢）"
     assert any("转回退" in text for text in log.texts("WARNING"))
@@ -946,7 +762,8 @@ def test_bad_umo_reports_bad_session_and_uses_fallback():
         _deliver(_FakeContext(), _FakeRegistry(), snapshot=snap, log=log, fallback_send=fallback)
     )
 
-    assert out.error == active_send.ERROR_BAD_SESSION
+    assert out.error == "", "回退救回 ⇒ 不记失败（R5）"
+    assert "Recovered:BadSession" in out.notes, "会话不可解析的原因留 notes"
     assert out.attempted is True and out.dispatched is True
     assert out.sent_via == active_send.CHANNEL_FALLBACK and out.accepted_by_platform is True
     assert [c.text for c in sent[0]] == ["终态正文"]
@@ -1220,6 +1037,95 @@ def _run_python(
         text=True,
         timeout=timeout,
     )
+
+
+_REAL_SCHEDULER_SCRIPT = r'''
+"""R1 的执行级判定（对**部署核心**直接跑调度器，不依赖推断）。
+
+与 captain 的 ``verification/probe_scheduler_stop_semantics.py`` 同形：
+一个**零 yield** 但 ``stop_event()`` 的 stage（= ``ResultDecorateStage`` 在
+``also_use_in_response=False`` 时的形态）+ 一个记录调用的下游 stage（= ``RespondStage``）。
+输出形如：``zero-yield stop -> downstream stages ran: ['SENDS'] | stopped = True``。
+"""
+import asyncio
+import sys
+
+sys.path.insert(0, "/root/AstrBot")
+from astrbot.core.pipeline.scheduler import PipelineScheduler  # noqa: E402
+
+
+class _Event:
+    def __init__(self):
+        self.stopped = False
+
+    def is_stopped(self):
+        return self.stopped
+
+    def stop_event(self):
+        self.stopped = True
+
+
+class _ZeroYieldStopStage:
+    """等价 ``ResultDecorateStage``（生产口径）：零 yield，且在 process 里 stop。"""
+
+    def __init__(self, event, log):
+        self.event = event
+        self.log = log
+
+    async def process(self, _event):
+        self.log.append("DECORATE")
+        self.event.stop_event()
+        return
+        yield  # noqa: unreachable —— 让函数成为异步生成器（唯 yield 永不执行）
+
+
+class _Responder:
+    def __init__(self, log):
+        self.log = log
+
+    async def process(self, _event):
+        self.log.append("SENDS")
+
+
+async def main():
+    scheduler = PipelineScheduler.__new__(PipelineScheduler)  # 跳过 __init__ 的依赖
+    scheduler.ctx = None
+    event = _Event()
+    log = []
+    scheduler.stages = [_ZeroYieldStopStage(event, log), _Responder(log)]
+    await scheduler._process_stages(event)
+    print("zero-yield stop -> downstream stages ran:", log, "| stopped =", event.is_stopped())
+
+
+asyncio.run(main())
+'''
+
+
+@pytest.mark.skipif(
+    not (Path("/root/AstrBot") / "astrbot").is_dir(),
+    reason="本机无 /root/AstrBot 部署树（导出树/CI 里跳过）",
+)
+def test_real_core_scheduler_sends_when_zero_yield_stage_stops():
+    """R1：**真核心调度器**实测 —— 零 yield 的 stage 里 ``stop_event()`` **不阻断**后续阶段。
+
+    这就是形态 C′ 必须"照发"的依据：``ResultDecorateStage`` 在
+    ``content_safety.also_use_in_response=False``（生产默认）时零 yield（唯一 ``yield`` 在
+    内容安全循环 ``result_decorate/stage.py:156``），``PipelineScheduler`` 的
+    ``is_stopped()`` 检查在 ``async for`` 的循环体内（``scheduler.py:53-70``）⇒ 循环体不执行
+    ⇒ stop 被忽略 ⇒ ``RespondStage``（无 ``is_stopped`` 检查）照发非空链。
+    """
+    result = _run_python(_REAL_SCHEDULER_SCRIPT, cwd=Path("/tmp"))
+    assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
+    assert "['DECORATE', 'SENDS']" in result.stdout, (
+        f"下游阶段必须照跑（实测输出：{result.stdout.strip()}）"
+    )
+    assert "stopped = True" in result.stdout
+    # 与实现对齐：同一观测量（stopped、链非空、装饰方没发）在我们这里也必须"照发"
+    decision = active_send.classify_after_decorators(
+        ["终态正文"], stopped=True, side_started=False
+    )
+    assert decision.shape == active_send.SHAPE_C_PRIME
+    assert decision.should_send is True and decision.sent_via == active_send.CHANNEL_CONTEXT
 
 
 def test_module_never_imports_astrbot_at_import_time():

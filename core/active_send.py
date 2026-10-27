@@ -93,11 +93,12 @@ SHAPE_A = "A"  #: 只改链（含分段插件"末段留链"）⇒ 用改写后�
 SHAPE_B = "B"  #: 装饰方已发 + stop ⇒ 认成功、不重发（sent_via=decorator）
 SHAPE_B_PRIME = "B'"  #: 装饰方 send 抛错后 stop ⇒ 记 SideSend:<code>、不重发
 SHAPE_C = "C"  #: 清空链 + stop（未发）⇒ DecoratorSuppressed
-SHAPE_C_PRIME = "C'"  #: 表外补记：stop 但链非空且没发（核心同样不发）⇒ DecoratorStopped
+SHAPE_C_PRIME = "C'"  #: stop 但链非空且没发 ⇒ **照发**（部署核心对非空链同样照发，见 note）
 SHAPE_D = "D"  #: 清空链、不 stop（未发）⇒ DecoratorSuppressed
 
 ERROR_DECORATOR_SUPPRESSED = "DecoratorSuppressed"
-ERROR_DECORATOR_STOPPED = "DecoratorStopped"
+ERROR_HOOK_TIMEOUT = "HookTimeout"  #: ``HookTimeout:<plugin>.<handler>``（spec §5.2 的逐字形制）
+ERROR_HOOK_FAILED = "HookError"  #: ``HookError:<plugin>.<handler>``（单钩子异常，仍继续下一个）
 ERROR_PLATFORM_NOT_FOUND = "PlatformNotFound"
 ERROR_BAD_SESSION = "BadSession"
 ERROR_NO_FALLBACK = "NoFallbackChannel"
@@ -106,7 +107,9 @@ ERROR_UNACCOUNTED = "DeliveryUnaccounted"
 
 _GROUP_TYPE_VALUES = ("groupmessage", "group_message", "group")
 #: 会重放 on_after_message_sent 的形态（§5.4：C/C′/D 与构造失败都不跑）
-_AFTER_SENT_SHAPES = (SHAPE_A, SHAPE_B, SHAPE_B_PRIME)
+#: 会重放 ``on_after_message_sent`` 的形态（§5.4：C/D 与构造失败都不跑；形态 B 系看
+#: :attr:`ShapeDecision.after_sent` —— 「已发但链空且未 stop」按「链空不重放」处置）
+_AFTER_SENT_SHAPES = (SHAPE_A, SHAPE_C_PRIME, SHAPE_B, SHAPE_B_PRIME)
 
 
 class FrameworkUnavailable(RuntimeError):
@@ -201,7 +204,12 @@ class ChannelPlan:
 
 @dataclass(frozen=True)
 class ShapeDecision:
-    """装饰钩子跑完后的形态判定（§5.3 的四种 + B′ + 补记的 C′）。"""
+    """装饰钩子跑完后的形态判定（§5.3 的四种 + B′ + C′）。
+
+    ``after_sent`` 是「这条要不要重放 ``on_after_message_sent``」（§5.4）：默认按
+    "发出去过才跑"，形态 C/D（一条都没发）与"装饰方已发但链空且未 stop"为 ``False``，
+    理由写在 ``note`` 里。
+    """
 
     shape: str
     should_send: bool
@@ -209,6 +217,7 @@ class ShapeDecision:
     sent_via: str = CHANNEL_NONE
     error: str = ""
     note: str = ""
+    after_sent: bool = True
 
 
 @dataclass(frozen=True)
@@ -408,6 +417,7 @@ def _decide(
     sent_via: str = CHANNEL_NONE,
     error: str = "",
     note: str = "",
+    after_sent: bool = True,
 ) -> ShapeDecision:
     return ShapeDecision(
         shape=shape,
@@ -416,6 +426,7 @@ def _decide(
         sent_via=sent_via,
         error=error,
         note=note,
+        after_sent=after_sent,
     )
 
 
@@ -428,37 +439,68 @@ def classify_after_decorators(
 ) -> ShapeDecision:
     """装饰钩子跑完后的形态判定（§5.3 表，纯函数、**不做**任何发送）。
 
-    ``chain`` / ``stopped`` / ``side_started`` / ``side_err`` 就是表里那四个观测量。
+    判序是 **``side_started`` 优先**（spec §5.3「处置 1」）：装饰方只要经我们覆写的
+    ``event.send`` 发过，账就按形态 B 记（``sent_via=decorator``、``accepted=not side_err``），
+    ``stopped`` 只决定"要不要跑 after-sent"，**不决定**记账 —— 否则"发完 + 清空链 +
+    不 stop"会被记成 ``DecoratorSuppressed``（账说没投递，用户其实收到了）。
+
+    ``stopped`` 且链非空且装饰方没发（形态 C′）⇒ **照发**：部署核心的
+    ``ResultDecorateStage.process`` 在 ``content_safety.also_use_in_response=False``（默认）
+    时是**零 yield 的异步生成器**（``result_decorate/stage.py:156`` 是唯一的 ``yield``，被
+    内容安全开关包着），而 ``PipelineScheduler`` 的 ``is_stopped()`` 检查写在
+    ``async for`` 的**循环体内**（``scheduler.py:53-70``）⇒ 循环体一次都不进、stop 检查
+    被跳过，``RespondStage``（无 ``is_stopped`` 检查）对非空链**照发**。因此后台也必须发，
+    否则「前台发、后台丢」，违背本版"同权/不丢"。
+
     注意 **A 与 A′ 在可观测状态上等价**：装饰方若绕开 ``event.send`` 直接用
     ``Context.send_message`` 发前 N 段（``splitter`` 常规路径），我们看不见 ⇒ 统一按
     A 处置（发剩余链），A′ 只作为理由记在 ``note`` 里。
     """
     pending = list(chain or [])
-    if stopped and side_started:
-        if side_err:
+    if side_started:
+        if stopped or not pending:
+            # 装饰方已经发过：账统一按 B 记（R2：side_started 优先，不看 stopped/链空）
+            if side_err:
+                return _decide(
+                    SHAPE_B_PRIME,
+                    False,
+                    True,
+                    sent_via=CHANNEL_DECORATOR,
+                    error=f"SideSend:{side_err}",
+                    note="装饰方 send 失败：记 B′，不重发",
+                    after_sent=stopped,
+                )
             return _decide(
-                SHAPE_B_PRIME,
+                SHAPE_B,
                 False,
                 True,
                 sent_via=CHANNEL_DECORATOR,
-                error=f"SideSend:{side_err}",
-                note="装饰方 send 失败后 stop：记 B′，不再重发",
+                note=(
+                    "装饰方已发并 stop：认成功、不重发，after-sent 照常（§5.3 形态 B）"
+                    if stopped
+                    else "装饰方已发、链空、未 stop：仍认成功、不重发（§5.3 处置 1），"
+                    "after-sent 照常（用户确实收到过这条）"
+                ),
+                after_sent=True,
             )
         return _decide(
-            SHAPE_B,
-            False,
+            SHAPE_A,
             True,
-            sent_via=CHANNEL_DECORATOR,
-            note="装饰方已发并 stop：认成功、不重发（§5.3 形态 B）",
+            True,
+            sent_via=CHANNEL_CONTEXT,
+            note="装饰方已发过一部分（event.send）且留了链：继续发剩余链",
         )
     if stopped:
         if pending:
             return _decide(
                 SHAPE_C_PRIME,
-                False,
-                False,
-                error=ERROR_DECORATOR_STOPPED,
-                note="装饰方 stop 但没发、链非空：核心同样不发，记 DecoratorStopped 不静默",
+                True,
+                True,
+                sent_via=CHANNEL_CONTEXT,
+                note="装饰方 stop 但没发、链非空：部署核心零 yield 时 stop 不生效、RespondStage "
+                "照发非空链（stage.py:156 / scheduler.py:53-70）⇒ 我们也照发，与前台同权"
+                "（配置依赖：also_use_in_response=True 时核心会在 yield 点看到 stop；"
+                "本版取生产口径 = 关闭）",
             )
         return _decide(
             SHAPE_C,
@@ -466,6 +508,7 @@ def classify_after_decorators(
             False,
             error=ERROR_DECORATOR_SUPPRESSED,
             note="清空链 + stop：装饰方压制",
+            after_sent=False,
         )
     if not pending:
         return _decide(
@@ -474,13 +517,15 @@ def classify_after_decorators(
             False,
             error=ERROR_DECORATOR_SUPPRESSED,
             note="清空链、未 stop：装饰方压制（§5.3 形态 D）",
+            after_sent=False,
         )
-    note = (
-        "装饰方已发过一部分（event.send）且留了链：继续发剩余链"
-        if side_started
-        else "只改链 / A′（侧发不可见）：发改写后的链"
+    return _decide(
+        SHAPE_A,
+        True,
+        True,
+        sent_via=CHANNEL_CONTEXT,
+        note="只改链 / A′（侧发不可见）：发改写后的链",
     )
-    return _decide(SHAPE_A, True, True, sent_via=CHANNEL_CONTEXT, note=note)
 
 
 def fold_outcome(
@@ -573,6 +618,56 @@ def snapshot_from_event(event: Any, umo: str = "") -> DeliverySnapshot:
             "session_id": getattr(event, "session_id", "") or "",
         }
     )
+
+
+class BackgroundEventView:
+    """后台执行体的**只读事件面**（spec §6 C1/C2）：不持有原事件、没有平台能力。
+
+    后台执行体（``_browse_web_run`` / ``_local_page_render`` / ``_search_job``）只需要
+    身份字段（umo / group / sender / 平台名 / 触发文本）；平台能力一律禁止，要发东西
+    只能 ① 在 ``artifact_sink`` 里登记路径（``_emit_media`` 的后台分支）或 ② 走终态投递。
+
+    因此后台拿到的不是原事件，而是这份由 :class:`DeliverySnapshot` 构造的视图：
+    ``send`` / ``send_streaming`` 直接抛错（C2 的硬约束），其余字段只读。
+    """
+
+    __slots__ = ("_snapshot",)
+
+    def __init__(self, snapshot: Any) -> None:
+        self._snapshot = _coerce_snapshot(snapshot)
+
+    @property
+    def unified_msg_origin(self) -> str:
+        return self._snapshot.umo
+
+    @property
+    def message_str(self) -> str:
+        return self._snapshot.trigger_text
+
+    def get_group_id(self) -> str:
+        return self._snapshot.group_id
+
+    def get_sender_id(self) -> str:
+        return self._snapshot.sender_id
+
+    def get_platform_name(self) -> str:
+        return self._snapshot.platform_name
+
+    def image_result(self, path: Any) -> Any:
+        return ("image", str(path))
+
+    def chain_result(self, chain: Any) -> Any:
+        return ("chain", list(chain or []))
+
+    async def send(self, *_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError(
+            "后台执行体不得直接发送（spec §6 C2）：只能登记 artifact 或走终态投递"
+        )
+
+    async def send_streaming(self, *_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError(
+            "后台执行体不得流式发送（spec §6 C2）：只能登记 artifact 或走终态投递"
+        )
 
 
 def build_chain(
@@ -693,10 +788,26 @@ def build_proactive_event(
     return event
 
 
+def _plugin_name_of(handler: Any) -> str:
+    """处理器所属插件名（`<plugin>.<handler>` 的 ``<plugin>`` 段）。
+
+    真实 ``StarHandlerMetadata`` 只有 module 路径；测试替身可直接给 ``plugin_name``。
+    拿不到时退化为模块路径最后两段，保证标签稳定可 grep。
+    """
+    explicit = str(getattr(handler, "plugin_name", "") or "")
+    if explicit:
+        return explicit
+    module = str(getattr(handler, "handler_module_path", "") or "")
+    parts = [part for part in module.split(".") if part]
+    if len(parts) >= 2:
+        return parts[-2]
+    return parts[-1] if parts else "?"
+
+
 def _handler_label(handler: Any) -> str:
-    module = str(getattr(handler, "handler_module_path", "") or "?")
+    """``<plugin>.<handler>``（spec §5.2 的 ``HookTimeout:<plugin>.<handler>`` 用它拼）。"""
     name = str(getattr(handler, "handler_name", "") or getattr(handler, "name", "") or "?")
-    return f"{module}.{name}"
+    return f"{_plugin_name_of(handler)}.{name}"
 
 
 def _event_type_for(hook: str, framework: Framework | None) -> Any:
@@ -768,11 +879,12 @@ async def replay_hooks(
             except asyncio.CancelledError:
                 raise
             except TimeoutError:
-                timed_out.append(f"{hook}:{label}")
+                timed_out.append(f"{ERROR_HOOK_TIMEOUT}:{label}")
                 log_.warning(f"钩子超时 {hook} handler={label}（继续下一个）")
             except BaseException:  # noqa: BLE001 — 单钩子异常不中断（核心同款）
-                errors.append(f"{hook}:{label}")
-                log_.warning(f"钩子异常 {hook} handler={label}（继续下一个）\n{traceback.format_exc()}")
+                errors.append(f"{ERROR_HOOK_FAILED}:{label}")
+                # 与核心同档：result_decorate/stage.py 用 logger.error(traceback)，不降档
+                log_.error(f"钩子异常 {hook} handler={label}（继续下一个）\n{traceback.format_exc()}")
             ran += 1
             if event.is_stopped():
                 stopped = True
@@ -1005,7 +1117,7 @@ async def _deliver_once(
         accepted = decision.shape == SHAPE_B and not error
 
     # 步骤 7：条件重放 on_after_message_sent（§5.4）
-    if event is not None and decision.shape in _AFTER_SENT_SHAPES:
+    if event is not None and decision.after_sent and decision.shape in _AFTER_SENT_SHAPES:
         after = await replay_hooks(
             event,
             HOOK_AFTER_SENT,
@@ -1017,6 +1129,10 @@ async def _deliver_once(
         )
         hook_errors.extend(after.errors)
         hook_errors.extend(after.timed_out)
+    elif event is not None:
+        # 一条都没发（形态 C/D）⇒ 不重放，理由写进账（§5.4：下游写记忆/写统计不该被压制的消息触发）
+        notes.append("after_sent_skipped=suppressed")
+        log.debug(f"跳过 on_after_message_sent task_id={tag} reason=suppressed shape={decision.shape}")
 
     # 步骤 8/9：记账；事件对象在返回时即出栈（不进任何全局表）
     return fold_outcome(
@@ -1085,7 +1201,12 @@ async def _dispatch(
             code = f"PlatformSendError:{type(exc).__name__}"
             log.warning(f"后台终态回退发送抛错 task_id={tag} error={code}")
             return False, CHANNEL_FALLBACK, error or code, dispatched
-        return True, CHANNEL_FALLBACK, error, dispatched
+        # 回退救回：**通道没报告失败**（回退腿成功）⇒ error 置空，L1 腿的原因留 notes
+        # （spec §4.2 的"平台缺失"与"回退已救回"是两件事，见 spec 勘误 r1 §4.2）
+        if error:
+            notes.append(f"Recovered:{error}")
+            log.warning(f"后台终态 L1 腿失败已由平台回退救回 task_id={tag} recovered={error}")
+        return True, CHANNEL_FALLBACK, "", dispatched
 
     notes.append(ERROR_NO_FALLBACK)
     if not error:
@@ -1095,8 +1216,19 @@ async def _dispatch(
 
 
 def _log_outcome(outcome: DeliveryOutcome, log: Any, *, status: str = "") -> None:
-    """§4.4 的四条硬性输出：不静默、不带正文、不带用户标识明文。"""
+    """§4.4 的四条硬性输出：不静默、不带正文、不带用户标识明文。
+
+    「已投递」两行会带上两个**只读**标记（不改决策）：
+    ``splitter_patch=1``（``splitter`` 装了 ``Context.send_message`` 补丁，§5.6）与
+    ``webchat_persisted=1``（webchat 无活跃流 ⇒ 消息落库、用户刷新才看见，§4.2）。
+    """
     tag = _tag(outcome.task_id)
+    marks = []
+    if "splitter_patch=1" in outcome.notes:
+        marks.append("splitter_patch=1")
+    if str(outcome.platform or "").strip().lower() == "webchat":
+        marks.append("webchat_persisted=1")
+    tail = (" " + " ".join(marks)) if marks else ""
     if not outcome.attempted:
         log.warning(
             f"后台终态未投递 task_id={tag} reason={outcome.error or ERROR_DECORATOR_SUPPRESSED} "
@@ -1113,10 +1245,10 @@ def _log_outcome(outcome: DeliveryOutcome, log: Any, *, status: str = "") -> Non
     if outcome.sent_via == CHANNEL_FALLBACK:
         log.info(
             f"后台终态已投递(回退通道) task_id={tag} platform={outcome.platform or '-'} "
-            f"fallback=1 attempted=1 accepted=1 sent_via={outcome.sent_via}"
+            f"fallback=1 attempted=1 accepted=1 sent_via={outcome.sent_via}{tail}"
         )
         return
     log.info(
         f"后台终态已投递 task_id={tag} status={status or '-'} elapsed={outcome.elapsed_s:.1f}s "
-        f"attempted=1 accepted=1 sent_via={outcome.sent_via}"
+        f"attempted=1 accepted=1 sent_via={outcome.sent_via}{tail}"
     )

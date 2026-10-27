@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import dataclasses
 import sys
 from pathlib import Path
 
@@ -30,356 +31,25 @@ for _path in (str(ROOT.parent), str(ROOT), str(ROOT / "tests")):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
-import test_v175_tools as helpers  # noqa: E402 — 复用 _bare_plugin（配置/目录装配）
 import core.background as bg  # noqa: E402
 import core.active_send as active_send  # noqa: E402
 import main as main_module  # noqa: E402
 
-UMO = "aiocqhttp-1:GroupMessage:777001"
-
-
-# ---------------------------------------------------------------------------
-# 假框架：让 active_send 在没有真 astrbot 的环境里跑完整投递路径
-# ---------------------------------------------------------------------------
-
-
-class _FakeContentType:
-    LLM_RESULT = "LLM_RESULT"
-
-
-class _FakeChain:
-    def __init__(self, chain=None, **kwargs):
-        self.chain = list(chain or [])
-
-    def __repr__(self):
-        text = "".join(str(getattr(item, "text", item)) for item in self.chain)
-        return f"MessageChain({text})"
-
-    __str__ = __repr__
-
-
-class _FakePlain:
-    def __init__(self, text=""):
-        self.text = str(text)
-
-    def __repr__(self):
-        return f"Plain({self.text!r})"
-
-
-class _FakePlatformMeta:
-    def __init__(self, name="aiocqhttp", description="", id=UMO.split(":")[0]):
-        self.name = name
-        self.description = description
-        self.id = id
-
-
-class _FakePlatformInst:
-    def __init__(self, meta):
-        self._meta = meta
-
-    def meta(self):
-        return self._meta
-
-
-class _FakeMessage:
-    def __init__(self):
-        self.type = "GroupMessage"
-        self.session_id = UMO.split(":")[-1]
-        self.message_id = "m-1"
-        self.self_id = "90000"
-        self.group = _FakeGroup("777001")
-        self.sender = _FakeMember("10001", "tester")
-        self.message = []
-        self.message_str = ""
-        self.raw_message = None
-
-
-class _FakeGroup:
-    def __init__(self, group_id=""):
-        self.group_id = group_id
-
-
-class _FakeMember:
-    def __init__(self, user_id="", nickname=None):
-        self.user_id = user_id
-        self.nickname = nickname
-
-
-class _FakeSession:
-    def __init__(self, platform_name, message_type, session_id):
-        self.platform_name = platform_name
-        self.platform_id = platform_name
-        self.message_type = message_type
-        self.session_id = session_id
-
-    def __str__(self):
-        return f"{self.platform_id}:{self.message_type}:{self.session_id}"
-
-    @staticmethod
-    def from_str(value):
-        platform_id, message_type, session_id = value.split(":", 2)
-        return _FakeSession(platform_id, message_type, session_id)
-
-
-class _FakeResult:
-    def __init__(self, chain=None):
-        self.chain = list(chain or [])
-        self.result_content_type = None
-        self.stopped = False
-
-    def set_result_content_type(self, value):
-        self.result_content_type = value
-        return self
-
-    def is_llm_result(self):
-        return self.result_content_type == _FakeContentType.LLM_RESULT
-
-    def is_model_result(self):
-        return self.is_llm_result()
-
-    def stop_event(self):
-        self.stopped = True
-        return self
-
-    def is_stopped(self):
-        return self.stopped
-
-
-class _FakeSyntheticEvent:
-    """合成事件替身（``active_send.build_proactive_event`` 的产物）。"""
-
-    def __init__(self, *, context, umo, message_str, message_obj, platform_meta, session_id):
-        self.context = context
-        self.message_str = message_str
-        self.message_obj = message_obj
-        self.platform_meta = platform_meta
-        self.session = _FakeSession.from_str(umo)
-        self.session_id = session_id
-        self.plugins_name = None
-        self.side_send_started = False
-        self.side_send_error = ""
-        self._result = None
-        self._stopped = False
-
-    @property
-    def unified_msg_origin(self):
-        return str(self.session)
-
-    def get_platform_name(self):
-        return self.platform_meta.name
-
-    def get_result(self):
-        return self._result
-
-    def set_result(self, result):
-        self._result = result
-
-    def stop_event(self):
-        self._stopped = True
-
-    def is_stopped(self):
-        return self._stopped
-
-    async def send(self, message):
-        self.side_send_started = True
-        components = list(getattr(message, "chain", None) or [])
-        try:
-            found = await self.context.send_message(self.unified_msg_origin, _FakeChain(components))
-        except Exception as exc:  # noqa: BLE001 — 与生产一致：记 code 后上抛
-            self.side_send_error = type(exc).__name__
-            raise
-        if not found:
-            self.side_send_error = active_send.ERROR_PLATFORM_NOT_FOUND
-
-    async def send_streaming(self, generator, use_fallback=False):
-        async for chunk in generator:
-            await self.send(chunk)
-
-
-class RealEventStub:
-    """**触发事件**替身：只提供快照白名单字段 + ``send``（平台回退句柄）。
-
-    ``send`` 记调用；需要时用 :meth:`make_probe` 换成"一碰就炸"的探针。
-    """
-
-    def __init__(
-        self,
-        *,
-        umo=UMO,
-        message_id="m-1",
-        platform="aiocqhttp",
-        plugins_name=None,
-        send_error=None,
-    ):
-        self._send_error = send_error
-        self.unified_msg_origin = umo
-        self.message_str = "帮我看下这个页面"
-        self.plugins_name = list(plugins_name) if plugins_name else None
-        self.platform_meta = _FakePlatformMeta(name=platform, id=umo.split(":")[0])
-        self.message_obj = _FakeMessage()
-        self.message_obj.message_id = message_id
-        self.message_obj.type = umo.split(":")[1]
-        self.session_id = umo.split(":")[-1]
-        self.sent = []
-        self.send_calls = 0
-
-    def get_group_id(self):
-        return self.message_obj.group.group_id
-
-    def get_sender_id(self):
-        return self.message_obj.sender.user_id
-
-    def get_platform_name(self):
-        return self.platform_meta.name
-
-    def image_result(self, path):
-        return ("image", str(path))
-
-    def chain_result(self, chain):
-        return ("chain", chain)
-
-    async def send(self, message):
-        self.send_calls += 1
-        if self._send_error is not None:
-            raise self._send_error
-        self.sent.append(message)
-
-
-class FakeContext:
-    """假 ``Context``：只实现投递需要的两件事（``send_message`` + 只读平台表）。"""
-
-    def __init__(
-        self,
-        *,
-        platform_insts=None,
-        send_result=True,
-        send_error=None,
-        on_send=None,
-    ):
-        self.send_calls = []
-        self._send_result = send_result
-        self._send_error = send_error
-        self.on_send = on_send
-        insts = (
-            [_FakePlatformInst(_FakePlatformMeta())]
-            if platform_insts is None
-            else list(platform_insts)
-        )
-        self.platform_manager = type("PM", (), {"platform_insts": insts})()
-
-    async def send_message(self, umo, chain):
-        self.send_calls.append((umo, list(getattr(chain, "chain", []) or [])))
-        if self.on_send is not None:
-            self.on_send()
-        if self._send_error is not None:
-            raise self._send_error
-        return self._send_result
-
-
-class _Handler:
-    def __init__(self, name, fn, *, module="data.plugins.probe.main", plugin="probe"):
-        self.handler_name = name
-        self.handler_module_path = module
-        self.plugin_name = plugin
-        self.handler = fn
-
-
-class FakeRegistry:
-    """按核心语义过滤：事件类型（按 ``name``）/ 插件白名单（``None`` 与 ``["*"]`` 全放行）。"""
-
-    def __init__(self, decorating=(), after_sent=()):
-        self.decorating = list(decorating)
-        self.after_sent = list(after_sent)
-        self.calls = []
-
-    def get_handlers_by_event_type(self, event_type, only_activated=True, plugins_name=None):
-        hook = str(getattr(event_type, "name", event_type))
-        self.calls.append({"hook": hook, "plugins_name": None if plugins_name is None else list(plugins_name)})
-        if hook == "OnDecoratingResultEvent":
-            pool = self.decorating
-        elif hook == "OnAfterMessageSentEvent":
-            pool = self.after_sent
-        else:
-            return []
-        return [
-            handler
-            for handler in pool
-            if plugins_name is None
-            or plugins_name == ["*"]
-            or handler.plugin_name in plugins_name
-        ]
-
-
-def make_framework(registry=None):
-    return active_send.Framework(
-        event_cls=_FakeSyntheticEvent,
-        message_cls=_FakeMessage,
-        group_cls=_FakeGroup,
-        member_cls=_FakeMember,
-        session_cls=_FakeSession,
-        platform_meta_cls=_FakePlatformMeta,
-        chain_cls=_FakeChain,
-        result_cls=_FakeResult,
-        content_type_cls=_FakeContentType,
-        plain_cls=_FakePlain,
-        registry=registry if registry is not None else FakeRegistry(),
-        event_types={
-            active_send.HOOK_DECORATING: "OnDecoratingResultEvent",
-            active_send.HOOK_AFTER_SENT: "OnAfterMessageSentEvent",
-        },
-    )
-
-
-def install_framework(monkeypatch, registry=None):
-    """把 ``active_send.load_framework`` 换成假框架（本文件与媒体用例共用）。"""
-    framework = make_framework(registry)
-    monkeypatch.setattr(active_send, "load_framework", lambda: framework)
-    return framework
-
-
-def make_plugin(tmp_path, context):
-    """装配一个可投递的插件替身（不建浏览器、不联网）。"""
-    plugin = helpers._bare_plugin(tmp_path)
-    plugin.context = context
-    plugin.background_mode = "browse_only"
-    return plugin
-
-
-def make_job(*, task_id="bg-9001", trigger_key="", progress=None, status="running"):
-    job = bg.BackgroundJob(
-        task_id=task_id,
-        umo=UMO,
-        tool=main_module._BROWSE_WEB_TOOL_NAME,
-        budget_s=30.0,
-        task_key=bg.task_key(UMO, main_module._BROWSE_WEB_TOOL_NAME, "t"),
-        trigger_key=trigger_key,
-        status=status,
-    )
-    job.progress = dict(progress or {})
-    return job
-
-
-def deliver_once(plugin, event, job, *, body="【后台任务完成】正文", status="ok"):
-    """直接调用生产投递入口（快照 + 回退句柄由 ``_terminal_deliverer`` 固定）。
-
-    任务先登记进本插件的 registry：``note_delivery`` 的额度是按 task 记的。
-    """
-    plugin._watchdog.registry.register(job)
-    snapshot = active_send.snapshot_from_event(event, umo=plugin._umo_of(event))
-    return asyncio.run(
-        plugin._deliver_terminal(job, status, body, snapshot=snapshot, fallback_send=event.send)
-    )
-
-
-async def _wait_handle(handle, *, timeout=3.0):
-    """等到这个 handle 收尾（``_finalize`` 只跑一次；不依赖 registry 残留）。"""
-    deadline = asyncio.get_running_loop().time() + timeout
-    while asyncio.get_running_loop().time() < deadline:
-        if handle.finalized:
-            await asyncio.sleep(0)
-            return handle
-        await asyncio.sleep(0.01)
-    raise AssertionError(f"任务 {handle.task_id} 没有在 {timeout}s 内收尾")
+import v176_fakes as v176  # noqa: E402 — 共用假件（R14：假框架只在 tests/v176_fakes.py 一份）
+from v176_fakes import (  # noqa: E402
+    UMO,
+    FakeContext,
+    FakeHandler as _Handler,
+    FakePlain as _FakePlain,
+    FakeRegistry,
+    FakeResult as _FakeResult,
+    RealEventStub,
+    deliver_once,
+    install_framework,
+    make_job,
+    make_plugin,
+    wait_handle as _wait_handle,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -460,20 +130,32 @@ def test_send_error_is_recorded_not_retried(tmp_path, monkeypatch):
 
 
 def test_platform_missing_falls_back_to_event_send(tmp_path, monkeypatch):
+    """R5：平台缺失是**原因**、回退救回是**结果** —— 账上把两者分开记。
+
+    ``error`` 只表示"通道报告了失败"：回退腿成功 ⇒ ``error=""``；
+    L1 腿为什么没用上记在 ``notes``（``Recovered:PlatformNotFound``），WARN 仍照打
+    （不静默）。spec §4.2 该行按本实现改写（spec 勘误 r1）。
+    """
     install_framework(monkeypatch)
     context = FakeContext(platform_insts=[])  # 平台实例一个都没有
     plugin = make_plugin(tmp_path, context)
     event = RealEventStub()
     job = make_job()
+    log = v176.plugin_logger(monkeypatch)
 
     receipt = deliver_once(plugin, event, job)
 
-    assert receipt.error == active_send.ERROR_PLATFORM_NOT_FOUND
-    assert receipt.accepted_by_platform is True
+    assert receipt.error == "", "回退救回 ⇒ 通道没报告失败"
+    assert "Recovered:PlatformNotFound" in receipt.notes, "L1 腿没走的原因必须留痕"
+    assert receipt.accepted_by_platform is True and receipt.dispatched is True
     assert receipt.sent_via == active_send.CHANNEL_FALLBACK
     assert context.send_calls == [], "平台找不到时不走 L1"
     assert event.send_calls == 1, "回退句柄必须用一次（不静默丢消息）"
     assert "【后台任务完成】" in str(event.sent[0])
+    assert any("平台实例未找到" in text for text in log.texts("WARNING")), "不静默：平台缺失必须 WARN"
+    assert any("已由平台回退救回" in text for text in log.texts("WARNING")), (
+        "回退救回也要留痕（与「没发出去」区分）"
+    )
 
 
 def test_decorator_suppressed_records_attempted_false(tmp_path, monkeypatch):
@@ -497,6 +179,127 @@ def test_decorator_suppressed_records_attempted_false(tmp_path, monkeypatch):
     assert context.send_calls == [] and event.send_calls == 0
 
 
+def test_webchat_delivery_marks_persisted_only_in_log(tmp_path, monkeypatch):
+    """R6 / §4.2 webchat 行：无活跃流 ⇒ 消息**落库**，日志加只读标记，决策不变。"""
+    install_framework(monkeypatch)
+    context = FakeContext(platform_name="webchat", platform_id="webchat")
+    plugin = make_plugin(tmp_path, context)
+    webchat_event = RealEventStub(platform="webchat", umo="webchat:FriendMessage:room-1")
+
+    log = v176.plugin_logger(monkeypatch)
+    receipt = deliver_once(plugin, webchat_event, make_job())
+
+    assert receipt.accepted_by_platform is True
+    assert receipt.sent_via == active_send.CHANNEL_CONTEXT
+    assert receipt.error == ""
+    assert any("webchat_persisted=1" in text for text in log.texts("INFO")), (
+        "webchat 的「落库」必须让 ops 看得见"
+    )
+    assert len(context.send_calls) == 1
+
+    # 非 webchat 不打这个标记（只读判断，不改任何账字段）
+    log.records.clear()
+    install_framework(monkeypatch)
+    plain_plugin = make_plugin(tmp_path, FakeContext())
+    other = deliver_once(plain_plugin, RealEventStub(), make_job())
+    assert other.sent_via == active_send.CHANNEL_CONTEXT
+    assert not any("webchat_persisted=1" in text for text in log.texts("INFO"))
+
+
+def test_send_message_true_is_not_delivery_proof(tmp_path, monkeypatch):
+    """R7 / §4.1：``send_message`` 返回 True 只代表**找到匹配的平台**，不是"用户收到"。
+
+    用户可见后果：``qq_official`` 群场景适配器可能静默跳过 —— 账上不许冒出任何
+    "已送达/已读"语义字段，只能有 ``accepted_by_platform``（= 通道报告成功）。
+    """
+
+    class SkippingContext(FakeContext):
+        async def send_message(self, umo, chain):
+            self.send_calls.append((umo, list(getattr(chain, "chain", []) or [])))
+            self.skip_next()  # 适配器内部记一次"跳过"（用户没收到）
+            return True  # 但它仍然按核心语义返回"找到平台"
+
+    install_framework(monkeypatch)
+    context = SkippingContext()
+    plugin = make_plugin(tmp_path, context)
+
+    receipt = deliver_once(plugin, RealEventStub(), make_job())
+
+    assert context.skipped == 1, "桩内部确实跳过了发送"
+    assert receipt.accepted_by_platform is True, "账只记「通道报告成功」"
+    assert receipt.sent_via == active_send.CHANNEL_CONTEXT
+    field_names = {item.name for item in dataclasses.fields(receipt)}
+    for forbidden in ("delivered", "delivered_to_user", "read", "acked", "user_seen"):
+        assert forbidden not in field_names, f"账里不许有「已送达」语义字段 {forbidden}"
+    # §4.1 的语义逐字钉住（docstring 是"给后来人看的合同"）
+    module_doc = active_send.__doc__ or ""
+    assert "是否找到匹配的平台" in module_doc, "§4.1 的核心 docstring 语义必须逐字写进模块文档"
+    assert "不代表用户收到" in module_doc, "不许把这个 True 读成「已送达」"
+
+
+def test_splitter_patch_and_hook_both_installed(tmp_path, monkeypatch):
+    """R8 / §5.6：``splitter`` 补丁与装饰钩子**同装**时，终态仍然是恰好一条。"""
+
+    async def keep_last_segment(event):
+        result = event.get_result()
+        if result is not None and result.chain:
+            event.set_result(_FakeResult(result.chain[-1:]))
+
+    registry = FakeRegistry(decorating=[_Handler("splitter_segments", keep_last_segment)])
+    install_framework(monkeypatch, registry)
+    context = FakeContext()
+    context._splitter_send_patched = True  # 只读探测：补丁装着
+    plugin = make_plugin(tmp_path, context)
+
+    log = v176.plugin_logger(monkeypatch)
+    receipt = deliver_once(plugin, RealEventStub(), make_job())
+
+    assert len(context.send_calls) == 1, "补丁 + 钩子同装也只发一条"
+    assert receipt.accepted_by_platform is True
+    assert "splitter_patch=1" in receipt.notes
+    assert any("splitter_patch=1" in text for text in log.texts("INFO")), (
+        "标记必须进已投递 INFO 行（ops 一眼可见）"
+    )
+
+
+def test_at_tag_turns_into_component_only_via_decorating_hook(tmp_path, monkeypatch):
+    """R8 / §5.7：``[at:1]`` 只有装饰钩子在场时才变成 ``At`` 组件；否则原样发文本。"""
+
+    async def replace_at_tag(event):
+        result = event.get_result()
+        chain = list(result.chain) if result is not None else []
+        rebuilt = []
+        for component in chain:
+            text = getattr(component, "text", "")
+            if "[at:1]" in text:
+                rebuilt.append(v176.FakeAt("10001", "tester"))
+            else:
+                rebuilt.append(component)
+        event.set_result(_FakeResult(rebuilt))
+
+    install_framework(monkeypatch)  # 没有装饰钩子
+    context = FakeContext()
+    plugin = make_plugin(tmp_path, context)
+    plain = deliver_once(plugin, RealEventStub(), make_job(), body="提醒 [at:1] 看这里")
+    plain_chain = context.send_calls[-1][1]
+    assert not any(getattr(item, "type", "") == "At" for item in plain_chain), (
+        "没有装饰钩子 ⇒ [at:1] 只能是文本（插件不越权替 AtTool 干活）"
+    )
+    assert plain.accepted_by_platform is True
+
+    registry = FakeRegistry(decorating=[_Handler("at_tags", replace_at_tag)])
+    install_framework(monkeypatch, registry)
+    context2 = FakeContext()
+    plugin2 = make_plugin(tmp_path, context2)
+    with_at = deliver_once(plugin2, RealEventStub(), make_job(), body="提醒 [at:1] 看这里")
+
+    delivered = context2.send_calls[-1][1]
+    assert any(getattr(item, "type", "") == "At" for item in delivered), (
+        "装饰钩子把 [at:1] 换成 At ⇒ 后台终态与前台同权"
+    )
+    assert with_at.accepted_by_platform is True
+
+
 # ---------------------------------------------------------------------------
 # 3. TerminalOutcome 记账 + 恰好一条 + 不重试（走真 watchdog）
 # ---------------------------------------------------------------------------
@@ -507,9 +310,10 @@ def _run_through_watchdog(plugin, event, *, runner=None):
         async def default_runner(progress):
             return "后台结论"
 
+        snapshot = active_send.snapshot_from_event(event, umo=plugin._umo_of(event))
         handle = plugin._watchdog.submit(
             runner=runner or default_runner,
-            deliver=plugin._terminal_deliverer(event),
+            deliver=plugin._terminal_deliverer(snapshot, event.send),
             umo=plugin._umo_of(event),
             tool=main_module._BROWSE_WEB_TOOL_NAME,
             task_text="记账用例",
@@ -525,13 +329,13 @@ def _run_through_watchdog(plugin, event, *, runner=None):
     return asyncio.run(_main())
 
 
-def test_finalize_records_delivery_receipt(tmp_path, monkeypatch, caplog):
+def test_finalize_records_delivery_receipt(tmp_path, monkeypatch):
     install_framework(monkeypatch)
     context = FakeContext()
     plugin = make_plugin(tmp_path, context)
 
-    with caplog.at_level("INFO"):
-        handle, _ = _run_through_watchdog(plugin, RealEventStub())
+    log = v176.plugin_logger(monkeypatch)
+    handle, _ = _run_through_watchdog(plugin, RealEventStub())
 
     outcome = handle.outcome
     assert outcome is not None
@@ -539,7 +343,7 @@ def test_finalize_records_delivery_receipt(tmp_path, monkeypatch, caplog):
     assert outcome.attempted is True and outcome.succeeded is True
     assert outcome.accepted_by_platform is True and outcome.error == ""
     assert outcome.sent_via == active_send.CHANNEL_CONTEXT
-    assert "attempted=1 accepted=1 sent_via=context.send_message" in caplog.text
+    assert any("attempted=1 accepted=1 sent_via=context.send_message" in text for text in log.texts("INFO"))
     assert len(context.send_calls) == 1
 
 
@@ -553,9 +357,10 @@ def test_exactly_one_terminal_message_even_if_finalize_twice(tmp_path, monkeypat
         async def runner(progress):
             return "一次就够"
 
+        snapshot = active_send.snapshot_from_event(event, umo=plugin._umo_of(event))
         handle = plugin._watchdog.submit(
             runner=runner,
-            deliver=plugin._terminal_deliverer(event),
+            deliver=plugin._terminal_deliverer(snapshot, event.send),
             umo=plugin._umo_of(event),
             tool=main_module._BROWSE_WEB_TOOL_NAME,
             task_text="恰好一条",
@@ -580,14 +385,14 @@ def test_exactly_one_terminal_message_even_if_finalize_twice(tmp_path, monkeypat
     assert handle.job.terminal_sent == 1
 
 
-def test_delivery_failure_is_recorded_and_logged(tmp_path, monkeypatch, caplog):
+def test_delivery_failure_is_recorded_and_logged(tmp_path, monkeypatch):
     install_framework(monkeypatch)
     context = FakeContext(send_error=RuntimeError("adapter down"))
     plugin = make_plugin(tmp_path, context)
     event = RealEventStub(send_error=RuntimeError("event gone"))
 
-    with caplog.at_level("WARNING"):
-        handle, _ = _run_through_watchdog(plugin, event)
+    log = v176.plugin_logger(monkeypatch)
+    handle, _ = _run_through_watchdog(plugin, event)
 
     outcome = handle.outcome
     assert outcome.attempted is True and outcome.succeeded is False
@@ -595,8 +400,11 @@ def test_delivery_failure_is_recorded_and_logged(tmp_path, monkeypatch, caplog):
     assert outcome.error == "PlatformSendError:RuntimeError"
     assert outcome.sent_via == active_send.CHANNEL_FALLBACK
     assert outcome.delivered is True, "闸放行过（额度已消耗）但发送没成功 —— 两件事分开记"
-    assert "后台任务终态投递失败" in caplog.text
-    assert "PlatformSendError:RuntimeError" in caplog.text
+    failures = log.texts("WARNING")
+    assert any("后台终态投递失败" in text for text in failures), (
+        "§4.4 的失败面只在投递层落一条（后台层已降 DEBUG）"
+    )
+    assert any("PlatformSendError:RuntimeError" in text for text in failures)
     assert len(context.send_calls) == 1 and event.send_calls == 1, "不重试"
 
 
@@ -737,8 +545,9 @@ def test_terminal_deliverer_captures_snapshot_and_fallback_only(tmp_path, monkey
     install_framework(monkeypatch)
     plugin = make_plugin(tmp_path, FakeContext())
     event = RealEventStub()
+    snap = active_send.snapshot_from_event(event, umo=plugin._umo_of(event))
 
-    deliver = plugin._terminal_deliverer(event)
+    deliver = plugin._terminal_deliverer(snap, event.send)
 
     assert deliver.func == plugin._deliver_terminal
     assert deliver.args == ()

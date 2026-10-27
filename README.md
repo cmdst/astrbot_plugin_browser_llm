@@ -98,7 +98,8 @@ python tools/migrate_config_v6.py --strip-v6       # 只删 v6 新叶（成对�
    "只为发送而生"的事件（读提交时快照）→ 重放 `on_decorating_result`（装饰链 / 分段 /
    表情类插件**现在能看见**它）→ `Context.send_message(umo, chain)` → 重放
    `on_after_message_sent`。合成事件的结果类型是 `LLM_RESULT`、`plugins_name` 继承原事件。
-2. **一次后台任务 = 恰好一条消息（含附件）**：后台 `_emit_media` 只登记路径，截图/视频
+2. **一次后台任务 = 恰好一条终态投递（含附件；装了分段插件的部署可能被分成多段，见已知边界）**：
+   后台 `_emit_media` 只登记路径，截图/视频
    随终态那一条作为附件发出（`progress["artifacts"]` ≤12 条；缺失文件只计数，不拖垮终态）。
 3. **记账拆字段**：`delivered` 拆成 `attempted` / `succeeded` / `accepted_by_platform` /
    `error` / `sent_via`；`delivered` 只剩"终态额度被放行过"的闸语义。日志按
@@ -107,13 +108,17 @@ python tools/migrate_config_v6.py --strip-v6       # 只删 v6 新叶（成对�
    `kind=duplicate_trigger`）；取不到 `message_id` 时退回内容指纹 + `tools.dedupe_window_s`
    （默认 600s）；在途任务不受窗口限制。
 5. **平台回退**：平台实例缺失 / 平台抛错 / `umo` 不可解析，或 `qq_official` 这类主动发送
-   受限的平台，才回退到提交时捕获的 `event.send`（`sent_via=platform_fallback`，只调一次）；
-   回退也失败则记 `error`，不重试、不静默。
+   受限的平台，才回退到提交时捕获的 `event.send`（`sent_via=platform_fallback`，只调一次）。
+   **回退救回时 `error` 留空**（通道没报告失败），L1 腿为什么没用上记在 `notes`
+   （`Recovered:PlatformNotFound` 等）并打 WARN；回退也失败才记 `error`，不重试、不静默。
 
 **已知边界**（详见 CHANGELOG v1.7.6「已知边界」）：核心**内容安全 stage 不重放**（主动消息
 不过审查，L3 残差交 fix）；`provider_ltm_settings.group_message_history_enable` 为真时群会话
-会多写一条 bot 侧长期记忆历史；`qq_official` 群场景可能被适配器静默跳过（只能 WARN）；
-钩子重放有 10s/个、20s/段 的超时上限。
+会多写一条 bot 侧长期记忆历史；`qq_official` 群场景可能被适配器静默跳过（只能 WARN，已投递
+日志会带 `webchat_persisted=1` 之类的只读标记帮你分辨落库场景）；钩子重放有 10s/个、20s/段
+的超时上限，异常/超时记在 `hook_errors`（`HookTimeout:<plugin>.<handler>` /
+`HookError:<plugin>.<handler>`），WARN 可见但不污染 `error`；**装饰方发了一部分又留了链**
+时我们与核心一样会发两条（继承核心行为，不做特殊处理）。
 
 ## 📁 仓库结构（v1.7.6）
 
@@ -134,10 +139,10 @@ core/crawler.py              正文抓取（逐跳 SSRF + 限长 + 文本化）
 core/extract.py              正文/链接提取
 core/http.py                 HTTP 传输层（aiohttp 优先 / 标准库兜底，均不跟随重定向）
 core/safety.py               SSRF + 内容禁词
-core/delivery.py             后台媒体登记（artifact_sink / collect_artifact / current_artifacts）
+core/delivery.py             后台媒体登记（artifact_sink / collect_artifact；current_artifacts 仅测试/诊断用）
 core/active_send.py          投递适配层：合成事件 + 重放装饰/发送后钩子 + L1/回退 + 四形态记账
 tools/migrate_config_v6.py   配置迁移器（v3/v4/v5 → v6 单跳；五模式）
-tests/                       门禁（33 个 test_*.py + conftest.py）
+tests/                       门禁（34 个 test_*.py + conftest.py）
 ```
 
 `core/` 现有 17 个模块（`__init__.py` 之外），每个都有生产调用方（`main.py`）。
@@ -168,8 +173,8 @@ PYTHONDONTWRITEBYTECODE=1 /root/AstrBot/.venv/bin/python -m pytest tests/ -q -p 
 /root/AstrBot/.venv/bin/python -m ruff check .
 ```
 
-当前门禁：**865 passed / 0 failed**（v1.7.6 实测数；v1.7.5 的 786 见 CHANGELOG）；
-`tests/` 下 **33 个 `test_*.py`** + `conftest.py`。
+当前门禁：**879 passed / 0 failed**（v1.7.6 实测数；v1.7.5 的 786 见 CHANGELOG）；
+`tests/` 下 **34 个 `test_*.py`** + `conftest.py`。
 守卫模块是"文档/配置/工具面"的主闸门，
 改任何一层都会先红：
 
@@ -181,6 +186,7 @@ PYTHONDONTWRITEBYTECODE=1 /root/AstrBot/.venv/bin/python -m pytest tests/ -q -p 
 | `test_v175_background_wiring.py` | 后台只走 watchdog、终态走 `active_send` 适配器（闸 → 钩子 → L1/回退）、无 core 引擎残留 |
 | `test_v176_docs_vs_code.py` | v1.7.6 口径：版本四处、叶数 57/59、工具面 3+5、新行为与记账字段、已知边界，且文档里的标识符必须与代码常量一致 |
 | `test_v176_active_send.py` / `test_v176_delivery_parity.py` / `test_v176_media_delivery.py` | 投递适配层（四形态/钩子顺序/平台闸）、接线与记账、后台媒体随终态一条 |
+| `test_v176_lifecycle.py` | 事件生命周期纪律 C1–C8：后台零访问原事件（探针）、回退句柄至多一次、AST 判三种执行体无平台能力 |
 
 其余分组：感知（`test_v175_a11y.py`）、动作（`test_v175_action_model.py` / `test_v175_executor.py`）、
 验证（`test_v175_verify.py`）、后台（`test_v175_background.py`）、内层执行体（`test_v175_agent.py`）、

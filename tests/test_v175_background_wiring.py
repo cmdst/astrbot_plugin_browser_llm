@@ -79,17 +79,57 @@ def test_config_map_keeps_only_the_frozen_v5_drop_record():
         )
 
 
-def test_three_entries_submit_through_the_watchdog():
-    src = _src("main.py")
-    assert "self._watchdog = BudgetWatchdog(" in src, "watchdog 没在 __init__ 建起来"
-    submit_body = src[src.index("    async def _submit_background("):]
-    submit_body = submit_body[: submit_body.index("\n    async def ", 10)]
-    assert "self._watchdog.submit(" in submit_body, "提交没走 watchdog"
-    for key in ("budget_s=", "max_chars=", "dedupe_window_s=", "max_parallel=", "task_text="):
-        assert key in submit_body, f"submit 缺 {key}"
-    # 三个外层入口都要能进后台分支
-    for tool in ("_BROWSE_WEB_TOOL_NAME", "_LOCAL_PAGE_TOOL_NAME", "_SEARCH_TOOL_NAME"):
-        assert f"_background_enabled_for({tool})" in src, f"{tool} 没有后台分支"
+def test_three_entries_submit_through_the_watchdog(tmp_path):
+    """R15：执行级（取代"源码里有没有这个串"的三条断言）。
+
+    直接装配真插件：①``_watchdog`` 真的是 ``BudgetWatchdog``；②三种 ``background_mode``
+    下三个工具的分派布尔与设计一致（``browse_local_page`` 只在 ``all`` 里进后台）；
+    ③提交真的会起一个被 watchdog 管着的任务（受理文案 + 任务登记）。
+    """
+    from astrbot_plugin_browser_llm.core import background as bg
+
+    sys.path.insert(0, str(ROOT / "tests"))
+    import v176_fakes as v176
+
+    plugin = v176.make_plugin(tmp_path, v176.FakeContext())
+    assert isinstance(plugin._watchdog, bg.BudgetWatchdog), "watchdog 没在 __init__ 建起来"
+
+    expectations = {
+        ("_BROWSE_WEB_TOOL_NAME", "off"): False,
+        ("_BROWSE_WEB_TOOL_NAME", "browse_only"): True,
+        ("_BROWSE_WEB_TOOL_NAME", "all"): True,
+        ("_LOCAL_PAGE_TOOL_NAME", "off"): False,
+        ("_LOCAL_PAGE_TOOL_NAME", "browse_only"): False,
+        ("_LOCAL_PAGE_TOOL_NAME", "all"): True,
+        ("_SEARCH_TOOL_NAME", "off"): False,
+        ("_SEARCH_TOOL_NAME", "browse_only"): False,
+        ("_SEARCH_TOOL_NAME", "all"): True,
+    }
+    for (tool_attr, mode), expected in expectations.items():
+        plugin.background_mode = mode
+        tool = getattr(main_module, tool_attr)
+        assert plugin._background_enabled_for(tool) is expected, (tool, mode)
+
+    # 提交一次：真的走 watchdog（受理文案 + 任务登记 + 额度）
+    plugin.background_mode = "browse_only"
+
+    async def _main():
+        reply = await plugin._submit_background(
+            event=v176.RealEventStub(),
+            tool_name=main_module._BROWSE_WEB_TOOL_NAME,
+            task_text="watchdog 接线",
+            runner=lambda view, progress: _stub_runner(progress),
+        )
+        handle = next(iter(plugin._watchdog._handles.values()))
+        await v176.wait_handle(handle)
+        return reply, handle
+
+    async def _stub_runner(progress):
+        return "结论"
+
+    reply, handle = asyncio.run(_main())
+    assert "已受理" in reply and handle.task_id in reply
+    assert handle.job is not None and handle.job.budget_s > 0
 
 
 def test_deliver_terminal_goes_through_active_send(tmp_path, monkeypatch):
@@ -99,7 +139,7 @@ def test_deliver_terminal_goes_through_active_send(tmp_path, monkeypatch):
     平台可用时**一次** ``event.send`` 都不调用；U3/U4 红线靠"这些能力根本不存在"兜住。
     """
     sys.path.insert(0, str(ROOT / "tests"))
-    import test_v176_delivery_parity as v176  # 复用假框架 / 假 Context / 装配
+    import v176_fakes as v176  # 复用共用假件（假框架 / 假 Context / 装配）
 
     v176.install_framework(monkeypatch)
     context = v176.FakeContext()
@@ -118,12 +158,38 @@ def test_deliver_terminal_goes_through_active_send(tmp_path, monkeypatch):
         assert not hasattr(plugin, forbidden), f"插件上不该存在 {forbidden}（U3/U4 红线）"
 
 
-def test_terminate_uses_watchdog_shutdown():
-    src = _src("main.py")
-    start = src.index("    async def terminate(")
-    body = src[start : start + 4000]
-    assert "self._watchdog.shutdown(" in body, "terminate 必须走 watchdog.shutdown"
-    assert "_cancel_background_tasks" not in src, "旧的取消实现应已删除"
+def test_terminate_uses_watchdog_shutdown(tmp_path):
+    """R15：执行级 —— ``terminate()`` 真的把在跑任务取消掉（而不是看源码里有没有那行）。"""
+    sys.path.insert(0, str(ROOT / "tests"))
+    import v176_fakes as v176
+
+    plugin = v176.make_plugin(tmp_path, v176.FakeContext())
+
+    async def _main():
+        started = asyncio.Event()
+
+        async def _slow(progress):
+            started.set()
+            await asyncio.sleep(30)
+            return "不该跑到这里"
+
+        await plugin._submit_background(
+            event=v176.RealEventStub(),
+            tool_name=main_module._BROWSE_WEB_TOOL_NAME,
+            task_text="terminate 用例",
+            runner=lambda view, progress: _slow(progress),
+        )
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+        # 只补 terminate 需要的两个清理任务句柄（替身没跑启动钩子）
+        plugin._cache_cleanup_task = None
+        plugin._agent_provider_sync_task = None
+        before = len(plugin._watchdog.registry.running())
+        await plugin.terminate()
+        return before, len(plugin._watchdog.registry.running())
+
+    before, after = asyncio.run(_main())
+    assert before >= 1 and after == 0, "terminate 必须经 watchdog 取消在跑任务"
+    assert not hasattr(plugin, "_cancel_background_tasks"), "旧的取消实现应已删除"
 
 
 def test_accepted_reply_comes_from_the_watchdog(tmp_path):
