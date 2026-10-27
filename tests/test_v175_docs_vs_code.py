@@ -5,7 +5,7 @@
 1. **版本四处同一笔**：`metadata.yaml` / `main._PLUGIN_VERSION_FALLBACK` /
    CHANGELOG 首节 / README「当前版本」；
 2. **工具面**：外层 3 个名字不变 + 内层 5 个（26 → 5）；
-3. **配置两口径**：配置叶 58 / JSON 叶子键 60（差 2 = `resources.viewport` 1↔3），
+3. **配置两口径**：配置叶 57 / JSON 叶子键 59（差 2 = `resources.viewport` 1↔3），
    且 README 与 CHANGELOG 都**带单位**写出来；
 4. **迁移与行为变化**：迁移器五模式（`--dry-run/--apply/--verify/--restore-from/--strip-v6`）、
    「先迁配置 + 成对回滚 + 只回其一会永久丢失」、以及**后台引擎退役带来的行为变化**
@@ -33,7 +33,7 @@ METADATA = (ROOT / "metadata.yaml").read_text(encoding="utf-8")
 SCHEMA = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8-sig"))
 MIGRATOR = (ROOT / "tools" / "migrate_config_v6.py").read_text(encoding="utf-8")
 
-EXPECTED_VERSION = "v1.7.5"
+EXPECTED_VERSION = "v1.7.6"  # 当前发布版本（发版时改这一行；四处同一笔由本文件守卫）
 EXPECTED_OUTER = ("browse_web", "browse_local_page", "browser_web_search")
 EXPECTED_LEAVES = 57
 EXPECTED_JSON_LEAVES = 59
@@ -77,8 +77,8 @@ def test_version_is_consistent_in_four_places():
     assert _version_of_metadata() == EXPECTED_VERSION, "metadata.yaml 的 version 没对齐"
     assert main_module._PLUGIN_VERSION_FALLBACK == EXPECTED_VERSION
     assert main_module.PLUGIN_VERSION == EXPECTED_VERSION
-    assert _first_changelog_version() == EXPECTED_VERSION, "CHANGELOG 首节不是 v1.7.5"
-    assert _readme_version() == EXPECTED_VERSION, "README 的「当前版本」不是 v1.7.5"
+    assert _first_changelog_version() == EXPECTED_VERSION, "CHANGELOG 首节不是当前版本"
+    assert _readme_version() == EXPECTED_VERSION, "README 的「当前版本」不是当前版本"
 
 
 def test_tool_surface_is_three_outer_plus_five_inner():
@@ -94,13 +94,13 @@ def test_tool_surface_is_three_outer_plus_five_inner():
 
 
 def test_config_counts_match_docs_with_units():
-    assert len(config_map.KEY_MAP) == EXPECTED_LEAVES, "配置叶必须是 58"
+    assert len(config_map.KEY_MAP) == EXPECTED_LEAVES, "配置叶必须是 57"
     assert len(config_map.GROUPS) == 7
-    assert len(_flatten(SCHEMA)) == EXPECTED_JSON_LEAVES, "JSON 叶子键必须是 60"
+    assert len(_flatten(SCHEMA)) == EXPECTED_JSON_LEAVES, "JSON 叶子键必须是 59"
     assert EXPECTED_JSON_LEAVES - EXPECTED_LEAVES == 2, "差 2 = resources.viewport 1↔3"
     for name, text in (("README", README), ("CHANGELOG", CHANGELOG)):
-        assert "配置叶 57 条" in text, f"{name} 缺「配置叶 58 条」"
-        assert "JSON 叶子键 59 个" in text, f"{name} 缺「JSON 叶子键 60 个」"
+        assert "配置叶 57 条" in text, f"{name} 缺「配置叶 57 条」"
+        assert "JSON 叶子键 59 个" in text, f"{name} 缺「JSON 叶子键 59 个」"
     assert "resources.viewport" in README
 
 
@@ -184,7 +184,7 @@ def test_readme_current_part_has_no_deleted_keys_or_tools():
 
 
 def test_readme_current_part_documents_v175_surface():
-    """R5：现行部分必须写全六层 / 5 工具 / 58 叶 / 无起始页 / 无 core 引擎。"""
+    """R5：现行部分必须写全六层 / 5 工具 / 57 叶 / 无起始页 / 无 core 引擎。"""
     current = _readme_current_section()
     for module in (
         "core/a11y.py",

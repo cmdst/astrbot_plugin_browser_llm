@@ -12,7 +12,8 @@
    ``a11y.render_snapshot`` 逐字等价，且 ``core/`` 里不再有私有 ``_node_line`` /
    ``_snapshot_header`` 实现；
 5. ``core/session.py`` 无起始页（``about:blank``）且提供按任务取页 ``claim_page``；
-6. 规模守则：``main.py`` ≤ 4200 行、``core/agent.py`` 600–750 行。
+6. 规模守则：``main.py`` ≤ 4300 行（spec §3.1 / v1.7.5 勘误 E6 口径）、
+   ``core/agent.py`` 600–750 行。
 """
 
 from __future__ import annotations
@@ -263,7 +264,7 @@ def test_config_reads_exist_in_v6_leaf_table():
 def test_line_budgets():
     main_lines = len((ROOT / "main.py").read_text(encoding="utf-8").splitlines())
     agent_lines = len((ROOT / "core" / "agent.py").read_text(encoding="utf-8").splitlines())
-    assert main_lines <= 4200, f"main.py {main_lines} 行（守则 ≤ 4200）"
+    assert main_lines <= 4300, f"main.py {main_lines} 行（守则 ≤ 4300）"
     assert 600 <= agent_lines <= 750, f"core/agent.py {agent_lines} 行（守则 600–750）"
 
 

@@ -4,6 +4,76 @@
 `data/` 目录（主仓库 .gitignore 忽略）迁移初始化而来。仅跟踪插件源码与测试，运行时
 数据（`data/`：截图、运行时配置、临时文件）一律不入库。
 
+## [v1.7.6] - 2026-10-28
+
+> **为什么抬到 `v1.7.6`**：本版是**投递语义**的行为变化（不是破坏性重构）：后台终态从
+> "捕获的 `event.send` 直捅适配器"改成"走正规主动发送通道 + 重放生态钩子"，投递成败从
+> 一个布尔拆成可证的多字段账。配置结构**零变更**（仍是 7 组 / **配置叶 57 条 = JSON 叶子键 59 个**），
+> 工具面一字未改（外层 3 / 内层 5），因此只抬 patch。
+
+### 行为变化（对用户可见）
+
+1. **后台终态改走 `Context.send_message` + 钩子重放**（"后台与前台同权"）：终态不再
+   `event.send` 直捅适配器，而是先合成一个"只为发送而生"的事件（读提交时快照），重放
+   `on_decorating_result` —— 装饰链 / 分段 / 表情类插件**现在能看见**这条消息 —— 再走
+   `Context.send_message(umo, chain)`，最后重放 `on_after_message_sent`。
+   合成事件的结果类型是 `LLM_RESULT`（`is_llm_result()` 为真，`llm_only` 门放行），
+   `plugins_name` 原样继承原事件（白名单语义与会话插件集一致）；`message_obj.message` /
+   `message_str` / `raw_message` 诚实留空（不假装拥有原始消息，依赖 `raw_message` 的插件
+   在主动链上会退化）。
+2. **后台媒体不再各自一条消息**（F-G4 修复）：后台 `_emit_media` 只登记路径、**绝不**
+   `event.send`；截图/视频随**终态那一条**作为附件发出（`progress["artifacts"]` ≤12 条，
+   缺失文件只计数、不拖垮终态）。升级后观感：一次后台任务 = **恰好一条**消息（含附件），
+   不再是"每条截图一条裸消息 + 一条终态"。
+3. **触发消息 ID 去重**：同一句用户消息（`message_id`）在同一会话同一工具下只允许一个
+   后台任务 —— 模型换个措辞再调一次也会被拦（日志 `kind=duplicate_trigger`）；取不到
+   `message_id` 时退回原有的内容指纹 + `tools.dedupe_window_s`（默认 600s）；**在途任务
+   不受窗口限制**。
+4. **平台回退**：`qq_official` / `qq_official_webhook` 等主动发送受限的平台，或平台实例
+   缺失、平台抛错、`umo` 不可解析时，回退到**提交时捕获**的 `event.send` 绑定方法
+   （唯一例外，只调一次），日志带 `sent_via=platform_fallback`；回退也失败则记 `error`，
+   **不重试、不静默**。
+
+### 记账变化（日志 / 调用方可见）
+
+- `TerminalOutcome.delivered`（单个布尔）**拆成五个字段**：`attempted`（是否进入发送阶段）、
+  `succeeded`（整体判定）、`accepted_by_platform`（通道报告成功）、`error`（第一处失败/跳过
+  原因）、`sent_via`（`context.send_message` / `platform_fallback` / `decorator` / `none`）。
+  `delivered` 保留但**语义收窄**为"终态额度被放行过"（每任务恰好一条的闸），
+  **不再**代表"发送成功"——闸放行但平台没收到时 `delivered=1` 而 `accepted_by_platform=0`。
+- 日志按级分流：装饰方压制 → WARNING（`reason=DecoratorSuppressed`）；尝试了但没成功 →
+  WARNING（带 `error=` 与 `sent_via=`）；平台已接收 → INFO（`attempted=1 accepted=1
+  sent_via=…`）。**注意**：`Context.send_message` 返回 True 只代表"找到匹配的平台"，不代表
+  用户真的收到（`qq_official` 群场景可能被适配器静默跳过）。
+- 投递失败**不重试**（"不重"优先于"不丢"）：终态额度已消耗就不再发第二条；失败面靠 WARN 可见。
+
+### 已知边界（本版**不做**的事）
+
+1. **内容安全 stage 不重放**（L3 残差）：核心 `ContentSafetyCheckStage` 是 **stage 级**装饰，
+   不在 `on_decorating_result` 钩子链里 —— 后台终态**不过**内容安全审查。部署若开了
+   `content_safety.also_use_in_response`，主动消息也不受它管；需要核心侧提供"主动发送前的
+   stage 级检查"API（交 fix）。
+2. **群聊历史库可能写入**：`Context.send_message` 在 `provider_ltm_settings` 的
+   `group_message_history_enable` 为真、会话是群、平台名非 `webchat` 时，会把这条消息写进
+   长期记忆的群消息历史（`role="bot"`）。受核心配置控制，插件侧不改；不接受就关掉该核心开关。
+3. **`qq_official` 的"静默跳过"无法从插件侧判定**：群场景拿不到 `msg_id`/`scene` 时适配器
+   会跳过发送但仍返回成功；插件只能打 `platform_hint=qq_official_group_scene_unset` 的 WARN。
+4. **钩子重放有超时上限**（10s/个、20s/段、整条 30s）：极慢的第三方钩子会被跳过并记
+   `HookTimeout`，不阻塞终态。
+
+### 门禁与版本
+
+- 版本四处同一笔：`metadata.yaml` / `main._PLUGIN_VERSION_FALLBACK` / 本 CHANGELOG 首节 /
+  README「当前版本」= **v1.7.6**。
+- 全量门禁 **865 passed / 0 failed**、`ruff check .` clean、配置叶 **57 条 / JSON 叶子键
+  59 个**（**零配置变更**：`_conf_schema.json` 与 `tools/` 零 diff）。
+- 新增守卫 `tests/test_v176_docs_vs_code.py`（版本 / 叶数 / 工具面 / 新行为 / 记账 / 边界，
+  且文档里的标识符必须与代码常量一致）+ 投递层执行级用例
+  `tests/test_v176_active_send.py` / `tests/test_v176_delivery_parity.py` /
+  `tests/test_v176_media_delivery.py`。
+- `main.py` 行数守则（代码侧）从 4200 对齐到 **4300**（spec §3.1 与 v1.7.5 勘误 E6 既有口径；
+  本版实测 4197 行）。
+
 ## [v1.7.5] - 2026-10-27
 
 > **为什么抬到 `v1.7.5`**：本版是**破坏性架构重做**（感知/动作/执行/验证四层整体换栈、内层工具面 26 → 5、

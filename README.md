@@ -2,7 +2,13 @@
 
 Agent 驱动的网页浏览插件 —— 让 LLM 通过 function-calling 自主浏览网页：导航、搜索、点击链接、填表、滚动、截图识图、下载媒体，无需用户手动指令。
 
-当前版本：**v1.7.5**（变更见 [CHANGELOG](./CHANGELOG.md)；v1.7.5 是**破坏性架构重做** —— 感知/动作/执行/验证四层整体换栈：CDP A11y 树 + 结构化动作 + Playwright locator + CDP 受信任事件 + 操作后验证，截图仅兜底且必须叠 Set-of-Mark 编号；内层工具 **26 → 5**；配置结构 **v6**：**7 组 / 配置叶 57 条 = JSON 叶子键 59 个**；平台原生后台引擎按 spec §6.6 退役。外层三个工具名一字未改）
+当前版本：**v1.7.6**（变更见 [CHANGELOG](./CHANGELOG.md)；v1.7.6 是**投递语义**的行为变化 —— 后台终态改走
+`Context.send_message` + 重放 `on_decorating_result`/`on_after_message_sent`（装饰链/分段类插件现在能看见它），
+后台媒体随终态**一条**作为附件发出，投递记账拆成 `attempted`/`succeeded`/`accepted_by_platform`/`error`/`sent_via`；
+**零配置变更**、工具面一字未改。上一版 v1.7.5 是破坏性架构重做 —— 感知/动作/执行/验证四层整体换栈：
+CDP A11y 树 + 结构化动作 + Playwright locator + CDP 受信任事件 + 操作后验证，截图仅兜底且必须叠
+Set-of-Mark 编号；内层工具 **26 → 5**；配置结构 **v6**：**7 组 / 配置叶 57 条 = JSON 叶子键 59 个**；
+平台原生后台引擎按 spec §6.6 退役。外层三个工具名一字未改）
 
 > **看不懂「配置叶 57 条 = JSON 叶子键 59 个」？** 这是同一份 schema 的两种数法，两个都对，差 2 恒来自
 > `resources.viewport`（**1 条复合叶 ↔ 3 个 JSON 叶子键**：`width` / `height` / `device_scale_factor`）。
@@ -17,7 +23,7 @@ Agent 驱动的网页浏览插件 —— 让 LLM 通过 function-calling 自主�
 | ② | 动作 | `core/action_model.py` | 16 个动作 + JSON Schema + `R-A1..R-A14` 拒绝码（唯一闸门） |
 | ③ | 执行 | `core/executor.py` | target → Playwright locator（定位阶梯）+ CDP `Input.*` 受信任事件 |
 | ④ | 验证 | `core/verify.py` | expect / 六类差分 / `【无变化】` / 重复守卫 / 观测块**唯一**渲染处 |
-| ⑤ | 后台 | `core/background.py` | 任务表 + 整链墙钟看门狗 + `task_key` 去重 + 单次投递（硬不变量）+ 模板终态 |
+| ⑤ | 后台 | `core/background.py` | 任务表 + 整链墙钟看门狗 + 触发消息 ID / `task_key` 双通道去重 + 单次投递（硬不变量）+ 模板终态；投递走 `core/active_send.py`（合成事件 + 钩子重放 + `Context.send_message`） |
 | ⑥ | 配置 | `core/config_map.py` | v6 叶子唯一事实源 + `ConfigView` + v5 冻结视图 |
 
 **工具面**：外层 3 个（`browse_web` / `browse_local_page` / `browser_web_search`，名字不变）+ 内层 5 个
@@ -86,10 +92,33 @@ python tools/migrate_config_v6.py --strip-v6       # 只删 v6 新叶（成对�
    Set-of-Mark 编号，模型只回编号不回坐标。`perception.screenshot_to_chat`
    决定这张图**是否也发到会话**（默认 false = 只给模型看）。
 
-## 📁 仓库结构（v1.7.5）
+### v1.7.6 的行为变化：后台终态与前台回复同权
+
+1. **投递走正规通道 + 重放生态钩子**：终态不再 `event.send` 直捅适配器，而是合成一个
+   "只为发送而生"的事件（读提交时快照）→ 重放 `on_decorating_result`（装饰链 / 分段 /
+   表情类插件**现在能看见**它）→ `Context.send_message(umo, chain)` → 重放
+   `on_after_message_sent`。合成事件的结果类型是 `LLM_RESULT`、`plugins_name` 继承原事件。
+2. **一次后台任务 = 恰好一条消息（含附件）**：后台 `_emit_media` 只登记路径，截图/视频
+   随终态那一条作为附件发出（`progress["artifacts"]` ≤12 条；缺失文件只计数，不拖垮终态）。
+3. **记账拆字段**：`delivered` 拆成 `attempted` / `succeeded` / `accepted_by_platform` /
+   `error` / `sent_via`；`delivered` 只剩"终态额度被放行过"的闸语义。日志按
+   「未投递 / 投递失败 / 已投递」分流，**平台已接收**才写 INFO。
+4. **触发消息 ID 去重**：同一句用户消息只允许一个后台任务（换措辞也拦，日志
+   `kind=duplicate_trigger`）；取不到 `message_id` 时退回内容指纹 + `tools.dedupe_window_s`
+   （默认 600s）；在途任务不受窗口限制。
+5. **平台回退**：平台实例缺失 / 平台抛错 / `umo` 不可解析，或 `qq_official` 这类主动发送
+   受限的平台，才回退到提交时捕获的 `event.send`（`sent_via=platform_fallback`，只调一次）；
+   回退也失败则记 `error`，不重试、不静默。
+
+**已知边界**（详见 CHANGELOG v1.7.6「已知边界」）：核心**内容安全 stage 不重放**（主动消息
+不过审查，L3 残差交 fix）；`provider_ltm_settings.group_message_history_enable` 为真时群会话
+会多写一条 bot 侧长期记忆历史；`qq_official` 群场景可能被适配器静默跳过（只能 WARN）；
+钩子重放有 10s/个、20s/段 的超时上限。
+
+## 📁 仓库结构（v1.7.6）
 
 ```text
-main.py                      唯一装配层（≤4200 行）：配置读取 + 三个外层入口 + 后台接线
+main.py                      唯一装配层（≤4300 行）：配置读取 + 三个外层入口 + 后台接线
 core/a11y.py                 ① 感知：CDP A11y 全树裁剪 / 文本通道 / Set-of-Mark / 帧链
 core/action_model.py         ② 动作：ACTION_SPEC 16 条 → JSON Schema + parse_action 闸门
 core/executor.py             ③ 执行：locator 定位阶梯 + CDP 受信任事件 + 16 动作矩阵
@@ -106,8 +135,9 @@ core/extract.py              正文/链接提取
 core/http.py                 HTTP 传输层（aiohttp 优先 / 标准库兜底，均不跟随重定向）
 core/safety.py               SSRF + 内容禁词
 core/delivery.py             后台媒体登记（artifact_sink / collect_artifact / current_artifacts）
+core/active_send.py          投递适配层：合成事件 + 重放装饰/发送后钩子 + L1/回退 + 四形态记账
 tools/migrate_config_v6.py   配置迁移器（v3/v4/v5 → v6 单跳；五模式）
-tests/                       门禁（32 个 test_*.py + conftest.py）
+tests/                       门禁（33 个 test_*.py + conftest.py）
 ```
 
 `core/` 现有 17 个模块（`__init__.py` 之外），每个都有生产调用方（`main.py`）。
@@ -138,8 +168,8 @@ PYTHONDONTWRITEBYTECODE=1 /root/AstrBot/.venv/bin/python -m pytest tests/ -q -p 
 /root/AstrBot/.venv/bin/python -m ruff check .
 ```
 
-当前门禁：**854 passed / 0 failed**（v1.7.6 新增投递层/媒体投递用例后的实测数；
-v1.7.5 的 786 见 CHANGELOG）；`tests/` 下 **32 个 `test_*.py`** + `conftest.py`。
+当前门禁：**865 passed / 0 failed**（v1.7.6 实测数；v1.7.5 的 786 见 CHANGELOG）；
+`tests/` 下 **33 个 `test_*.py`** + `conftest.py`。
 守卫模块是"文档/配置/工具面"的主闸门，
 改任何一层都会先红：
 
@@ -148,7 +178,9 @@ v1.7.5 的 786 见 CHANGELOG）；`tests/` 下 **32 个 `test_*.py`** + `conftes
 | `test_v175_docs_vs_code.py` | 版本四处一致、工具面 3+5、叶数口径、动作清单/observe 视图**从 ACTION_SPEC 生成**比对、README 现行部分不得出现已删键与工具名 |
 | `test_v175_tools.py` | 工具面、description 硬话、SoM 行为、单渲染处、行数预算 |
 | `test_v175_config_readpoints.py` | schema ⇄ `LEAVES` ⇄ `main.py` 读取点 ⇄ 迁移器四方一致；热开关叶必须影响控制流 |
-| `test_v175_background_wiring.py` | 后台只走 watchdog、deliver 只 `event.send`、无 core 引擎残留 |
+| `test_v175_background_wiring.py` | 后台只走 watchdog、终态走 `active_send` 适配器（闸 → 钩子 → L1/回退）、无 core 引擎残留 |
+| `test_v176_docs_vs_code.py` | v1.7.6 口径：版本四处、叶数 57/59、工具面 3+5、新行为与记账字段、已知边界，且文档里的标识符必须与代码常量一致 |
+| `test_v176_active_send.py` / `test_v176_delivery_parity.py` / `test_v176_media_delivery.py` | 投递适配层（四形态/钩子顺序/平台闸）、接线与记账、后台媒体随终态一条 |
 
 其余分组：感知（`test_v175_a11y.py`）、动作（`test_v175_action_model.py` / `test_v175_executor.py`）、
 验证（`test_v175_verify.py`）、后台（`test_v175_background.py`）、内层执行体（`test_v175_agent.py`）、
