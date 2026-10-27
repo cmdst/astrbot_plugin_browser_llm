@@ -70,18 +70,25 @@ python tools/migrate_config_v6.py --verify --baseline
   `fill` 或 `Input.insertText`（不再 `page.type`）。
 - **D9**：取消路径不吞 `CancelledError`、不 await；关页时同时摘感知层 CDP 会话与执行层缓存。
 
-### 测试网：1128 → 775 的逐主题去向（R8）
+### 测试网：1128 → 785 的逐主题去向（R8）
 
-删除过时用例本身合理，但净 −421 条里有三处**非过时**缺口，处置如下（规格勘误 E7）：
+算术自洽（每一步都能用 `pytest tests/ -q` 复算）：
 
-| 去向 | 约计 | 内容 |
+| 步骤 | 条数 | 说明 |
 | --- | --- | --- |
-| 删除的 v1.3–v1.7.0 用例 | −421 | 主体是被删 API：caption 链 / core 引擎 / `search.mode` / 26 个旧原语 / v5 计数 / 历史迁移器 |
-| **本轮补回** | **+58** | `test_v175_local_page.py` 16（路径穿越/软链/扩展名/黑名单，R6）、`test_v175_agent.py` 22（8 格决策/人格三档/六段/台账/归类/抽图/作用域，R7）、`test_v175_repair_r1.py` 20（R1–R4/R9/R13/R17/R20–R22 的调用级回归） |
+| v1.7.0 基线 | 1128 | 规格 §12.3 的锚点 |
+| 删除过时的 v1.3–v1.7.0 用例 | **−421** | 主体是被删 API：caption 链 / core 引擎 / `search.mode` / 26 个旧原语 / v5 计数 / 历史迁移器 |
+| 小计（t7 收口时点） | **707** | 与 t7 回报一致 |
+| t11 补回非过时覆盖 | **+69** | `test_v175_local_page.py` 16（路径安全）+ `test_v175_agent.py` 22（内层执行体）+ `test_v175_repair_r1.py` 20（R1–R4 回归）+ t8 复检 5（已入库）+ docs 3 + migrator 3 |
+| 小计 | **776** | t11 门禁 |
+| t13 返工 | **+7** | 2 isolate 对照 + 1 deliver_once 删除 + 1 LRU + 1「禁旧数字」+ 2 README 生成式守卫 |
+| 小计 | **783** | t13 门禁 |
+| t15 收尾返工 | **+2** | 1 前台**执行级**超时（替换掉原来只读源码字符串的那条）+ 1「全 live 硬上限」（R31） |
+| **现行门禁** | **785** | **785 passed / 0 failed**、ruff clean、无 skip/xfail |
 
-现行门禁 **783 passed / 0 failed**、ruff clean。三个"覆盖缺口"的结论：
-R6/R7 **已补回**（不是接受缺口）；文档⇄代码由 `tests/test_v175_docs_vs_code.py`（10 条）承接。
-规格 §12.3 的「≥1128」据此作废（勘误 E7 改为「≥760 且 0 failed + 四个守卫模块全绿」）。
+三个"覆盖缺口"的结论：R6 路径安全与 R7 内层执行体**已补回**（不是接受缺口）；
+文档⇄代码由 `tests/test_v175_docs_vs_code.py` 承接。规格 §12.3 的「≥1128」据此作废
+（勘误 E7 改为「≥760 且 0 failed + 四个守卫模块全绿」）。
 
 ### 返工收口（round 2，t9 评审 24 条）
 
@@ -114,6 +121,26 @@ R6/R7 **已补回**（不是接受缺口）；文档⇄代码由 `tests/test_v17
   移入「历史版本」章节 + docs-gate；R6/R7 用例补回；R14/R16/R19/R24 进规格勘误
   `spec/20261027-v175-arch-spec-errata-r2.md`（E1–E8）。
 
+### 返工收口（round 4，t14 复评的 1 blocker + 4 open）
+
+- **B1（blocker）**：`_browse_web_run` 的超时分支调 `agent_core.render_ledger(...)` 时用了
+  不存在的 `self.ledger_max_lines`（正确名 `self.agent_ledger_max_lines`）⇒ 预算到点在
+  `if background: raise` **之前**就抛 `AttributeError` ⇒ 后台终态被记成 `failed` 而不是
+  `timeout`，`partial`/`steps`/`ledger` 三条终态字段全部不可达。已修。
+- **守卫从"读源码字符串"升级为"执行级"**：原超时用例只 `assert "if background:" in src`，
+  所以 B1 能逃过 783 条门禁。现在两条用例真跑 `_browse_web_run`（假 `context.tool_loop_agent`
+  睡 5s、预算 10ms）：① 前台返回「超过 N 秒硬上限被中止（已完成 1 步…）」而不是
+  `AttributeError`；② 后台经 watchdog 收尾为 `STATUS_TIMEOUT` + 终态正文是
+  `【后台任务超时】`，且 `progress["partial"]/["steps"]/["ledger"]` 三键都有值
+  （R11 的台账生产者由此**实测可达**，不再是"渲染器支持了但没人喂"）。
+- **R4-deliver**：README 架构表不再把 `deliver_once` 当模块职责；`core/background.py`
+  docstring 与迁移器的「58 叶 / 15 条新增」文案统一到 **57 叶 / 14 条新增**。
+- **R8**：测试数字改 **785** 并给出**可复算的算术**（1128 −421 → 707 → t11 +69 → 776 →
+  t13 +7 → 783 → t15 +2 → 785）；「禁旧数字」门禁同步（770/775/776/781/783 全禁）。
+- **R31**：任务状态表补**硬上限**（软 64 → 硬 256）：先淘汰空闲状态（`deadline<=0`），
+  若仍超硬上限就按 `last_used` LRU 兜底淘汰并记 WARN ⇒ 全 live 场景也不会无限增长，
+  用例 `test_task_state_has_hard_cap_even_when_all_live` 覆盖（400 个 live 状态 ⇒ ≤256）。
+
 ### 群聊缺陷（U1–U4）
 
 - **U1** 整链墙钟预算：提交时快照 `resources.total_budget_s` 派生 deadline → 执行体 `wait_for(remaining)` →
@@ -142,8 +169,7 @@ R6/R7 **已补回**（不是接受缺口）；文档⇄代码由 `tests/test_v17
   `test_v175_qa_recheck.py` 裁决 = 由 t11 入库（5 条，已在门禁内）。
 - **E9（规格 §10.2）**「同 UMO 不拦只 WARN」→ 与代码的**真闸**对齐（不再互相打架）：
   第二个 `browse_web`（含后台在跑）直接回 `【拒绝】同一会话已有一个浏览任务在跑…`。
-- 本轮门禁：**783 passed / 0 failed**、ruff clean（776 → 781：+2 isolate 对照、+1 deliver_once
-  删除守卫、+4 README 生成式 docs-gate，净 +5）。
+- 本轮门禁：t13 时点 783 条、0 failed（t15 收尾返工后为 **785**）、ruff clean。
 
 ## [v1.7.0] - 2026-10-26
 

@@ -414,6 +414,20 @@ def test_task_state_eviction_is_lru(tmp_path):
     assert plugin._tasks.get("oldest") is None, "最久未用的状态应先被淘汰"
 
 
+def test_task_state_has_hard_cap_even_when_all_live(tmp_path):
+    """R31：**全是 live**（deadline>0）时也必须收敛到硬上限，否则内存只增不减。"""
+    plugin = _plugin(tmp_path)
+    plugin._tasks = {}
+    for index in range(400):
+        state = plugin._task_state(f"live-{index}")
+        state.deadline = 1.0  # 每个都在跑"预算内"
+    assert len(plugin._tasks) <= main_module._TASK_STATE_HARD_CAP, len(plugin._tasks)
+    # 软上限仍在：只淘汰空闲状态时表可回到软上限附近
+    for index in range(400, 500):
+        plugin._task_state(f"idle-{index}")  # deadline==0 ⇒ 空闲
+    assert len(plugin._tasks) <= main_module._TASK_STATE_HARD_CAP
+
+
 def test_same_session_second_browse_is_rejected(tmp_path):
     """R21：同 UMO 只允许一个 browse_web（含后台）——否则两个任务抢同一张页面。"""
     plugin = _plugin(tmp_path)
@@ -423,10 +437,124 @@ def test_same_session_second_browse_is_rejected(tmp_path):
     assert reason.startswith("【拒绝】"), reason
 
 
-def test_background_browse_timeout_maps_to_status_timeout(tmp_path):
-    """R22：本工具自己的超时不能被记成"完成"。"""
-    src = (ROOT / "main.py").read_text(encoding="utf-8")
-    body = src[src.index("    async def _browse_web_run("):]
-    body = body[: body.index("\n    async def ", 10)]
-    assert "if background:" in body and "raise" in body, "后台超时必须抛出去让 watchdog 记超时"
-    assert 'progress["steps"]' in body, "R11：超时要把步数写进 progress"
+class _InnerContext:
+    """假的 `self.context`：`tool_loop_agent` 先记一步台账，再睡到超时。"""
+
+    def __init__(self, run_holder):
+        self.run_holder = run_holder
+        self.calls = 0
+
+    async def tool_loop_agent(self, **_kwargs):
+        self.calls += 1
+        run = self.run_holder.get("run")
+        if run is not None and hasattr(run, "ledger"):
+            run.ledger.add("browse_observe", {"view": "structure"}, "【观测】1 个节点")
+        await asyncio.sleep(5)  # 预算到点由 wait_for 取消，不会真等 5 秒
+        return type("R", (), {"completion_text": "不该到这里"})()
+
+
+def _timeout_plugin(tmp_path, monkeypatch):
+    """装配一个"预算极小 + 内层卡住"的插件（B1 的执行级复现环境）。"""
+    from astrbot_plugin_browser_llm.core import agent as agent_core
+
+    plugin = _plugin(tmp_path)
+    plugin.total_budget_s = 0.01  # 10ms 墙钟
+    plugin.agent_ledger_max_lines = 20
+    plugin.action_timeout_s = 1
+    holder: dict = {}
+
+    async def _fake_resolve(_event):
+        return type(
+            "D",
+            (),
+            {"ok": True, "provider_id": "m", "native_image": True, "notice": ""},
+        )()
+
+    async def _fake_prompt(**_kwargs):
+        return "INNER"
+
+    current: dict = {}
+
+    with agent_core.run_scope(agent_core.AgentRun(provider_id="m", native_image=True)) as run:
+        current["run"] = run
+    # 让假 context 能拿到"本次任务的 AgentRun"：包一层 run_scope
+    real_scope = agent_core.run_scope
+
+    def _scope(run):
+        holder["run"] = run
+        return real_scope(run)
+
+    monkeypatch.setattr(plugin, "_resolve_agent_provider", _fake_resolve)
+    monkeypatch.setattr(plugin, "_compose_inner_prompt", _fake_prompt)
+    monkeypatch.setattr(agent_core, "run_scope", _scope)
+    plugin.context = _InnerContext(holder)
+    return plugin, holder
+
+
+def test_browse_web_own_timeout_returns_text_not_attribute_error(tmp_path, monkeypatch):
+    """B1（前台）：预算到点走的是**本工具的超时分支**，回显式超时文案。
+
+    修 B1 前这里会抛 `AttributeError: ledger_max_lines`（t13 的 `render_ledger`
+    调用用了不存在的属性名）—— 所以本用例是"能被打红"的行为断言，不是读源码字符串。
+    """
+    plugin, _holder = _timeout_plugin(tmp_path, monkeypatch)
+    event = helpers._FakeEvent()
+    # 与生产同形：前台调用也带 `meta`（它同时充当 progress 通道），
+    # 所以 B1 那个 `render_ledger(self.ledger_max_lines)` 在**前台**也会被走到。
+    out = asyncio.run(
+        plugin._browse_web_run(event, "打开 https://example.com/x", meta={})
+    )
+    assert "硬上限被中止" in out, out
+    assert "AttributeError" not in out and "ledger_max_lines" not in out
+    assert "已完成 1 步" in out, "台账步数必须进提示（step 由内层工具调用记入）"
+
+
+def test_browse_web_own_timeout_maps_to_status_timeout(tmp_path, monkeypatch):
+    """B1（后台）：本工具超时 ⇒ 终态是 **STATUS_TIMEOUT**，且三键都可达。"""
+    from astrbot_plugin_browser_llm.core import background as bg
+
+    plugin, _holder = _timeout_plugin(tmp_path, monkeypatch)
+    event = helpers._FakeEvent()
+    progress_box: dict = {}
+
+    async def _runner(progress: dict) -> str:
+        progress_box["p"] = progress
+        return await plugin._browse_web_run(
+            event, "打开 https://example.com/x", progress=progress, background=True
+        )
+
+    async def _run() -> object:
+        plugin._submit_background  # noqa: B018 — 确认走真实提交路径
+        handle = plugin._watchdog.submit(
+            runner=_runner,
+            deliver=lambda job, status, body: plugin._deliver_terminal(
+                event, job, status, body
+            ),
+            umo=plugin._umo_of(event),
+            tool=main_module._BROWSE_WEB_TOOL_NAME,
+            task_text="timeout-case",
+            budget_s=30.0,
+            max_chars=1500,
+            dedupe_window_s=0.0,
+            max_parallel=2,
+        )
+        for _ in range(200):  # 最多等 2 秒
+            job = plugin._watchdog.registry.get(handle.task_id)
+            if job is not None and job.is_terminal:
+                return job
+            await asyncio.sleep(0.01)
+        raise AssertionError("后台任务没有在 2 秒内收尾")
+
+    job = asyncio.run(_run())
+    assert job.status == bg.STATUS_TIMEOUT, (job.status, job.status)
+    progress = progress_box.get("p") or {}
+    assert progress.get("partial"), "partial 必须可达（B1 前这里拿不到）"
+    assert int(progress.get("steps") or 0) > 0, progress
+    assert progress.get("ledger") and "1. browse_observe" in progress["ledger"], progress
+    body = getattr(event, "sent", None)
+    assert body is not None, "deliver 必须收到终态"
+    rendered = str(body)
+    assert "【后台任务超时】" in rendered, rendered[:200]
+    assert "【后台任务完成】" not in rendered
+
+

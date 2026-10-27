@@ -261,6 +261,6 @@ def test_readme_current_part_has_no_legacy_numbers():
 def test_changelog_test_numbers_are_not_stale():
     """R8：CHANGELOG 里的门禁条数必须是本轮实数（不许留上一轮的 770/775/776）。"""
     section = _v175_changelog_section()
-    for stale in ("770 passed", "775 passed", "776 passed", "781 passed"):
+    for stale in ("770 passed", "775 passed", "776 passed", "781 passed", "783 passed"):
         assert stale not in section, f"CHANGELOG v1.7.5 节仍有旧数字 {stale}"
-    assert "783 passed" in section, "CHANGELOG 必须写本轮实数（781 passed）"
+    assert "785 passed" in section, "CHANGELOG 必须写本轮实数（781 passed）"

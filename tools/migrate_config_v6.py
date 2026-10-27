@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""browser_llm 配置迁移器（v5 -> v6：54 叶 -> 58 叶；兼容分组 v4 / 扁平 v3 直迁）。
+"""browser_llm 配置迁移器（v5 -> v6：54 叶 -> 57 叶；兼容分组 v4 / 扁平 v3 直迁）。
 
 **为什么必须独立于插件运行**：核心 ``AstrBotConfig.__init__`` 会在插件
 ``__init__`` **之前**按 schema 删除未知键并落盘（``astrbot_config.py:113``、
@@ -47,11 +47,11 @@
 - 叶子顺序 = ``_conf_schema.json`` 的声明顺序（由 ``core.config_map`` 承载），
   避免核心因顺序变化白写一次配置（``astrbot_config.py:268-275``）；
 - ``search.providers`` 整值当**不透明叶子**搬运，**不展开**；路径段数 > 2 一律拒写；
-- 幂等：已是 7 组 58 叶 ⇒ ``--apply`` **不覆盖任何已有值**，只在缺叶时补默认；
+- 幂等：已是 7 组 57 叶 ⇒ ``--apply`` **不覆盖任何已有值**，只在缺叶时补默认；
   内容无变化时不再替换文件（``idempotent=1``）；
 - 未知键默认**拒绝写盘**（退出码 2 并列出键名），``--allow-unknown`` 才保留并继续；
 - 已知旧形态全部可吃：**扁平 v3（25 顶层键）** -> 分组 v4（45 叶）->
-  v5（54 叶）-> v6（58 叶），链式迁移复用 ``core.config_map`` 的同一张映射表
+  v5（54 叶）-> v6（57 叶），链式迁移复用 ``core.config_map`` 的同一张映射表
   （``KEY_MAP_V5`` / ``V5_DISPOSITION``），不另写一份；
 - 值类型不符（``"30"`` / ``"true"`` / ``"off"`` 这类字符串）在写盘前按**目标叶**类型
   归一（``int`` / ``bool``），归一动作只打印**路径名与类型方向**，不打印值；
@@ -109,7 +109,7 @@ BOM = "utf-8-sig"
 #: 组顺序表还是硬编码的旧 4 组，``nest()`` 静默丢整组"。
 GROUP_ORDER: tuple[str, ...] = tuple(GROUPS)
 
-#: v6 的全部路径（58 条，声明顺序）。
+#: v6 的全部路径（57 条，声明顺序）。
 V6_PATHS: tuple[str, ...] = tuple(KEY_MAP)
 
 #: v5 路径 -> 旧扁平键（25 条有值）；扁平 v3 配置靠它归一。
@@ -516,7 +516,7 @@ def migrate(
     allow_unknown: bool = False,
     coerce: bool = True,
 ) -> dict:
-    """v3（扁平）/ v4 / v5 / v6 -> v6（7 组 / 58 叶）。
+    """v3（扁平）/ v4 / v5 / v6 -> v6（7 组 / 57 叶）。
 
     - 承接自 v5 的 43 条路径：**值原样搬运**（rename / move 直搬；merge 按
       :data:`MERGE_RULES` 求值）；已存在的 v6 值**只补不覆盖**（尤其
@@ -648,7 +648,7 @@ def strip_v6(config: dict) -> dict:
 
 
 def is_migrated(config: dict) -> bool:
-    """是否已是完整的 v6 结构（7 组齐全 + 58 条路径全在 + 无 v5 遗留键 + 无未知键）。"""
+    """是否已是完整的 v6 结构（7 组齐全 + 57 条路径全在 + 无 v5 遗留键 + 无未知键）。"""
     if not isinstance(config, dict):
         return False
     if any(key in config for key in _FLAT_TO_PATH_V5):
@@ -764,7 +764,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="migrate_config_v6.py",
         description=(
-            "browser_llm 配置迁移 v6（扁平 v3 / 分组 v4 / v5 -> 7 组 58 叶，"
+            "browser_llm 配置迁移 v6（扁平 v3 / 分组 v4 / v5 -> 7 组 57 叶，"
             "干跑优先，任何模式都不打印配置值）"
         ),
         epilog=(
@@ -801,7 +801,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="strip_v6",
         action="store_true",
         help=(
-            "降级方向：删掉 15 个 v6 新叶（默认落盘并先备份，配 --dry-run 只报计划）。"
+            "降级方向：删掉 14 个 v6 新叶（默认落盘并先备份，配 --dry-run 只报计划）。"
             "注意它产出的是「v6 键名 − 新叶」，只有 v1.7.5 代码能加载；"
             "真正的 v5 降级请用 --restore-from"
         ),
@@ -1031,7 +1031,7 @@ def run(args: argparse.Namespace) -> int:
         _emit_result(args, config=actual, rc=rc, idempotent=is_migrated(actual))
         return rc
 
-    # ---- 降级：删掉 15 个 v6 新叶 ----
+    # ---- 降级：删掉 14 个 v6 新叶 ----
     if args.strip_v6:
         try:
             stripped = strip_v6(current)
@@ -1113,7 +1113,7 @@ def run(args: argparse.Namespace) -> int:
         changed = True  # --to 指向新文件
 
     if already:
-        print("[OK] already migrated (7 groups / 58 leaves), 只补缺失叶、不覆盖已有值")
+        print("[OK] already migrated (7 groups / 57 leaves), 只补缺失叶、不覆盖已有值")
 
     # 幂等 = "本次没有任何值变更"（已是 v6 且字节也不需要重排）。
     idempotent = already and not changed
@@ -1146,7 +1146,7 @@ def run(args: argparse.Namespace) -> int:
         )
 
     # 写入后自检（只报路径名，不报值）：
-    # ① 磁盘 58 叶 == 打算写下去的内容（证明没写歪）；
+    # ① 磁盘 57 叶 == 打算写下去的内容（证明没写歪）；
     # ② 43 条承接路径的值与**源**（经 v5 视图）逐条等值（类型归一过的路径除外）。
     reread = read_config(target)
     on_disk, _v5_disk, _u_disk = flatten(reread)

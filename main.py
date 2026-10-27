@@ -586,6 +586,12 @@ def _has_explicit_url(text: str) -> bool:
 AGENT_MAX_STEPS_MIN = 64
 AGENT_MAX_STEPS_MAX = 512
 
+#: 每会话任务状态的**软上限**（到此开始淘汰空闲状态）与**硬上限**（全 live 时兜底
+#: 按 LRU 淘汰，保证内存不无限增长）。R31：两级上限都要有，否则"全是 live"就只增不减。
+_TASK_STATE_SOFT_CAP = 64
+_TASK_STATE_HARD_CAP = 256
+_TASK_STATE_EVICT_BATCH = 32
+
 
 def derive_max_steps(total_budget_s: float) -> int:
     """从总预算派生步数护栏（纯函数，spec §7.4-9 的公式）。"""
@@ -2040,7 +2046,7 @@ class BrowserLLMPlugin(Star):
                         progress["partial"] = text
                         progress["steps"] = int(steps)
                         progress["ledger"] = agent_core.render_ledger(
-                            scoped.ledger, int(self.ledger_max_lines)
+                            scoped.ledger, int(self.agent_ledger_max_lines)
                         )
                     if background:
                         # R22：本工具自己的超时不能被记成"完成" —— 抛出去让
@@ -2437,7 +2443,7 @@ class BrowserLLMPlugin(Star):
         if state is not None:
             state.last_used = time.monotonic()  # R31：LRU 的"最后使用"要真的被更新
         if state is None:
-            if len(tasks) > 64:  # 长跑实例的任务表不该无限增长
+            if len(tasks) >= _TASK_STATE_SOFT_CAP:  # 长跑实例的任务表不该无限增长
                 # R20：按"最后使用时间"淘汰**空闲**状态（deadline==0）；绝不踢掉
                 # 有预算在身的状态，否则它的 ref/mark 会与手上那张 SoM 图对不上。
                 idle = sorted(
@@ -2445,8 +2451,22 @@ class BrowserLLMPlugin(Star):
                     for key, other in tasks.items()
                     if float(getattr(other, "deadline", 0) or 0) <= 0
                 )
-                for _stamp, key in idle[:32]:
+                for _stamp, key in idle[:_TASK_STATE_EVICT_BATCH]:
                     tasks.pop(key, None)
+                # 兜底硬上限（R31）：全是 live（deadline>0）时也得收敛，否则长跑
+                # 实例的内存只增不减。按 last_used 升序丢最久未用的（并记 WARN）。
+                if len(tasks) > _TASK_STATE_HARD_CAP:
+                    overflow = sorted(
+                        (float(getattr(item, "last_used", 0.0)), key)
+                        for key, item in tasks.items()
+                    )
+                    drop = len(tasks) - _TASK_STATE_SOFT_CAP
+                    for _stamp, key in overflow[:drop]:
+                        tasks.pop(key, None)
+                    logger.warning(
+                        f"[{self.metadata_name}] 任务状态表达硬上限"
+                        f"（{_TASK_STATE_HARD_CAP}），已按 LRU 淘汰 {drop} 个在跑状态"
+                    )
             state = _TaskState(
                 # R4：actions.repeat_guard 之前读了没人用；阈值必须来自配置
                 # （0 = 关闭重复守卫，由 RepeatGuard 自己处理 <=0）。

@@ -11,7 +11,8 @@
 
 **U2 投递归属**：``task_key = sha1(umo|tool|normalize(任务文本))[:16]``，同键任务在
 ``dedupe_window_s`` 内只允许一次主动投递（已完成 ⇒ 回【重复请求】并附结果，在跑 ⇒
-回【已受理】）；``deliver_once`` 把每任务主动投递限死 1 次；结果为空也发一条模板
+回【已受理】）；投递由 :meth:`BackgroundRegistry.note_delivery` 限死（**每任务恰好
+一条主动投递 + 一条终态，硬不变量、不做开关**）；结果为空也发一条模板
 兜底终态（对应核心 "finished, but nothing was sent" 的反向缺口）。
 
 **U3/U4**：终态由**确定性模板**渲染（不经 LLM），首行带 ``task_id``/``tool``/耗时；

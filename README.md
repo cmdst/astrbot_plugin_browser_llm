@@ -17,7 +17,7 @@ Agent 驱动的网页浏览插件 —— 让 LLM 通过 function-calling 自主�
 | ② | 动作 | `core/action_model.py` | 16 个动作 + JSON Schema + `R-A1..R-A14` 拒绝码（唯一闸门） |
 | ③ | 执行 | `core/executor.py` | target → Playwright locator（定位阶梯）+ CDP `Input.*` 受信任事件 |
 | ④ | 验证 | `core/verify.py` | expect / 六类差分 / `【无变化】` / 重复守卫 / 观测块**唯一**渲染处 |
-| ⑤ | 后台 | `core/background.py` | 任务表 + 整链墙钟看门狗 + `task_key` 去重 + `deliver_once` + 模板终态 |
+| ⑤ | 后台 | `core/background.py` | 任务表 + 整链墙钟看门狗 + `task_key` 去重 + 单次投递（硬不变量）+ 模板终态 |
 | ⑥ | 配置 | `core/config_map.py` | v6 叶子唯一事实源 + `ConfigView` + v5 冻结视图 |
 
 **工具面**：外层 3 个（`browse_web` / `browse_local_page` / `browser_web_search`，名字不变）+ 内层 5 个
@@ -138,7 +138,7 @@ PYTHONDONTWRITEBYTECODE=1 /root/AstrBot/.venv/bin/python -m pytest tests/ -q -p 
 /root/AstrBot/.venv/bin/python -m ruff check .
 ```
 
-当前门禁：**783 passed / 0 failed**（v1.7.5，含 t2–t5 的四层用例与返工用例）；
+当前门禁：**785 passed / 0 failed**（v1.7.5，含 t2–t5 的四层用例与返工用例）；
 `tests/` 下 **29 个 `test_*.py`** + `conftest.py`。四个守卫模块是"文档/配置/工具面"的主闸门，
 改任何一层都会先红：
 
