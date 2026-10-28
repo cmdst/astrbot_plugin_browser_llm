@@ -631,9 +631,9 @@ def test_recent_of_is_per_umo_and_only_succeeded_with_body():
     assert [record.result_text for record in u1] == ["有正文"]
     assert [record.umo for record in book.recent_of("u2", window_s=600.0, limit=5)] == ["u2"]
     assert book.recent_of("u1", window_s=0.0, limit=5) == []
-    # 任务书别名与规格主名同义
-    assert book.recent("u1", window_s=600.0, limit=5) == u1
-    assert book.status(u1[0].task_id) is u1[0]
+    # 规格 §5.4 只列 get / recent_of：零消费方的"任务书别名"已按评审 R5 同族删除
+    assert not hasattr(book, "recent") and not hasattr(book, "status")
+    assert book.get(u1[0].task_id) is u1[0]
     assert book.progress("bg-9999")["state"] == "unknown"
 
 
@@ -903,3 +903,148 @@ def test_status_and_recall_reports_follow_the_book_clock():
     recall = tb.recall_report(book, umo="u1", mode="browse_only")
     assert "5 分钟前" in recall, recall
     assert decision.task_id in recall
+
+
+# ============================================================================
+# t8 返工（t6 评审 R1 / R2）：终态日志与终态闭包释放
+#
+# 两条都是**观测面/引用面**的回归，行为断言抓不到，所以这里直接读 logger 记录与
+# 记录里的 meta —— 但仍是执行级：真提交、真跑状态机、真读 caplog（不是源码字符串）。
+# ============================================================================
+
+#: 四态词（日志与用户可见前缀的**同一份事实源**）：运营对账靠它在终态日志里分档
+STATE_WORDS_IN_TERMINAL_LOG = {
+    tb.STATE_SUCCEEDED, tb.STATE_FAILED, tb.STATE_TIMEOUT, tb.STATE_CANCELLED,
+}
+
+
+def _terminal_log_lines(caplog) -> list[str]:
+    """抓 `后台任务终态 …` 日志行（不按 logger 名过滤：本模块可能被两种导入名各加载一次）。"""
+    return [rec.getMessage() for rec in caplog.records
+            if "后台任务终态" in rec.getMessage()]
+
+
+def test_terminal_log_carries_the_real_state_on_both_paths(caplog):
+    """R1：成功路径与「排队 → 取消」路径**都**要有一条终态日志，且 state 不是 None。
+
+    修前：`_finalize` 在 `note_delivery` 之后才读 `meta["pending_state"]`（已被 pop）⇒
+    日志恒 `state=None`；`_finish_queued` 则一条日志都不打 ⇒ 排队任务被重载取消后
+    在日志里搜不到，「受理条数 == 终态条数」的对账在出现排队时天然不成立。
+    """
+    async def scenario():
+        book = _book()
+
+        async def ok(progress: dict) -> str:
+            return "成功正文"
+
+        async def hang(progress: dict) -> str:
+            await asyncio.sleep(5)
+            return "never"
+
+        done = book.submit(runner=ok, deliver=_recorder([]), umo="log:u1", tool="browse_web",
+                           task_text="成功路径", budget_s=5.0, max_parallel=1)
+        await _wait_until(lambda: book.get(done.task_id).is_terminal)
+        busy = book.submit(runner=hang, deliver=_recorder([]), umo="log:u2", tool="browse_web",
+                           task_text="占槽", budget_s=30.0, max_parallel=1)
+        queued = book.submit(runner=ok, deliver=_recorder([]), umo="log:u3", tool="browse_web",
+                            task_text="排队后被取消", budget_s=30.0, max_parallel=1)
+        assert book.get(queued.task_id).state == tb.STATE_QUEUED
+        await asyncio.sleep(0.02)
+        book.cancel(queued.task_id)                     # queued → cancelled（走 _finish_queued）
+        await _wait_until(lambda: book.get(queued.task_id).is_terminal)
+        book.cancel(busy.task_id)
+        await asyncio.sleep(0.05)
+        return done, queued
+
+    with caplog.at_level("INFO"):
+        done, queued = asyncio.run(scenario())
+
+    lines = _terminal_log_lines(caplog)
+    assert lines, "一条终态日志都没有"
+    # ① 成功任务：任务号出现，且 state 是四态词之一（不是 None）
+    mine = [line for line in lines if done.task_id in line]
+    assert mine, f"成功任务的终态日志缺失：{lines}"
+    assert "state=None" not in mine[0], mine[0]
+    assert any(f"state={state}" in mine[0] for state in STATE_WORDS_IN_TERMINAL_LOG), mine[0]
+    assert f"state={tb.STATE_SUCCEEDED}" in mine[0], mine[0]
+    # ② 排队后被取消的任务：**必须**也有一条终态日志（R1 之前这里完全空白）
+    queued_lines = [line for line in lines if queued.task_id in line]
+    assert queued_lines, f"排队任务的终态日志缺失（task_id={queued.task_id}）：{lines}"
+    assert f"state={tb.STATE_CANCELLED}" in queued_lines[-1], queued_lines[-1]
+    assert "state=None" not in queued_lines[-1]
+    for line in lines:  # 全量口径：每条终态日志都必须带四态词
+        assert any(f"state={state}" in line for state in STATE_WORDS_IN_TERMINAL_LOG), line
+
+
+def test_terminal_records_release_runner_and_deliver():
+    """R2：终态记录的 `meta` 不许留 runner / deliver / progress（否则间接持 event）。"""
+    captured: list[dict] = []
+
+    async def scenario():
+        book = _book()
+
+        async def ok(progress: dict) -> str:
+            return "正文"
+
+        async def boom(progress: dict) -> str:
+            raise RuntimeError("炸了")
+
+        for index, runner in enumerate((ok, boom)):
+            decision = book.submit(runner=runner, deliver=_recorder([]), umo=f"rel:u{index}",
+                                   tool="browse_web", task_text=f"t{index}", budget_s=5.0)
+            await _wait_until(lambda tid=decision.task_id: book.get(tid).is_terminal)
+            captured.append(dict(book.get(decision.task_id).meta))
+        return book
+
+    asyncio.run(scenario())
+    for meta in captured:
+        assert "runner" not in meta, f"终态记录仍持 runner 闭包：{sorted(meta)}"
+        assert "deliver" not in meta, f"终态记录仍持 deliver 闭包：{sorted(meta)}"
+        assert "progress" not in meta, f"终态记录仍持 runner 的进度袋：{sorted(meta)}"
+        assert "task" not in meta and "guard" not in meta, sorted(meta)
+    # 投递记账本身必须还在（释放的是闭包，不是账）
+    assert all("delivery_done" in meta for meta in captured)
+
+
+def test_runner_closure_captures_are_collectable_after_terminal():
+    """R2 的进阶判据：runner 闭包捕获的对象在终态后**可被回收**（gc + weakref 实测）。
+
+    等价于"终态记录不再间接持 `AstrMessageEvent`"—— 生产里 runner 闭包捕获的正是 event
+    （main.py 的 `lambda progress: self._browse_web_run(event, …)`），所以这条比查 `meta`
+    的键名更接近真实后果。写法上有两个坑：① 闭包必须捕获**自己的形参**（cell），不能靠外层
+    变量 —— 外层一清变量，cell 也跟着空，断言就永远成立（假绿）；② 强引用只能留在子函数帧里，
+    子函数返回后局部名自然消失（用 `del` 会被 ruff 判 F821）。
+    """
+    import gc
+    import weakref
+
+    class _Watched:
+        """被 runner 闭包捕获的哨兵（等价于 AstrMessageEvent）。"""
+
+    def _make_runner(target):
+        async def runner(progress: dict) -> str:
+            return "captured" if target is not None else "never"  # 闭包持有 target 的强引用
+        return runner
+
+    def _submit_and_wait():
+        """在**本帧**造对象并跑完一条任务：返回后这里的所有强引用都应自然消失。"""
+        watched = _Watched()
+        ref = weakref.ref(watched)
+        strong = {"runner": _make_runner(watched)}  # 唯一强引用 = 这个闭包
+
+        async def scenario():
+            book = _book()
+            decision = book.submit(runner=strong.pop("runner"), deliver=_recorder([]),
+                                   umo="rel:gc", tool="browse_web", task_text="gc",
+                                   budget_s=5.0)
+            await _wait_until(lambda: book.get(decision.task_id).is_terminal)
+            return book, decision
+
+        book, decision = asyncio.run(scenario())
+        return ref, book, decision
+
+    ref, book, decision = _submit_and_wait()
+    for _ in range(3):
+        gc.collect()
+    assert ref() is None, "终态记录仍持有 runner 闭包捕获的对象（间接持 event）"
+    assert book.get(decision.task_id).result_text == "captured"

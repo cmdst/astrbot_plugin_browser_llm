@@ -128,6 +128,30 @@ python tools/migrate_config_v6.py --strip-v6       # 只删 14 条 v6 新叶（�
 `api_key` 一旦被删就是**永久丢失（不可恢复）**。只回滚其一（只回代码或只回配置）会静默丢设置，因此
 **配置与代码必须成对回滚**。
 
+### 生产判据：v1.8.0 的**真锚点**（部署后照抄这张表，别抄历史节）
+
+日志文件：`/root/AstrBot/data/logs/astrbot.log`。
+
+| 口径 | 锚点串 | 说明 |
+| --- | --- | --- |
+| **受理**（分母） | `后台提交 tool=` | `main.py::_submit_background` 每条**裁决**打一行（受理/排队/单飞/满载/重复都算"来过一次"） |
+| **终态**（分子） | `后台任务终态 state=` | `core/tasks.py::_log_terminal` 打，`state` ∈ `succeeded` / `failed` / `timeout` / `cancelled`；**执行体与排队两条收尾路径都会打** |
+| **成功**（用户侧） | `【后台任务完成】` | 用户真的看到的那条消息（投递成功才有；投递失败只记账不改终态） |
+
+```bash
+LOG=/root/AstrBot/data/logs/astrbot.log
+grep -c "后台提交 tool=" "$LOG"                       # 分母
+grep -c "后台任务终态 state=" "$LOG"                  # 分子（四态合计）
+grep -c "后台任务终态 state=succeeded" "$LOG"         # 成功终态
+grep -c "【后台任务完成】" "$LOG"                      # 用户可见成功
+grep -c "【后台任务失败】\|【后台任务超时】\|【后台任务已取消】" "$LOG"
+```
+
+**按 state 分档现在成立**：受理数 − 终态数 = 仍在跑/排队（正常）；终态数 − `【后台任务完成】` 数
+= 投递没出去（查同一 `task_id` 行的 `attempted/succeeded/channel/shape/error` 字段）。
+⛔ 历史节里那三条旧串（`后台任务受理` / `后台任务终态 status=` / `status=ok`）在 v1.8.0 **恒为 0**，
+照抄会得到 0/0 的假通过。
+
 ### 四个 v1.8.0 的行为约定
 
 1. **无起始页**：v5 的 `browser.default_url` 已删。任务里没有显式网址、且本会话
@@ -155,6 +179,10 @@ python tools/migrate_config_v6.py --strip-v6       # 只删 14 条 v6 新叶（�
 7. 插件重载 = 在跑任务全部取消（`cancelled` 终态若投得出去仍会投递）。
 8. 队列上限 8、回看 5 条 / 30 分钟都是**常量**（要可配就得加配置叶，本版零新增叶）。
 9. 人格工具集为**数组**时，两个新工具默认不可见（见「两个只读回看工具」）。
+10. **附件腿未接线**：`artifact_sink()` 在生产线**零调用方**（只有定义与测试用它）⇒
+    `current_artifacts()` 恒空、`collect_artifact()` 恒 `False`，因此**本版后台终态不发附件**
+    （正文里的 `截图: <path>` 仍可读）。这是 v1.7.5 就有的形态，登记为 **v1.8.1** 候选，
+    本版不改（见 `spec/20261028-v180-spec.md` §13）。
 
 ## 📁 仓库结构（v1.8.0）
 
@@ -703,7 +731,10 @@ title + url + 摘要片段 ≤120 字）/ 其余条数的省略提示 / `备注�
   `browse_screenshot`（受 `perception.silent_mode` 管：静默开启时它不产出媒体，自然
   也不会成为附件）/ `browse_sniff_media`。
 
-### 生产判据（部署后照抄；日志口径与用户口径分开数）
+### 生产判据（**v1.7.5 口径，仅作历史**；v1.8.0 请用上面「现行能力」节那张锚点表）
+
+> 下面三条 grep 在 v1.8.0 **恒为 0**：`后台任务受理` 与 `status=ok` 自 v1.7.5 起就已不存在，
+> `status=` 在 v1.8.0 改名为 `state=`。留着是为了读旧日志时对得上号。
 
 ```bash
 LOG=/root/AstrBot/data/logs/astrbot.log

@@ -17,8 +17,8 @@ from core import action_model as am
 def test_mapping_returns_same_object_identity():
     payload = {"action": "back"}
     assert am.coerce_payload(payload) is payload
-    assert am.coerce_action_payload(payload) is payload  # 别名是同一函数对象
-    assert am.coerce_action_payload is am.coerce_payload
+    # 规格 §4.2 只要求一个名字；自造的 `coerce_action_payload` 别名已按评审 R5 删除
+    assert not hasattr(am, "coerce_action_payload")
 
 
 def test_mapping_subclass_is_passed_through_untouched():

@@ -541,10 +541,6 @@ class TaskBook:
         """按 id 取记录（**含**终态；跨会话由调用方按 ``record.umo`` 过滤）。"""
         return self._records.get(str(task_id or ""))
 
-    def status(self, task_id: str) -> TaskRecord | None:
-        """``get`` 的任务书别名（规格主名是 :meth:`get`）。"""
-        return self.get(task_id)
-
     def active_of(self, umo: str) -> TaskRecord | None:
         """该会话的非终态记录（最多 1 条）。"""
         for tid in self._by_umo.get(umo, ()):
@@ -580,11 +576,6 @@ class TaskBook:
             if len(out) >= capped:
                 break
         return out
-
-    def recent(self, umo: str, *, window_s: float, limit: int,
-               now: float | None = None) -> list[TaskRecord]:
-        """``recent_of`` 的任务书别名（规格主名是 :meth:`recent_of`）。"""
-        return self.recent_of(umo, window_s=window_s, limit=limit, now=now)
 
     def latest_terminal_of(self, umo: str, *, window_s: float,
                            now: float | None = None) -> TaskRecord | None:
@@ -765,12 +756,22 @@ class TaskBook:
                     self._by_umo.pop(record.umo, None)
 
     def _after_terminal(self, record: TaskRecord) -> None:
-        """终态后的收尾：撤看门狗 → 保留上限 → 顶排队任务。"""
+        """终态后的收尾：撤看门狗 → **释放闭包**（R2）→ 保留上限 → 顶排队任务。"""
         guard = record.meta.pop("guard", None)
         if guard is not None and not guard.done():
             guard.cancel()
+        # R2：终态记录不许间接持 AstrMessageEvent —— runner 闭包捕获 event，≤64 条会一直留着
+        for key in ("runner", "deliver", "progress"):
+            record.meta.pop(key, None)
         self._trim()
         self._pump()
+
+    def _log_terminal(self, record: TaskRecord, state: str) -> None:
+        """一条终态日志（四态同一格式）：``state`` 由调用方先落局部变量，**勿读已被 pop 的 meta**。"""
+        # 与 v1.7.5 的 ``后台任务终态 status=`` 同口径（只是键名改 state）：分母=受理、分子=终态
+        logger.info("后台任务终态 state=%s task_id=%s tool=%s elapsed_s=%.1f budget_s=%.0f %s",
+                    state, record.task_id, record.tool, record.elapsed_s(self._clock()),
+                    float(record.budget_s), record.delivery.as_fields())
 
     async def _run(self, record: TaskRecord) -> None:
         """执行体：``wait_for`` 层 + 异常→终态映射（取消不吞）。"""
@@ -821,7 +822,8 @@ class TaskBook:
         if record.meta.get("finalized"):
             return  # 执行体与看门狗只允许一方收尾（避免双终态）
         record.meta["finalized"] = True
-        record.meta["pending_state"] = state if state in TERMINAL_STATES else STATE_FAILED
+        final_state = state if state in TERMINAL_STATES else STATE_FAILED
+        record.meta["pending_state"] = final_state
         record.meta["pending_reason"] = shorten(reason, REASON_LIMIT)
         self.set_result(record.task_id, text or "")
         record.steps = int(record.meta.get("progress", {}).get("steps") or 0)
@@ -831,10 +833,7 @@ class TaskBook:
         if record.state != STATE_DELIVERING:
             self._set_state(record, STATE_DELIVERING)
         self.note_delivery(record.task_id, await self._deliver_once(record))
-        logger.info("后台任务终态 state=%s task_id=%s tool=%s elapsed_s=%.1f budget_s=%.0f %s",
-                    record.meta.get("pending_state"), record.task_id, record.tool,
-                    record.elapsed_s(self._clock()), float(record.budget_s),
-                    record.delivery.as_fields())
+        self._log_terminal(record, final_state)  # 读局部变量：meta 里的 pending_state 已被 pop（R1）
 
     async def _finish_queued(self, record: TaskRecord, state: str, reason: str, *,
                              notify: bool) -> None:
@@ -850,7 +849,8 @@ class TaskBook:
             guard.cancel()
         self.note_delivery(record.task_id,
                            await self._deliver_once(record) if notify else DeliveryNote())
-        self._trim()
+        self._log_terminal(record, state)  # R1：排队被取消/超预算同样要留终态日志
+        self._after_terminal(record)
 
     async def _deliver_once(self, record: TaskRecord) -> DeliveryNote:
         """调一次投递回调；异常收敛成记账（T-8），绝不重试。"""

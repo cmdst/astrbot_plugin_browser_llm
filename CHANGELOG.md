@@ -88,7 +88,7 @@
 ### 配置：v6 不变（零新增叶、无迁移）
 
 - **7 组 / 配置叶 57 条 / JSON 叶子键 59 个**（差 2 恒来自 `resources.viewport`：1 条复合叶 ↔ 3 个 JSON 叶子键），
-  与 v1.7.5 完全一致；**没有 v7、没有新增叶、迁移器零改动**。
+  与 v1.7.5 完全一致；**没有 v7、没有新增叶**。迁移器 `tools/migrate_config_v6.py` **仅补 4 行 v1.8.0 说明（逻辑零改动；判据：`git diff 96d119a -- tools/migrate_config_v6.py` 只有这 4 行、`--dry-run` 路径未变）**。
 - 两个新工具复用既有叶：`tools.background_mode` 判"是否启用"，`tools.background_max_chars`
   判"回看单条截断"。回看窗口（30 分钟）、条数（5）、队列上限（8）是**常量**（要可配就加叶 ⇒ v1.8.1 候选）。
 - **升级只有一条腿**：覆盖插件目录 → WebUI 重载插件即可，**配置一个键都不用动**；
@@ -117,8 +117,8 @@
   `test_v175_background_wiring.py`（6 条）—— 按规格 §10.4 的映射表**逐组重写**（不是删掉了事），
   新增 `test_v180_{action_payload,proactive,taskbook,tools_status,tools_recall,wiring}.py`，
   docs-gate 更名 `test_v180_docs_vs_code.py`。
-- 行数守则：`main.py` **4160**（≤4200）/ `core/tasks.py` **898**（≤900，见 §16 勘误 E1）/
-  `core/proactive.py` **296**（≤300）/ `core/agent.py` 750（未变）/ `core/action_model.py` 1397（≤1400）。
+- 行数守则：`main.py` **4162**（≤4200）/ `core/tasks.py` **898**（≤900，见 §16 勘误 E1）/
+  `core/proactive.py` **296**（≤300）/ `core/agent.py` 750（**行数未变，2 行注释更新**：不可信前缀的出处指向 `core/tasks.py`）/ `core/action_model.py` 1396（≤1400）。
 
 ### 规格勘误（`spec/20261028-v180-spec.md` §16，追加式）
 

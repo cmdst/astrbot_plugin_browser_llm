@@ -16,7 +16,7 @@
 `resolve` 里判定，因为要数候选）、URL 安全策略（R-A11）。
 
 **v1.8.0 两层修法（A1 P0）**：闸门**不放宽**，容错放在**工具边界**。`coerce_payload()`
-（边缘层，别名 `coerce_action_payload`）只把模型偶发写成 JSON 字符串的载荷**解开一层**，
+（边缘层，唯一名字）只把模型偶发写成 JSON 字符串的载荷**解开一层**，
 解不开就原值返回；真正的判定仍只发生在 `parse_action()`。生产 8/8 全拒的根因是模型把
 `action` 参数传成了字符串（`R-A1 动作必须是 JSON 对象，收到 str`），不是闸门太严。
 
@@ -66,7 +66,6 @@ __all__ = [
     "TAB_OPS",
     "Target",
     "canonical_json",
-    "coerce_action_payload",
     "coerce_payload",
     "parse_action",
     "render_action_catalog",
@@ -1197,7 +1196,6 @@ def coerce_payload(payload: Any) -> Any:
         return payload
 
 
-coerce_action_payload = coerce_payload  # 任务书别名（规格 §4.2 主名 coerce_payload）
 
 
 def parse_action(payload: Any, *, ctx: ParseContext | None = None) -> Action | Rejection:
@@ -1220,8 +1218,9 @@ def parse_action(payload: Any, *, ctx: ParseContext | None = None) -> Action | R
             hint="直接给 done 结论，或让主 LLM 起新的浏览任务。",
         )
 
-    # 2) R-A1：必须是对象。**一字不改**（规格 §4.3）：闸门不认字符串，字符串只能由边缘
-    #    ``coerce_payload`` 解开一层再进来；放宽这里等于让「不是对象」整类失败消失。
+    # 2) R-A1：必须是对象。**判据与码义一字未改**（规格 §4.3 唯一授权改动 = 下面 hint 追加一句
+    #    提醒）：闸门不认字符串，字符串只能由边缘 ``coerce_payload`` 解开一层再进来；
+    #    放宽这里等于让「不是对象」整类失败消失。
     if not isinstance(payload, Mapping):
         return _reject(
             "R-A1", f"动作必须是 JSON 对象，收到 {type(payload).__name__}",
