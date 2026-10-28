@@ -111,8 +111,9 @@
 
 ### 测试网与门禁
 
-- **870 passed / 0 failed**、`ruff check .` clean、无 skip/xfail（v1.7.5 基线 786；
-  代码收口时 861，本版 docs gate 由 v1.7.5 的 16 条补到 **25** 条 ⇒ 870）。
+- **873 passed / 0 failed**、`ruff check .` clean、无 skip/xfail（v1.7.5 基线 786；
+  代码收口时 861，本版 docs gate 由 v1.7.5 的 16 条补到 **25** 条 ⇒ 870；t6 评审返工
+  再补 3 条（终态日志 1 + 终态释放闭包 2）⇒ **873**）。
 - `tests/test_*.py` **29 → 33**：删除 `test_v175_background.py`（1105 行 / 47 条）与
   `test_v175_background_wiring.py`（6 条）—— 按规格 §10.4 的映射表**逐组重写**（不是删掉了事），
   新增 `test_v180_{action_payload,proactive,taskbook,tools_status,tools_recall,wiring}.py`，

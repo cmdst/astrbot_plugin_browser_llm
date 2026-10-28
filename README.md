@@ -237,7 +237,7 @@ PYTHONDONTWRITEBYTECODE=1 /root/AstrBot/.venv/bin/python -m pytest tests/ -q -p 
 /root/AstrBot/.venv/bin/python -m ruff check .
 ```
 
-当前门禁：**870 passed / 0 failed**（v1.8.0）；`tests/` 下 **33 个 `test_*.py`** + `conftest.py`。
+当前门禁：**873 passed / 0 failed**（v1.8.0）；`tests/` 下 **33 个 `test_*.py`** + `conftest.py`。
 四个守卫模块是"文档/配置/工具面/接线"的主闸门，改任何一层都会先红：
 
 | 守卫 | 钉住什么 |
