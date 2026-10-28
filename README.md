@@ -2,52 +2,43 @@
 
 Agent 驱动的网页浏览插件 —— 让 LLM 通过 function-calling 自主浏览网页：导航、搜索、点击链接、填表、滚动、截图识图、下载媒体，无需用户手动指令。
 
-当前版本：**v1.7.5**（变更见 [CHANGELOG](./CHANGELOG.md)；v1.7.5 是**破坏性架构重做** —— 感知/动作/执行/验证四层整体换栈：CDP A11y 树 + 结构化动作 + Playwright locator + CDP 受信任事件 + 操作后验证，截图仅兜底且必须叠 Set-of-Mark 编号；内层工具 **26 → 5**；配置结构 **v6**：**7 组 / 配置叶 57 条 = JSON 叶子键 59 个**；平台原生后台引擎按 spec §6.6 退役。外层三个工具名一字未改）
+当前版本：**v1.8.0**（变更见 [CHANGELOG](./CHANGELOG.md)；v1.8.0 = **A1 动作载荷 P0 修复** + 外层工具面 **3 → 5**（两个只读回看工具）+ 后台 5 态引擎换成**轻量 7 态任务簿** + 投递层改成**极简同权**（296 行）；**配置结构 v6 不变**：**7 组 / 配置叶 57 条 = JSON 叶子键 59 个**，零新增叶、无需迁移；三个旧外层工具名一字未改）
 
 > **看不懂「配置叶 57 条 = JSON 叶子键 59 个」？** 这是同一份 schema 的两种数法，两个都对，差 2 恒来自
 > `resources.viewport`（**1 条复合叶 ↔ 3 个 JSON 叶子键**：`width` / `height` / `device_scale_factor`）。
 > 说「配置叶 / 键条目」用 **57**；说「配置文件里有几个键 / schema 展平几个」用 **59**。
 > v5（v1.7.0）的对应值是 54 / 55；v4 是 45 / 46。
 
-## 🧱 v1.7.5 架构：六层，每层一个事实源
+## 🧱 v1.8.0 架构：七层，每层一个事实源
 
 | # | 层 | 模块 | 一句话职责 |
 | --- | --- | --- | --- |
 | ① | 感知 | `core/a11y.py` | CDP `Accessibility.getFullAXTree` → 裁剪 → `- [role] name (state)`；文本通道；SoM 截图与 mark 表 |
-| ② | 动作 | `core/action_model.py` | 16 个动作 + JSON Schema + `R-A1..R-A14` 拒绝码（唯一闸门） |
+| ② | 动作 | `core/action_model.py` | 16 个动作 + JSON Schema + `R-A1..R-A14` 拒绝码（唯一闸门；边缘另有 `coerce_payload` 只解一层） |
 | ③ | 执行 | `core/executor.py` | target → Playwright locator（定位阶梯）+ CDP `Input.*` 受信任事件 |
 | ④ | 验证 | `core/verify.py` | expect / 六类差分 / `【无变化】` / 重复守卫 / 观测块**唯一**渲染处 |
-| ⑤ | 后台 | `core/background.py` | 任务表 + 整链墙钟看门狗 + `task_key` 去重 + 单次投递（硬不变量）+ 模板终态 |
-| ⑥ | 配置 | `core/config_map.py` | v6 叶子唯一事实源 + `ConfigView` + v5 冻结视图 |
+| ⑤ | 任务簿 | `core/tasks.py` | 7 态任务表 + 队列 + 整链墙钟看门狗 + `task_key` 去重 + 终态渲染（唯一事实源） |
+| ⑥ | 投递 | `core/proactive.py` | 一次逻辑投递：`context.send_message` 单通道 + 重放两个插件钩子 + 三形态记账 |
+| ⑦ | 配置 | `core/config_map.py` | v6 叶子唯一事实源 + `ConfigView` + v5 冻结视图 |
 
-**工具面**：外层 3 个（`browse_web` / `browse_local_page` / `browser_web_search`，名字不变）+ 内层 5 个
-（`browse_observe` / `browse_act` / `browse_screenshot` / `browse_media` / `browse_search`）。
-内层模型每步只输出**一个**动作对象，例：`{"action":"click","target":{"role":"button","name":"提交"}}`、
+**工具面**：外层 **5** 个（`browse_web` / `browse_local_page` / `browser_web_search` 三个旧名不变 +
+`browse_task_status` / `browse_recent_results` 两个只读回看工具）；内层仍是 5 个
+（`browse_observe` / `browse_act` / `browse_screenshot` / `browse_media` / `browse_search`，v1.7.5 的
+**26 → 5** 收口不变）。内层模型每步只输出**一个**动作对象，例：
+`{"action":"click","target":{"role":"button","name":"提交"}}`、
 `{"action":"type","target":{"label":"搜索"},"value":"北京 天气","submit":true}`。
 
-**配置迁移（顺序写死：先迁配置、再换代码；配置与代码成对回滚）**：
+## 🧭 v1.8.0 现行能力（权威；下面「历史版本」里的旧描述一律以此节为准）
 
-```bash
-python tools/migrate_config_v6.py --dry-run        # 1) 干跑：只看键名计划
-python tools/migrate_config_v6.py --apply          # 2) 落盘（自动再备份 + 原子替换）
-python tools/migrate_config_v6.py --verify --baseline   # 3) 复核承接叶值 + 新叶
-python tools/migrate_config_v6.py --restore-from <备份>  # 回滚：逐字节恢复
-python tools/migrate_config_v6.py --strip-v6       # 只删 v6 新叶（成对回滚的第一步）
-```
-
-**为什么必须先迁配置**：v6 schema 会把 schema 之外的键判为 stale 从配置里删掉 —— `search.providers` 的
-`api_key` 一旦被删就是**永久丢失（不可恢复）**。只回滚其一（只回代码或只回配置）会静默丢设置，因此
-**配置与代码必须成对回滚**。
-
-## 🧭 v1.7.5 现行能力（权威；下面「历史版本」里的旧描述一律以此节为准）
-
-### 工具面：外层 3 个 + 内层 5 个
+### 工具面：外层 5 个 + 内层 5 个
 
 | 层 | 工具 | 作用 | 返回 |
 | --- | --- | --- | --- |
-| 外层 | `browse_web` | 把整件事委托给内层子代理（唯一委派入口） | 不可信前缀 + 结论 + `【执行台账】` |
+| 外层 | `browse_web` | 把整件事委托给内层子代理（唯一委派入口） | 不可信前缀 + 结论 + `【执行台账】`；后台模式下回「【已受理】/【排队中】」 |
 | 外层 | `browse_local_page` | **直调**：渲染本地 HTML 并给结构视图（不进子代理） | 结构视图 + 正文摘要 +（可选）截图 |
 | 外层 | `browser_web_search` | 插件自有搜索 API 池（不启浏览器） | 结构化 JSON；后台模式回「【已受理】」 |
+| 外层 | `browse_task_status` | **只读**：查本会话后台任务的状态 / 阶段 / 已用 / 剩余 | `【状态】…`；**不含正文**、**不给完成时间** |
+| 外层 | `browse_recent_results` | **只读**：回看本会话最近的后台结果正文（默认 5 条 / 30 分钟） | `【最近结果】…` + 一次 `【不可信外部内容】` 前缀 |
 | 内层 | `browse_observe` | 取 A11y 结构视图（`structure`/`text`/`links`/`full`） | `【观测 #n】…` 节点表 |
 | 内层 | `browse_act` | **一个**结构化动作（16 种） | `【动作】…` + `【验证】…` |
 | 内层 | `browse_screenshot` | Set-of-Mark 截图兜底（无文本元素专用） | 图 + mark 表 |
@@ -58,6 +49,48 @@ python tools/migrate_config_v6.py --strip-v6       # 只删 v6 新叶（成对�
 `navigate`、`click`、`type`、`select`、`check`、`press`、`scroll`、`hover`、`back`、`forward`、`tab`、`read`、`screenshot`、`wait`、`reload`、`done`。
 模型每步只输出**一个**动作对象，例：
 `{"action":"click","target":{"role":"button","name":"提交"}}`。
+`action` 写成 **JSON 字符串**（或套 ` ```json ` 围栏）也能被接受 —— 工具边缘会**只解一层**再进闸门，
+但**闸门本身仍严格**：真非对象（数组 / 数字 / `null`）照样 `【拒绝】R-A1`。
+
+### 后台任务书：7 态、每任务恰好一条终态、满载改为排队
+
+任务状态是 `queued` · `running` · `delivering` · `succeeded` · `failed` · `timeout` · `cancelled` 七个
+（`core/tasks.py` 的 `STATES`）。结构与纪律：
+
+1. **`running` 不直接到终态** —— 必须先到 `delivering`，再由**唯一一次**投递写终态。
+   于是"每条任务**恰好一条终态消息**"是结构性保证，不是靠自觉；非法转移直接抛 `ValueError`，终态不可变。
+2. **满载改为排队**：全局在跑数达到 `resources.max_parallel` 时，新任务进 `queued`（**队列上限 8**，
+   超出仍然是 `【拒绝】`），模型收到 `【排队中】（第 N 位）`。
+3. **预算从提交时刻起算**、**排队时间计入**：排队期就把预算耗尽 ⇒ 落 `timeout`，且**不启动**执行体。
+4. **终态保留 64 条**（超出淘汰最老）；记录里不持事件对象、不读写会话历史，日志只留摘要。
+
+### 两个只读回看工具：状态与结果怎么查
+
+后台结果**不进主模型上下文**（v1.5.0 起就如此，为什么要两个工具见下）：
+
+- **`browse_task_status`（状态）**：`task_id` 留空 = 看本会话**当前**任务（没有在跑就看最近 30 分钟内
+  那条终态）。返回任务号 / 工具 / 状态 / 已用 / 剩余预算；**任何分支都不含结果正文**，
+  **也不给绝对时间**（只给"已用 / 已等待 / 剩余"三个时长）—— 想知道"发了没"看这一行，
+  想看"说了什么"用回看工具。
+- **`browse_recent_results`（回看）**：默认 **5 条 / 最近 30 分钟**（参数 `limit` 钳到 1–5、
+  `minutes` 钳到 1–30，**钳制不报错**，只在块首补一行提示），**逐条截断**到
+  `tools.background_max_chars`（默认 1500 字），块首只加**一次** `【不可信外部内容】` 前缀，
+  时间只写"`N 分钟前`"。**按会话隔离、不跨会话；结果只在内存，插件重载即失效。**
+- **拒绝码是独立家族**：`TS-2`（没有这个任务）/ `TS-3`（`tools.background_mode=off`）/
+  `RR-2`（没有这条结果）/ `RR-3`（同上）。参数被钳制**不产生**拒绝码。
+- **注册恒定**：这两个工具**永远注册**，与 `tools.background_mode` 无关 —— `off` 时行为落在
+  `TS-3`/`RR-3`，而不是"工具消失"（工具面随配置漂移会让模型的可用工具集不可预测）。
+- **人格白名单**：人格的 `tools` 为 JSON `null` ⇒ 新工具直接可见；为**数组** ⇒ 只有列在其中的工具可见，
+  **老人格看不到这两个工具**，需要把名字补进人格工具集。这不是 bug，是平台语义。
+
+### 投递：插件自管后台 + 主动投递（同权目标保留，**极简实现**）
+
+终态消息走**单一通道** `context.send_message(umo, chain)` —— 不是 `event.send` 直捅适配器；
+投递前合成一个事件并重放 `on_decorating_result`，投递后重放 `on_after_message_sent`，
+`plugins_name` 继承、内容类型是 `LLM_RESULT`（生态插件因此"看得见"后台终态）。
+纪律是**一次逻辑投递**：**不重试、不补发**；平台找不到只 WARN + 记 `PlatformNotFound`（状态工具里可见），
+既不静默也不重发。装饰方三种形态：只改链（用改写后的链发）/ 自己已经发了（认成功、不重发）/
+清空链且没发（记 `DecoratorSuppressed`）。投递只持提交那一刻的**只读快照**，所以重载/超时之后仍能成立。
 
 ### 配置结构 v6：7 组 / 配置叶 57 条（JSON 叶子键 59 个）
 
@@ -73,29 +106,67 @@ python tools/migrate_config_v6.py --strip-v6       # 只删 v6 新叶（成对�
 
 `resources.viewport` 是唯一的复合叶（1 条 ↔ 3 个 JSON 叶子键
 `width`/`height`/`device_scale_factor`），所以"配置叶 57 条"与"JSON 叶子键 59 个"
-两个口径差恒为 2。
+两个口径差恒为 2。**v1.8.0 零新增叶**：两个新工具复用 `tools.background_mode`（是否启用）与
+`tools.background_max_chars`（回看单条截断）；回看窗口（30 分钟）、条数（5）、队列上限（8）都是常量。
 
-### 三个 v1.7.5 的行为约定
+**升级路径（两条，别混）**：
+
+- **v1.7.5 → v1.8.0：只有一条腿**（配置一个键都不动）—— 覆盖插件目录 → WebUI 重载插件。
+  回滚同样一条腿（拷回 v1.7.5 目录）；行为级回滚 = 面板把 `tools.background_mode` 改回 `off`（无需重启）。
+- **v1.6.x / v1.7.0 → v1.8.0 才需要迁配置**（v5 → v6 是破坏性重命名/合并/删除）。顺序**写死**：
+  **先迁配置、再换代码；配置与代码成对回滚**：
+
+```bash
+python tools/migrate_config_v6.py --dry-run        # 1) 干跑：只看键名计划
+python tools/migrate_config_v6.py --apply          # 2) 落盘（自动再备份 + 原子替换）
+python tools/migrate_config_v6.py --verify --baseline   # 3) 复核 43 条承接叶值 + 14 条新叶存在
+python tools/migrate_config_v6.py --restore-from <备份>  # 回滚：逐字节恢复
+python tools/migrate_config_v6.py --strip-v6       # 只删 14 条 v6 新叶（成对回滚的第一步）
+```
+
+**为什么必须先迁配置**：v6 schema 会把 schema 之外的键判为 stale 从配置里删掉 —— `search.providers` 的
+`api_key` 一旦被删就是**永久丢失（不可恢复）**。只回滚其一（只回代码或只回配置）会静默丢设置，因此
+**配置与代码必须成对回滚**。
+
+### 四个 v1.8.0 的行为约定
 
 1. **无起始页**：v5 的 `browser.default_url` 已删。任务里没有显式网址、且本会话
    还没有活页面时，`browse_web` 回「【需要网址】…」并**不打开任何默认站点**。
-2. **后台只有一条终态**：平台原生 core 引擎（`tools.background_engine`）退役，
-   升级后生产组合从 `all × core` 变 `all × plugin`；投递由「核心唤醒一轮主 LLM
-   生成」变为「插件模板生成的一条终态消息」（四态前缀 + task_id + 耗时 + 可选附件）。
+2. **后台只有一条终态**：平台原生 core 引擎已退役（v1.7.5），v1.8.0 起终态消息由
+   `core/tasks.py` 的模板渲染 + `core/proactive.py` 投递（四态前缀 + task_id + 耗时 + 可选附件）。
 3. **截图只作兜底**：结构视图是主通道；`browse_screenshot` 的图必须带
    Set-of-Mark 编号，模型只回编号不回坐标。`perception.screenshot_to_chat`
    决定这张图**是否也发到会话**（默认 false = 只给模型看）。
+4. **结果不进上下文**：后台任务的正文**不会**自动进主模型上下文 —— 想引用就调
+   `browse_recent_results`（模型自己来取），想看进度就调 `browse_task_status`。
 
-## 📁 仓库结构（v1.7.5）
+### 已知边界（v1.8.0，别当缺陷报）
+
+1. **内容安全 stage 不重放**：主动投递只做 L1（通道）+ L2 子集（生态钩子），**不交付 L3** ——
+   后台终态消息**不过**核心内容安全 / 分段 / TTS / 前缀 / t2i / 合并转发。
+2. **主动投递只重放插件钩子**：只有 `on_decorating_result` 与 `on_after_message_sent`
+   （单钩子 5 秒、总 10 秒超时）；核心流水线的 stage 一律不跑。
+3. 群聊消息历史库（`message_history_manager`，**不是**会话历史 `conv.history`）在开关打开时会记一条
+   `role="bot"`。
+4. 装饰方改写了文本时，回看到的正文（我们自己的 `result_text`）与用户最终看到的不完全一致。
+5. 平台找不到（或 `qq_official` 缺 msg_id/scene）⇒ 只记账不重发；`browse_task_status` 里会写
+   "投递失败：…"，任务本身仍是成功终态。
+6. 结果**只在内存**、按会话隔离：插件重载即失效，回看也不跨会话。
+7. 插件重载 = 在跑任务全部取消（`cancelled` 终态若投得出去仍会投递）。
+8. 队列上限 8、回看 5 条 / 30 分钟都是**常量**（要可配就得加配置叶，本版零新增叶）。
+9. 人格工具集为**数组**时，两个新工具默认不可见（见「两个只读回看工具」）。
+
+## 📁 仓库结构（v1.8.0）
 
 ```text
-main.py                      唯一装配层（≤4200 行）：配置读取 + 三个外层入口 + 后台接线
+main.py                      唯一装配层（≤4200 行）：配置读取 + 五个外层入口 + 任务簿接线
 core/a11y.py                 ① 感知：CDP A11y 全树裁剪 / 文本通道 / Set-of-Mark / 帧链
-core/action_model.py         ② 动作：ACTION_SPEC 16 条 → JSON Schema + parse_action 闸门
+core/action_model.py         ② 动作：ACTION_SPEC 16 条 → JSON Schema + parse_action 闸门 + coerce_payload
 core/executor.py             ③ 执行：locator 定位阶梯 + CDP 受信任事件 + 16 动作矩阵
 core/verify.py               ④ 验证：期望/六类差分/【无变化】/重复守卫/观测块渲染
-core/background.py           ⑤ 后台：任务表 + 整链墙钟看门狗 + task_key 去重 + 模板终态
-core/config_map.py           ⑥ 配置：v6 单一事实源（LEAVES / KEY_MAP / ConfigView + v5 冻结视图）
+core/tasks.py                ⑤ 任务簿：7 态 + 队列 + 看门狗 + task_key 去重 + 终态/状态/回看渲染
+core/proactive.py            ⑥ 投递：一次逻辑投递（context.send_message + 双钩子 + 三形态记账）
+core/config_map.py           ⑦ 配置：v6 单一事实源（LEAVES / KEY_MAP / ConfigView + v5 冻结视图）
 core/agent.py                内层执行体：provider 8 格决策 / 人格层 / 六段提示词 / 台账 / 归类
 core/browser.py              Playwright 驱动（headless / viewport+DPR / CJK 字体自检 / SSRF 计数）
 core/session.py              会话与标签页（claim_page 按任务取页 / on_page_closed 回调）
@@ -107,14 +178,14 @@ core/http.py                 HTTP 传输层（aiohttp 优先 / 标准库兜底�
 core/safety.py               SSRF + 内容禁词
 core/delivery.py             后台媒体登记（artifact_sink / collect_artifact / current_artifacts）
 tools/migrate_config_v6.py   配置迁移器（v3/v4/v5 → v6 单跳；五模式）
-tests/                       门禁（32 个 test_*.py + conftest.py）
+tests/                       门禁（33 个 test_*.py + conftest.py）
 ```
 
-`core/` 现有 17 个模块（`__init__.py` 之外），每个都有生产调用方（`main.py`）。
+`core/` 现有 16 个模块（`__init__.py` 之外），每个都有生产调用方（`main.py`）。
 历史迁移器（v3 / v4 / v5 三支）**已全部删除** —— 见 CHANGELOG 与规格勘误 E1：
 v6 迁移器直接吃得下三种历史形态，链式中转不再需要。
 
-## 🎯 感知与截图策略（v1.7.5）
+## 🎯 感知与截图策略（v1.7.5 起未变）
 
 页面感知**只有一个主通道**：CDP A11y 结构视图（`- [role] name (state)`）。截图是**兜底**，
 且必须带 Set-of-Mark 编号（模型只回编号、不回坐标）。四个键控制它：
@@ -138,21 +209,32 @@ PYTHONDONTWRITEBYTECODE=1 /root/AstrBot/.venv/bin/python -m pytest tests/ -q -p 
 /root/AstrBot/.venv/bin/python -m ruff check .
 ```
 
-当前门禁：**786 passed / 0 failed**（v1.7.5，含 t2–t5 的四层用例与返工用例）；
-`tests/` 下 **32 个 `test_*.py`** + `conftest.py`。四个守卫模块是"文档/配置/工具面"的主闸门，
-改任何一层都会先红：
+当前门禁：**870 passed / 0 failed**（v1.8.0）；`tests/` 下 **33 个 `test_*.py`** + `conftest.py`。
+四个守卫模块是"文档/配置/工具面/接线"的主闸门，改任何一层都会先红：
 
 | 守卫 | 钉住什么 |
 | --- | --- |
-| `test_v175_docs_vs_code.py` | 版本四处一致、工具面 3+5、叶数口径、动作清单/observe 视图**从 ACTION_SPEC 生成**比对、README 现行部分不得出现已删键与工具名 |
+| `test_v180_docs_vs_code.py` | 版本四处一致、外层工具面恰好 5 个（README 工具表 ⇄ `_ALL_TOOL_NAMES` 双向）、配置 57 叶 / 59 JSON 键 / 7 组不变、零新增叶、任务簿与投递边界文案 |
 | `test_v175_tools.py` | 工具面、description 硬话、SoM 行为、单渲染处、行数预算 |
 | `test_v175_config_readpoints.py` | schema ⇄ `LEAVES` ⇄ `main.py` 读取点 ⇄ 迁移器四方一致；热开关叶必须影响控制流 |
-| `test_v175_background_wiring.py` | 后台只走 watchdog、deliver 只 `event.send`、无 core 引擎残留 |
+| `test_v180_wiring.py` | 后台只走任务簿、投递只走 `proactive.deliver_text`、五工具参数表**从 docstring 的 `Args:` 段派生**、无旧投递/旧引擎残留 |
 
-其余分组：感知（`test_v175_a11y.py`）、动作（`test_v175_action_model.py` / `test_v175_executor.py`）、
-验证（`test_v175_verify.py`）、后台（`test_v175_background.py`）、内层执行体（`test_v175_agent.py`）、
-本地页路径安全（`test_v175_local_page.py`）、配置与迁移器（`test_config_v6.py` /
-`test_migrate_config_v6.py`）、搜索与安全（`test_search_*.py` / `test_v175_security.py`）。
+其余分组：A1 载荷（`test_v180_action_payload.py`）、任务簿（`test_v180_taskbook.py`）、
+投递（`test_v180_proactive.py`）、两个新工具（`test_v180_tools_status.py` / `test_v180_tools_recall.py`）、
+感知（`test_v175_a11y.py`）、动作（`test_v175_action_model.py` / `test_v175_executor.py`）、
+验证（`test_v175_verify.py`）、内层执行体（`test_v175_agent.py`）、本地页路径安全（`test_v175_local_page.py`）、
+配置与迁移器（`test_config_v6.py` / `test_migrate_config_v6.py`）、搜索与安全（`test_search_*.py` / `test_v175_security.py`）。
+
+**三条平台事实（写在这里免得再踩）**：
+
+1. 核心 `register_llm_tool` **只解析 docstring 的 `Args:` 块、不读函数签名** —— 参数只写在签名里
+   等于"模型看不到这个参数"（会派生出零参数 schema）。本仓库的守卫
+   `test_v180_wiring.py::test_tool_schemas_are_derived_from_docstrings_and_match_the_signature`
+   把五个工具的参数表 ⇄ docstring ⇄ 签名三方钉住。
+2. 参数类型只能写 `string` / `number` / `boolean` 等核心支持的类型 —— **没有 `integer`**
+   （写 `integer` 注册即抛 `ValueError`）；`int` 参数在 docstring 里要写 `number`。
+3. 跑探针时注意：`import astrbot` 会在 **cwd** 生成 `./data/`（含 `cmd_config.json`），
+   一律在 `/tmp` 下跑（本仓的门禁命令都带 `cd` 到临时目录或由 `conftest.py` 兜底）。
 
 ## 🚀 使用示例
 
@@ -162,10 +244,12 @@ PYTHONDONTWRITEBYTECODE=1 /root/AstrBot/.venv/bin/python -m pytest tests/ -q -p 
 - 「在这个页面上帮我填表提交」
 - 「把这个页面上的图片都下载发我」
 - 「打开这个网址，把页面上所有的商品价格读出来」
+- 「刚才那个后台任务跑完了吗？」（→ `browse_task_status`）
+- 「把刚才查到的结果再贴一次」（→ `browse_recent_results`）
 
-## 📜 历史版本（v1.7.0 及更早）
+## 📜 历史版本（v1.7.5 及更早）
 
-> 下面从「功能特性」到「配置迁移」的**全部内容都是 v1.7.0 及更早的实现说明**，保留仅作历史参考与回滚对账。v1.7.5 的现行能力见上文「v1.7.5 现行能力」；两者冲突时**一律以前者为准**（例如内层工具是 5 个而不是 26 个、配置是 v6 58 叶而不是 v5 54 叶、后台没有 `core` 引擎、没有 `browser.default_url`）。
+> 下面从「功能特性」到「配置迁移」的**全部内容都是 v1.7.5 及更早**（多数写于 v1.7.0）的实现说明，保留仅作历史参考与回滚对账。v1.8.0 的现行能力见上文「v1.8.0 现行能力」；两者冲突时**一律以前者为准**（例如外层工具是 5 个而不是 3 个、后台是 `core/tasks.py` 的 7 态任务簿 + `core/proactive.py` 投递而不是旧的 5 态引擎、内层工具是 5 个而不是 26 个、配置是 v6 57 叶而不是 v5 54 叶、没有 `browser.default_url`）。
 
 ## ✨ 功能特性
 

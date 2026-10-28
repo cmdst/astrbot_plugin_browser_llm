@@ -4,6 +4,143 @@
 `data/` 目录（主仓库 .gitignore 忽略）迁移初始化而来。仅跟踪插件源码与测试，运行时
 数据（`data/`：截图、运行时配置、临时文件）一律不入库。
 
+## [v1.8.0] - 2026-10-28
+
+> **为什么抬到 `v1.8.0`**（抬 minor；对外**不是**破坏性）：配置结构仍是 **v6（零新增叶、无迁移）**、
+> 内层工具面仍是 5 个、三个旧外层工具名一字未改；但本版**新增 2 个外层只读工具**（3 → 5）、
+> **修掉一个 P0**（生产 8/8 全拒的 `browse_act`），内部把后台引擎与投递层整体重写
+> （5 态引擎 1006 行 → 7 态任务簿；v1.7.6 的 1254 行投递层 → 296 行极简同权层）⇒ 抬 minor 而非 patch。
+>
+> **`v1.7.6` 与 `v1.7.7` 作废（不合并不部署不打 tag）**：`feat/v1.7.6-delivery-parity`（`1c1e5ac`）
+> 与只以补丁形式存在的 v1.7.7 方案都停在纸面，**不合并、不部署、不打 tag**；本版取代它们 ——
+> `core/active_send.py` 与 v1.7.7 的 `browser_task_status` / `browser_last_result` 命名一律不进仓库。
+
+### P0 修复：`browse_act` 的 `action` 被模型写成 JSON 字符串（生产 8/8 全拒）
+
+- **现象**（用户 2026-10-28 群聊日志）：子代理连续八次调 `browse_act`，**八次**都返回
+  `【拒绝】R-A1 动作必须是 JSON 对象，收到 str`；连 `back` / `wait` 这类零参数动作也被拒，
+  子代理据此误判成"浏览器动作通道故障"。
+- **根因在边缘，不在闸门**：模型把 `action` 参数（工具 schema 里是对象）写成了一个 **JSON 字符串**
+  （部分还套 ` ```json ` 围栏），工具边界把 `kwargs["action"]` 原样透传给 `parse_action`，
+  而闸门是严格的、只吃 Mapping ⇒ 第一步就全拒。
+- **修法（两层，各有证据）**：`core/action_model.coerce_payload()` 做**边缘容错** —— 去空白 →
+  去 ` ```json ` 围栏 → `json.loads`，**只解一层**、**只有解析成 Mapping 才采用**；真非对象
+  （`list` / 数字 / `None` / `"[1,2]"` / `"3"`）**原样返回**，于是照样走 R-A1。
+  接线在**工具边界**（`browse_act` 与 `browse_screenshot` 两处；截图的 `payload["target"]` 同样只解一层）。
+- **闸门**：`parse_action` **一字未放宽** —— `R-A1..R-A14` 的语义与"恰好 14 条"不变，
+  "传错类型"这一整类失败证据不会消失；`R-A1` 的建议文案补一句"不要传 JSON 字符串、不要加引号或代码围栏"。
+- **判据（执行级）**：接线级用例用**替身** `parse_action` 断言它收到的是 `dict`
+  （`browse_screenshot` 还断言 `payload["target"]` 是 `dict`）；反向五参数化（`list` / `42` /
+  `None` / `"[1,2]"` / `"3"`）**全部**仍走 `【拒绝】R-A1`；变异验证两条：`coerce_payload` 改恒等
+  ⇒ 6 failed，闸门放宽成"字符串也 `json.loads`" ⇒ 3 failed（复原后全绿）。
+
+### 新增：两个只读回看工具（外层工具面 3 → 5）
+
+| 工具 | 参数 | 返回 | 硬边界 |
+| --- | --- | --- | --- |
+| `browse_task_status` | `task_id`（string，留空 = 本会话当前任务） | 任务号 / 工具 / 状态 / 已用 / 剩余预算 | **不含正文**、**不给完成时间**（只给时长） |
+| `browse_recent_results` | `task_id`（string）、`limit`（number）、`minutes`（number） | 本会话最近结果，块首一次 `【不可信外部内容】` 前缀 | 默认 **5 条 / 30 分钟**、逐条截断、**不跨会话**、只在内存 |
+
+- **为什么需要**：后台结果**不进主模型上下文**（v1.5.0 起就如此），模型以前无从知道"卡在哪 / 发出去没"。
+  两个工具都**只读**（调用前后记录快照相等），数据源只有内存任务簿。
+- **拒绝码是新家族**：`TS-2`（没有这个任务）/ `TS-3`（`tools.background_mode=off`）/
+  `RR-2`（没有这条结果）/ `RR-3`（同上）。**不复用** `R-A*`（那是动作闸门的冻结码表）。
+- **注册恒定**：与 `tools.background_mode` 无关 —— `off` 时行为落在 `TS-3`/`RR-3`，
+  而不是"不注册"（工具面随配置漂移会让模型的可用工具集不可预测）。
+- **人格白名单告知**：人格 `tools` 为 JSON `null` ⇒ 新工具直接可见；为**数组** ⇒
+  **老人格看不到这两个新工具**，需运营方把名字补进工具集。这不是 bug，是平台语义。
+
+### 重写：后台 5 态引擎 → 7 态任务簿（`core/tasks.py`，898 行；删除 `core/background.py`）
+
+- **7 态**：`queued / running / delivering / succeeded / failed / timeout / cancelled`。
+  `running` **不直接到终态** —— 必须先到 `delivering`，再由唯一一次投递写终态 ⇒
+  **"每任务恰好一条终态"变成结构性保证**，而不是靠自觉。非法转移抛 `ValueError`，终态不可变。
+- **为什么加这两个态**：旧引擎里"结果已生成但没投出去"**没有名字** —— 生产那条 `bg-0001`
+  77 分钟无终态（V-1）正是这个盲区。现在 `delivering` + 投递超时 + 看门狗三重兜底。
+- **排队**：全局在跑数 ≥ `resources.max_parallel` 时进 `queued`（**上限 8**，超出仍 `【拒绝】`）。
+  预算是**提交时刻**起算、**排队时间计入**；排队期耗尽 ⇒ `timeout(reason=queued_budget)` 且不启动执行体。
+- **纪律**：纯 Python（顶层只 import 标准库）、记录**不持 event**（只有 `umo` 与摘要）、
+  **不读写会话历史**、日志只留摘要（`umo` 8 位 / 结果 12 位 + 字数）、`CancelledError` 不吞、
+  **无"是否投递"开关**（恰好一条终态是硬不变量）。终态保留 **64** 条（超出淘汰最老）。
+
+### 重写：投递层（`core/proactive.py`，296 行极简同权；不搬 v1.7.6 的 `core/active_send.py`）
+
+- **通道同权（L1）**：从 `context.send_message(umo, chain)` 出去 —— **不是** `event.send` 直捅适配器。
+- **生态同权（L2 子集）**：合成 `AstrMessageEvent` + 重放 `on_decorating_result` / `on_after_message_sent`
+  + `plugins_name` 继承 + `ResultContentType.LLM_RESULT`。
+- **不交付 L3**：内容安全 stage / 核心分段 / TTS / 前缀 / t2i / 合并转发 / `At`+`Reply` 补插 **都不跑**。
+  正确表述是"**生态插件看得见、通道走正规口；核心 stage 不跑**"，不许写成"后台消息也过内容安全"。
+- **一次逻辑投递、不重试、不补发**：平台找不到 ⇒ WARN + `PlatformNotFound` 记账（状态工具里可见），
+  不静默、不重发；`succeeded=False` 也是一次"已尝试"的结果，随后仍可回看。
+- 装饰方三形态：A（只改链 ⇒ 用改写后的链走 L1）/ B（装饰方自己发了 ⇒ 认成功、不重发）/
+  C（清空链且没发 ⇒ `DecoratorSuppressed`）。钩子超时 5s/个、10s 总；整次投递 30s。
+- 后台**不持 event**：`DeliveryTarget` 是提交那一刻的只读快照，重载/超时之后投递仍能成立。
+
+### 行为变化（升级前必读）
+
+1. **并发满载从「拒绝」改为「排队」**：旧行为是第 5 个任务直接 `【拒绝】`，现在进 `queued`（上限 8，
+   超出仍 `【拒绝】`）；模型的受理文案多了 `【排队中】（第 N 位）`。
+2. **预算起算点变了**：从**提交时刻**起算（排队时间计入），不再从开始执行算。
+3. **终态投递通道**：`context.send_message`（生态插件看得见、钩子会跑），不再是 `event.send` 直捅适配器。
+4. **外层工具 3 → 5**：人格工具集为数组时，两个新工具默认不可见（见上）。
+5. **`core/background.py` 删除**（1006 行 5 态引擎）；`core/active_send.py` 不进本库。
+
+### 配置：v6 不变（零新增叶、无迁移）
+
+- **7 组 / 配置叶 57 条 / JSON 叶子键 59 个**（差 2 恒来自 `resources.viewport`：1 条复合叶 ↔ 3 个 JSON 叶子键），
+  与 v1.7.5 完全一致；**没有 v7、没有新增叶、迁移器零改动**。
+- 两个新工具复用既有叶：`tools.background_mode` 判"是否启用"，`tools.background_max_chars`
+  判"回看单条截断"。回看窗口（30 分钟）、条数（5）、队列上限（8）是**常量**（要可配就加叶 ⇒ v1.8.1 候选）。
+- **升级只有一条腿**：覆盖插件目录 → WebUI 重载插件即可，**配置一个键都不用动**；
+  回滚同样一条腿（拷回 v1.7.5 目录）。行为级回滚 = 把 `tools.background_mode` 改回 `off`（无需重启）。
+- 迁移器 `tools/migrate_config_v6.py` 的五模式（`--dry-run` / `--apply` / `--verify` / `--restore-from` /
+  `--strip-v6`）与"43 条承接叶 + 14 条新叶"口径**不变**（v1.7.5 终稿已把旧的叶数文案统一到 14 条）。
+- **从 v1.6.x / v1.7.0（v5 配置）升级仍要迁配置**：顺序写死 —— **先迁配置、再换代码**，且
+  **配置与代码必须成对回滚**；只回滚其一（只回代码或只回配置）会让 `search.providers` 的 `api_key`
+  被核心当 stale 键删掉，这是**永久丢失（不可恢复）**。
+
+### 文档与版本
+
+- 版本四处同一笔对齐 **v1.8.0**：`metadata.yaml` 的 `version` / `main.py` 的
+  `_PLUGIN_VERSION_FALLBACK` / 本节 / README「当前版本」。
+- README 现行部分重写：7 层架构（新增 `core/tasks.py` 任务簿 + `core/proactive.py` 投递）、
+  5 个外层工具（含两个新工具的用法与边界）、任务簿语义、投递"同权但极简"与**已知边界**。
+- 文档⇄代码守卫 `tests/test_v180_docs_vs_code.py`：把版本四处一致、外层工具面恰好 5 个
+  （README 工具表 ⇄ `_ALL_TOOL_NAMES` 双向）、配置 57 叶 / 59 JSON 键 / 7 组不变、
+  **零新增叶**、任务簿与投递的边界文案钉成门禁（这类漂移不会被任何功能用例抓到）。
+
+### 测试网与门禁
+
+- **870 passed / 0 failed**、`ruff check .` clean、无 skip/xfail（v1.7.5 基线 786；
+  代码收口时 861，本版 docs gate 由 v1.7.5 的 16 条补到 **25** 条 ⇒ 870）。
+- `tests/test_*.py` **29 → 33**：删除 `test_v175_background.py`（1105 行 / 47 条）与
+  `test_v175_background_wiring.py`（6 条）—— 按规格 §10.4 的映射表**逐组重写**（不是删掉了事），
+  新增 `test_v180_{action_payload,proactive,taskbook,tools_status,tools_recall,wiring}.py`，
+  docs-gate 更名 `test_v180_docs_vs_code.py`。
+- 行数守则：`main.py` **4160**（≤4200）/ `core/tasks.py` **898**（≤900，见 §16 勘误 E1）/
+  `core/proactive.py` **296**（≤300）/ `core/agent.py` 750（未变）/ `core/action_model.py` 1397（≤1400）。
+
+### 规格勘误（`spec/20261028-v180-spec.md` §16，追加式）
+
+- **E1**：`core/tasks.py` 行数上限 450 → 900（附实测行数构成与"上限只为阻回胀"的依据）。
+- **E2**：§9.3-N1 的名称黑名单去掉 `TaskRecord`（保留 `TaskManager` / `BusyTracker` / `is_background_task`）。
+- **E3**：§7.2/§7.3 的 docstring 原稿会让工具注册成**零参数** —— 核心 `register_llm_tool`
+  **只解析 docstring 的 `Args:` 段、不读函数签名**；且参数类型必须写 `number`（核心
+  `SUPPORTED_TYPES` 无 `integer`，写 `integer` 注册即抛 `ValueError`）。
+- **E4**：`TS-b` 与 `EX-39` 的冲突裁定 —— 非终态 → 失败类终态要解释原因（只剩成功终态走情形 5）；
+  显式 `task_id` 时任何终态按情形 4。
+
+### 已知边界（本版不修，别当缺陷报）
+
+- **内容安全 stage 不重放**（L3 不交付）：后台终态消息**不过**核心内容安全/分段/TTS/前缀/t2i。
+- **主动投递只重放插件钩子**：`on_decorating_result` / `on_after_message_sent`；核心 stage 一律不跑。
+- 群聊消息历史库（`message_history_manager`，**不是** `conv.history`）在开关打开时会记一条 `role="bot"`。
+- 装饰方改写文本后，回看的正文（我们自己的 `result_text`）与用户看到的不完全一致。
+- 平台找不到 ⇒ 只记账不重发；`qq_official` 缺 msg_id/scene 时可能落到 `PlatformNotFound`/`BadSession`。
+- 结果**只在内存**：插件重载即失效；回看不跨会话（按 `umo` 隔离）。
+- 插件重载 = 在跑任务全部 `cancelled`（`cancelled` 终态若投得出去仍会投递）。
+- `import astrbot` 会在 **cwd** 生成 `./data/`（含 `cmd_config.json`）—— 跑探针/门禁请在 `/tmp` 下进行。
+
 ## [v1.7.5] - 2026-10-27
 
 > **为什么抬到 `v1.7.5`**：本版是**破坏性架构重做**（感知/动作/执行/验证四层整体换栈、内层工具面 26 → 5、
