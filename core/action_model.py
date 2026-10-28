@@ -15,6 +15,11 @@
 `parse_action` 里做：mark 纪元（R-A9）、`index ≥ 匹配数`（R-A8，实际在
 `resolve` 里判定，因为要数候选）、URL 安全策略（R-A11）。
 
+**v1.8.0 两层修法（A1 P0）**：闸门**不放宽**，容错放在**工具边界**。`coerce_payload()`
+（边缘层，别名 `coerce_action_payload`）只把模型偶发写成 JSON 字符串的载荷**解开一层**，
+解不开就原值返回；真正的判定仍只发生在 `parse_action()`。生产 8/8 全拒的根因是模型把
+`action` 参数传成了字符串（`R-A1 动作必须是 JSON 对象，收到 str`），不是闸门太严。
+
 与规格的**两处显式偏离**（都在本文件里写死，评审可查）：
 
 1. `Action.index` 默认 `None`（规格 §3.3 写的是 `0`）。理由：v1.6.x 的 D4
@@ -61,6 +66,8 @@ __all__ = [
     "TAB_OPS",
     "Target",
     "canonical_json",
+    "coerce_action_payload",
+    "coerce_payload",
     "parse_action",
     "render_action_catalog",
 ]
@@ -70,6 +77,7 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 MAX_ACTION_BYTES = 2048  # R-A13：防提示注入塞大对象
+_FENCE_LINES = ("```", "```json")  # 边缘容错认的围栏首行（小写比较）
 MAX_NAME_CHARS = 200  # target.name
 MAX_TARGET_TEXT_CHARS = 200  # target.label / text / testid
 MAX_CSS_CHARS = 400  # target.css
@@ -1150,6 +1158,48 @@ def _check_expect(raw_expect: Any) -> tuple[Expect | None, Rejection | None]:
     return expect, None
 
 
+def coerce_payload(payload: Any) -> Any:
+    """边缘容错（**不是闸门**）：把模型偶发写成 JSON 字符串的载荷解开一层。
+
+    契约（四条，逐条有测试，见 ``tests/test_v180_action_payload.py``）：① ``Mapping`` ⇒ **原对象
+    返回**（``is`` 同一性成立，零拷贝）；② ``bytes`` / ``bytearray`` ⇒ 按 UTF-8 解码
+    （``errors="replace"``）再按字符串处理；③ ``str`` ⇒ 去空白 → 去掉**一层** ``` 围栏
+    （首行 ``` 或 ```json、末行 ```）→ 空串返回原值 → ``json.loads`` ⇒ 结果是 ``Mapping``
+    才返回它，否则返回原值；④ 其它类型与**任何异常** ⇒ 原值返回。只解一层：**不做递归、
+    不做第二次 json.loads**（双重编码仍交给闸门按 R-A1 拒）；绝不抛异常、绝不改写入参。
+
+    实现约束（规格 §4.2 C-1..C-6）：``json.loads`` 最多 1 次、解析结果必须是 ``Mapping``
+    才采用、围栏只去首尾各一行、空串走原值、``except Exception`` 且**不记日志**（日志在
+    调用点记一次）、Mapping 分支零处理。
+    """
+    if isinstance(payload, Mapping):
+        return payload  # C-6：绝大多数情况零成本，同一性成立
+    try:
+        text: str | None = None
+        if isinstance(payload, (bytes, bytearray)):
+            text = bytes(payload).decode("utf-8", errors="replace")
+        elif isinstance(payload, str):
+            text = payload
+        if text is None:
+            return payload  # 契约 4：其它类型原样
+        body = text.strip()
+        if not body:
+            return payload  # C-4：空串/纯空白交给闸门给准确 R-A1
+        lines = body.splitlines()
+        if (len(lines) >= 2 and lines[-1].strip() == "```"
+                and lines[0].strip().lower() in _FENCE_LINES):
+            body = "\n".join(lines[1:-1]).strip()  # C-3：只去首尾各一行
+            if not body:
+                return payload
+        parsed = json.loads(body)  # C-1：全函数最多这一次
+        return parsed if isinstance(parsed, Mapping) else payload  # C-2
+    except Exception:  # noqa: BLE001 — C-5：容错层不制造噪声、绝不抛
+        return payload
+
+
+coerce_action_payload = coerce_payload  # 任务书别名（规格 §4.2 主名 coerce_payload）
+
+
 def parse_action(payload: Any, *, ctx: ParseContext | None = None) -> Action | Rejection:
     """**运行期唯一闸门**：把模型的原始 payload 变成 `Action` 或 `Rejection`。
 
@@ -1170,13 +1220,13 @@ def parse_action(payload: Any, *, ctx: ParseContext | None = None) -> Action | R
             hint="直接给 done 结论，或让主 LLM 起新的浏览任务。",
         )
 
-    # 2) R-A1：必须是对象
+    # 2) R-A1：必须是对象。**一字不改**（规格 §4.3）：闸门不认字符串，字符串只能由边缘
+    #    ``coerce_payload`` 解开一层再进来；放宽这里等于让「不是对象」整类失败消失。
     if not isinstance(payload, Mapping):
         return _reject(
-            "R-A1",
-            f"动作必须是 JSON 对象，收到 {type(payload).__name__}",
-            hint='示例：{"action":"click","target":{"role":"button","name":"提交"}}',
-        )
+            "R-A1", f"动作必须是 JSON 对象，收到 {type(payload).__name__}",
+            hint=('示例：{"action":"click","target":{"role":"button","name":"提交"}}；'
+                  "请直接传对象，不要传 JSON 字符串、不要加引号或代码围栏"))
     raw: dict[str, Any] = dict(payload)
     normalized_from: list[str] = []
     _normalize_alias(raw, normalized_from)

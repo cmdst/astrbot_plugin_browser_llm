@@ -182,13 +182,16 @@ def test_repeat_guard_threshold_comes_from_config(tmp_path):
 def test_deliver_once_leaf_is_gone_and_gate_is_hardwired(tmp_path):
     """t12 R4：`tools.deliver_once` 已删除 —— U2 的"每任务恰好一条"是**硬不变量**，
     不做开关（保留它会让人以为"关掉就会重复投递"，而实际 tool 通道根本没有第二
-    次投递的调用方）。所以这里断言：① 叶不存在；② registry 上没有该开关。"""
-    from astrbot_plugin_browser_llm.core import background as bg
+    次投递的调用方）。所以这里断言：① 叶不存在；② 任务簿上没有该开关（v1.8.0 换
+    ``TaskBook`` 后同样成立：它是 ``delivering → 终态`` 的单向转移，不是布尔开关）。"""
+    from astrbot_plugin_browser_llm.core import tasks as tasks_core
 
     plugin = _plugin(tmp_path)
     assert not any("deliver_once" in path for path in config_map.KEY_MAP), "叶必须已删除"
     assert not hasattr(plugin, "deliver_once"), "main.py 不该再读这个键"
-    assert not hasattr(bg.BackgroundRegistry(), "deliver_once"), "registry 不该留开关"
+    book = tasks_core.TaskBook()
+    assert not hasattr(book, "deliver_once"), "任务簿不该留开关"
+    assert not hasattr(tasks_core, "BackgroundRegistry"), "v1.5.0 的 registry 已随 5 态引擎删除"
 
 
 async def _ok_runner(_progress):
@@ -510,12 +513,13 @@ def test_browse_web_own_timeout_returns_text_not_attribute_error(tmp_path, monke
 
 
 def test_browse_web_own_timeout_maps_to_status_timeout(tmp_path, monkeypatch):
-    """B1（后台）：本工具超时 ⇒ 终态是 **STATUS_TIMEOUT**，且三键都可达。"""
-    from astrbot_plugin_browser_llm.core import background as bg
+    """B1（后台）：本工具超时 ⇒ 终态是 **timeout**，且三键都可达。"""
+    from astrbot_plugin_browser_llm.core import tasks as tasks_core
 
     plugin, _holder = _timeout_plugin(tmp_path, monkeypatch)
     event = helpers._FakeEvent()
     progress_box: dict = {}
+    captured: list[str] = []
 
     async def _runner(progress: dict) -> str:
         progress_box["p"] = progress
@@ -523,13 +527,14 @@ def test_browse_web_own_timeout_maps_to_status_timeout(tmp_path, monkeypatch):
             event, "打开 https://example.com/x", progress=progress, background=True
         )
 
+    async def _deliver(record) -> "tasks_core.DeliveryNote":
+        captured.append(tasks_core.render_terminal_text(record, record.result_text or ""))
+        return tasks_core.DeliveryNote(attempted=True, succeeded=True, channel="test")
+
     async def _run() -> object:
-        plugin._submit_background  # noqa: B018 — 确认走真实提交路径
-        handle = plugin._watchdog.submit(
+        decision = plugin._book.submit(
             runner=_runner,
-            deliver=lambda job, status, body: plugin._deliver_terminal(
-                event, job, status, body
-            ),
+            deliver=_deliver,
             umo=plugin._umo_of(event),
             tool=main_module._BROWSE_WEB_TOOL_NAME,
             task_text="timeout-case",
@@ -539,21 +544,20 @@ def test_browse_web_own_timeout_maps_to_status_timeout(tmp_path, monkeypatch):
             max_parallel=2,
         )
         for _ in range(200):  # 最多等 2 秒
-            job = plugin._watchdog.registry.get(handle.task_id)
-            if job is not None and job.is_terminal:
-                return job
+            record = plugin._book.get(decision.task_id)
+            if record is not None and record.is_terminal:
+                return record
             await asyncio.sleep(0.01)
         raise AssertionError("后台任务没有在 2 秒内收尾")
 
-    job = asyncio.run(_run())
-    assert job.status == bg.STATUS_TIMEOUT, (job.status, job.status)
+    record = asyncio.run(_run())
+    assert record.state == tasks_core.STATE_TIMEOUT, record.state
     progress = progress_box.get("p") or {}
     assert progress.get("partial"), "partial 必须可达（B1 前这里拿不到）"
     assert int(progress.get("steps") or 0) > 0, progress
     assert progress.get("ledger") and "1. browse_observe" in progress["ledger"], progress
-    body = getattr(event, "sent", None)
-    assert body is not None, "deliver 必须收到终态"
-    rendered = str(body)
+    assert captured, "deliver 必须收到终态"
+    rendered = captured[-1]
     assert "【后台任务超时】" in rendered, rendered[:200]
     assert "【后台任务完成】" not in rendered
 

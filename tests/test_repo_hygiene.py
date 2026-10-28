@@ -2,7 +2,7 @@
 
 守护三件事，防止"清理过的死重"重新长回来：
 
-1. **删除项不得复活**：``core/{tasks,async_bridge,vision,pages}.py``、
+1. **删除项不得复活**：``core/{async_bridge,vision,pages}.py``、
    库内重复副本 ``astrbot_plugin_browser_llm_tmp/``、孤儿资产
    ``data/cmd_config.json`` / ``data/t2i_templates/``；
 2. **裁剪项不得回胀**：``core/delivery.py`` 只含 artifact 三件套；
@@ -23,8 +23,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 CORE = ROOT / "core"
 
-DELETED_MODULES = ("tasks.py", "async_bridge.py", "vision.py", "pages.py")
-DELETED_MODULE_NAMES = ("core.tasks", "core.async_bridge", "core.vision", "core.pages")
+DELETED_MODULES = ("async_bridge.py", "vision.py", "pages.py")
+DELETED_MODULE_NAMES = ("core.async_bridge", "core.vision", "core.pages")
+#: 解禁声明（v1.8.0 / 规格 §9.3-U1，勘误 E2）：v1.4.0 删掉的是**290 行的 TaskRecord 版任务管理器**
+#: （``core/tasks.py`` 当时是它）；v1.8.0 的 ``core/tasks.py`` 是**7 态轻量任务簿**（queued/running/
+#: delivering/succeeded/failed/timeout/cancelled + 排队/并发槽/看门狗/单次投递），两者**不同物**，
+#: 因此把 ``tasks.py`` / ``core.tasks`` 从删除清单解禁，改由下方 N1/N2 守则钉规模与形态。
 
 
 def _py_files(*roots: Path) -> list[Path]:
@@ -111,7 +115,7 @@ def test_no_imports_of_deleted_modules():
                 if any(mod == name or mod.startswith(name + ".") for name in DELETED_MODULE_NAMES):
                     offenders.append(f"{path.name}: from {mod}")
                 # 相对导入：from .pages import ...
-                if node.level and any(mod == name for name in ("tasks", "async_bridge", "vision", "pages")):
+                if node.level and any(mod == name for name in ("async_bridge", "vision", "pages")):
                     offenders.append(f"{path.name}: from .{mod}")
             elif isinstance(node, ast.Import):
                 for alias in node.names:
@@ -178,6 +182,40 @@ def test_crawler_has_no_pages_surface():
         assert gone not in defined, f"crawler 里的 {gone} 只服务已删的 core/pages.py"
     assert hasattr(AiohttpFetcher, "fetch")
     assert not hasattr(AiohttpFetcher, "open_page")
+
+
+# ----------------- 新增项不得回胀（v1.8.0 §9.3-N1/N2 替代守卫）-------------------------
+
+
+def test_v180_tasks_module_is_bounded_and_has_no_legacy_manager():
+    """N1：``core/tasks.py``（7 态任务簿）行数守则 ≤900 且不得复活 v1.4.0/v1.5.0 的退役形态。
+
+    ``TaskRecord`` **允许**（v1.8.0 的中央记录类型，与 v1.4.0 那个同名任务管理器不同物，
+    见上方解禁声明）；只禁退役形态：``TaskManager`` / ``BusyTracker`` / ``is_background_task``。
+    """
+    path = CORE / "tasks.py"
+    assert path.exists(), "core/tasks.py 应存在（v1.8.0 交付的 7 态任务簿）"
+    lines = len(path.read_text(encoding="utf-8").splitlines())
+    assert lines <= 900, f"core/tasks.py 回胀到 {lines} 行（守则 ≤900，规格勘误 E1）"
+    defined = _defined_names(path)
+    for gone in ("TaskManager", "BusyTracker", "is_background_task"):
+        assert gone not in defined, f"{gone} 是已退役形态，不得复活"
+    assert "TaskRecord" in defined, "v1.8.0 的中央记录类型合法叫 TaskRecord"
+
+
+def test_v180_proactive_module_is_bounded_and_has_no_fallback_leg():
+    """N2：``core/proactive.py`` 行数守则 ≤300，且不得出现平台回退腿（规格 §6.8 写死的不做项）。"""
+    path = CORE / "proactive.py"
+    assert path.exists(), "core/proactive.py 应存在（v1.8.0 交付的极简同权投递层）"
+    source = path.read_text(encoding="utf-8")
+    lines = len(source.splitlines())
+    assert lines <= 300, f"core/proactive.py 回胀到 {lines} 行（守则 ≤300）"
+    tree = ast.parse(source)
+    for node in ast.walk(tree):  # 合成事件不得链式调基类 send（基类埋点会与新通道双发）
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        assert node.func.attr != "send", "proactive 只走 context.send_message，不直接调 send"
+    assert "platform_fallback" not in (_defined_names(path) | _referenced_names(path))
 
 
 # ------------------------- 接线项不得回退 -------------------------

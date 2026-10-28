@@ -1,18 +1,21 @@
 """astrbot_plugin_browser_llm — LLM 浏览器插件（v1.7.5：感知/动作/执行/验证四层重做）。
 
 **架构（规格 §1）**：主 LLM 只做委派，插件内置一个子代理在真实浏览器里干活。
-- 外层 **3 个 LLM 工具**（名字一律不改，生产人格按名硬白名单）：
+- 外层 **5 个 LLM 工具**（三个旧名一律不改，生产人格按名硬白名单）：
   ``browse_web``（唯一委派入口）/ ``browse_local_page``（本地 HTML 渲染预览，
-  不进子代理）/ ``browser_web_search``（搜索 API 池）。
+  不进子代理）/ ``browser_web_search``（搜索 API 池），加 v1.8.0 的两个**只读**
+  回看工具 ``browse_task_status``（任务状态）/ ``browse_recent_results``（结果回看）
+  —— 后台结果不进主模型上下文，要靠这两个工具自己来取。
 - 内层 **5 个工具**（``INNER_TOOLS``，规格 §9.2）：``browse_observe`` /
   ``browse_act`` / ``browse_screenshot`` / ``browse_media`` / ``browse_search``。
   它们只进 ``self._browser_toolset``，**不在** ``func_list`` 里，因此不受人格
   白名单 / ``inactivated_llm_tools`` 影响。
 - 六层各只有一个事实源：感知 ``core/a11y.py``（CDP AX 树 + SoM 兜底）/
-  动作 ``core/action_model.py``（``ACTION_SPEC`` + ``R-A1..R-A14``）/
+  动作 ``core/action_model.py``（``ACTION_SPEC`` + ``R-A1..R-A14`` + 边缘 ``coerce_payload``）/
   执行 ``core/executor.py``（locator 定位 + CDP 受信任事件）/
   验证 ``core/verify.py``（expect / 差分 / 无变化 / 重复守卫 / 观测块渲染）/
-  后台 ``core/background.py`` / 配置 ``core/config_map.py``。
+  后台 ``core/tasks.py``（7 态任务簿）+ 投递 ``core/proactive.py``（同权投递层）/
+  配置 ``core/config_map.py``。
 
 **本文件的职责只有四件**：鉴权与预算快照 → 前台/后台分派 → 把五层接到一起
 （``_snapshot`` / ``_act`` / ``_observe``）+ 结果合成。**不做**页面读写原语：
@@ -52,8 +55,7 @@ if __package__ in ("", None):  # pragma: no cover — 裸 `python -c "import mai
     __package__ = _pkg_name
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import Image, Plain, Video
+from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 
@@ -61,8 +63,9 @@ from .core import a11y, as_bool, as_float, as_int
 from .core import action_model as am
 from .core import agent as agent_core
 from .core import executor as ex
+from .core import proactive
+from .core import tasks as tasks_core
 from .core import verify as vf
-from .core.background import BudgetWatchdog
 from .core.browser import BrowserCore, validate_browser_type
 from .core.config_map import ConfigView, clamp_of, default_of, schema_leaf
 from .core.crawler import AiohttpFetcher, CrawlerLimits, FetchOutcome
@@ -127,9 +130,22 @@ _SEARCH_TOOL_NAME = "browser_web_search"
 _BROWSE_WEB_TOOL_NAME = "browse_web"
 _LOCAL_PAGE_TOOL_NAME = "browse_local_page"
 
-# 本插件注册的三个**外层** LLM 工具名（唯一事实源：装饰器字面量必须有且仅有
-# 这三个；内层 5 个工具不在 ``func_list`` 里，见 ``INNER_TOOL_NAMES``）。
-_ALL_TOOL_NAMES = (_BROWSE_WEB_TOOL_NAME, _LOCAL_PAGE_TOOL_NAME, _SEARCH_TOOL_NAME)
+# v1.8.0 的两个**只读**回看工具（后台结果不进主模型上下文，模型必须自己来取）。
+# 注册恒定：与 ``tools.background_mode`` 无关（``off`` 时的行为落在返回体的
+# TS-3 / RR-3，而不是"不注册"）—— 工具面随配置漂移会让模型的可用工具集不可预测。
+_TASK_STATUS_TOOL_NAME = "browse_task_status"
+_RECENT_RESULTS_TOOL_NAME = "browse_recent_results"
+
+# 本插件注册的五个**外层** LLM 工具名（唯一事实源：装饰器字面量必须有且仅有
+# 这五个；内层 5 个工具不在 ``func_list`` 里，见 ``INNER_TOOL_NAMES``）。
+# 顺序：三个旧名在前、两个 v1.8.0 新名在后（便于 diff 与人格白名单迁移）。
+_ALL_TOOL_NAMES = (
+    _BROWSE_WEB_TOOL_NAME,
+    _LOCAL_PAGE_TOOL_NAME,
+    _SEARCH_TOOL_NAME,
+    _TASK_STATUS_TOOL_NAME,
+    _RECENT_RESULTS_TOOL_NAME,
+)
 
 # 后台任务（v1.5.0 路线 D）：
 # - ``tools.background_mode`` 三取值：off（默认，行为与 v1.4.0 完全一致）/
@@ -137,8 +153,9 @@ _ALL_TOOL_NAMES = (_BROWSE_WEB_TOOL_NAME, _LOCAL_PAGE_TOOL_NAME, _SEARCH_TOOL_NA
 # - 终态消息**四态四前缀**（设计 §4.7 唯一口径，D3 裁决）：成功
 #   「【后台任务完成】」/ 失败「【后台任务失败】」/ 超时「【后台任务超时】」/
 #   取消「【后台任务已取消】」——**不要**回落成单前缀，否则失败会被算成成功；
+#   （v1.8.0 起前缀由 ``core/tasks.py`` 的 ``HEADERS`` 唯一持有，本文件不再拼文案）
 # - 生产判据两套口径各管一件事：``grep -c "后台任务受理"`` 与
-#   ``grep -c "后台任务终态 status="``（四态合计）+ 按前缀数成功数；
+#   ``grep -c "后台任务终态 state="``（四态合计）+ 按前缀数成功数；
 # - 后台任务在 terminate() 时取消并等待一小段，绝不让插件重载悬挂。
 _BACKGROUND_MODES = ("off", "browse_only", "all")
 
@@ -725,16 +742,13 @@ class BrowserLLMPlugin(Star):
             "B站搜索": "https://search.bilibili.com/all?keyword={keyword}",
         }
 
-        # 后台任务登记表（插件自管后台；同 UMO 单飞 + 全局并发闸）。
-        # 后台设施（v1.7.5）：任务表 + 预算看门狗 + 去重 + 单次投递 + 模板终态，
-        # 全在 core.background.BudgetWatchdog 里（U1–U4 的唯一实现处）。
-        # 默认值只是构造参数；每次 submit 都用当前配置覆盖（热更新即时生效）。
-        self._watchdog = BudgetWatchdog(
-            budget_s=float(self.total_budget_s),
-            max_chars=int(self.background_max_chars),
-            dedupe_window_s=float(self.dedupe_window_s),
-            max_parallel=int(self.max_parallel),
-        )
+        # 后台任务簿（插件自管后台；同 UMO 单飞 + 全局并发闸 + 排队 + 去重窗口）。
+        # v1.8.0：设施从 v1.7.5 的 5 态后台看门狗（本版已整模块删除）换成
+        # ``core.tasks.TaskBook``（**7 态**，多出 ``queued`` 与 ``delivering``）——
+        # ``delivering`` 给"结果已生成但没投出去"这件事一个名字（生产 V-1 的 77 分钟无终态）。
+        # 预算/截断/去重窗口/并发上限**都不是构造参数**：每次 ``submit`` 现读配置快照，
+        # 面板改值下一次调用即生效（热更新），不必重建任务簿。
+        self._book = tasks_core.TaskBook()
 
         # 内层子代理：5 个 FunctionTool 与它们的 ToolSet（构建一次，不再按配置重建）。
         self._browser_tools: list = []
@@ -1682,12 +1696,10 @@ class BrowserLLMPlugin(Star):
         self._stop_agent_provider_sync_task()
         # 后台任务（v1.5.0 路线 D）：先取消在跑任务并等一小段——否则浏览器关了
         # 它们才抛错，终态消息面对的是已销毁的浏览器/页面，重载还多一批悬挂协程。
-        # 后台任务（v1.7.5）：取消全部在跑任务（协作式取消 + 有限等待），
-        # 终态由 watchdog 兜底补投；先做这一步，否则浏览器关了它们才抛错。
+        # v1.8.0：``TaskBook.shutdown`` == ``cancel_all(reason="shutdown")``，取消在跑 +
+        # 排队任务并**落 cancelled 终态**（终止路径不投递：通道可能已随插件卸载拆掉）。
         try:
-            cancelled = await self._watchdog.shutdown(
-                timeout=_BACKGROUND_TERMINATE_TIMEOUT, reason="plugin_reload"
-            )
+            cancelled = await self._book.shutdown(timeout=_BACKGROUND_TERMINATE_TIMEOUT)
             if cancelled:
                 logger.info(f"{f'[{self.metadata_name}]'} 已取消 {cancelled} 个后台任务")
         except Exception as e:  # noqa: BLE001 — 重载路径不许因取消失败而悬挂
@@ -1716,10 +1728,10 @@ class BrowserLLMPlugin(Star):
                 self._search_service.clear_cache()
             self._search_service = None
             self._search_service_signature = None
-            # 后台任务登记表兜底清空：shutdown 已解占，这里再清一次是防
+            # 后台任务簿兜底清空：shutdown 已落终态，这里再清一次是防
             # "表非空但无在跑任务"那类残留把会话永久锁在单飞里。
             try:
-                self._watchdog.registry.clear()
+                self._book.clear()
             except Exception:  # noqa: BLE001
                 pass
         logger.info(f"{tag} 已终止")
@@ -1728,12 +1740,8 @@ class BrowserLLMPlugin(Star):
     # 后台任务（v1.7.5：插件内闭环，与核心后台机制无耦合）
     # ================================================================
 
-    #: 视频类媒体扩展名（``browse_sniff_media`` 会把视频交给 ``_emit_media``，
-    #: 统一按 Image 发会失败，必须按扩展名分流 —— 见 ``_deliver_terminal``）。
-    _VIDEO_SUFFIXES = (".mp4", ".webm", ".mov", ".m4v", ".mkv")
-
     def _background_enabled_for(self, tool_name: str) -> bool:
-        """该工具本次是否走 **plugin 引擎**的后台路径（v1.5.0 语义 + 一条新闸）。
+        """该工具本次是否走后台路径（v1.5.0 语义，v1.8.0 不变）。
 
         - ``off``（默认）：三个工具一律前台同步，行为与 v1.4.0 完全一致；
         - ``browse_only``：只后台化 ``browse_web``——它是唯一 68s 量级的长
@@ -1752,14 +1760,6 @@ class BrowserLLMPlugin(Star):
             return tool_name == _BROWSE_WEB_TOOL_NAME
         return False
 
-    # ----------------------------------------------------------------
-    # 后台引擎（v1.6.0）：置标志 / 重放 / 能力探测 / 降级
-    # ----------------------------------------------------------------
-
-    # ----------------------------------------------------------------
-    # C 模式执行体与媒体发布（媒体边界 A：只给路径，禁止 event.send）
-    # ----------------------------------------------------------------
-
     @staticmethod
     def _umo_digest(umo: str) -> str:
         """日志用的会话摘要：只记 8 位 md5，不把原始 UMO 写进后台任务日志行。"""
@@ -1773,22 +1773,26 @@ class BrowserLLMPlugin(Star):
         runner: Callable[[dict], Awaitable[str]],
         task_text: str = "",
     ) -> str:
-        """提交后台任务：三闸（同会话单飞 / 全局并发 / task_key 去重）全在 watchdog 里。
+        """提交后台任务：四道闸（同会话单飞 / 去重窗口 / 全局并发 / 排队上限）都在任务簿里。
 
-        返回 ```handle.reply_text``（受理/单飞/并发/重复四种文案之一）。**不再**
-        自己登记任务或起协程：执行体、看门狗、终态渲染与「恰好一次投递」都由
-        ``core.background.BudgetWatchdog`` 持有（spec §6，U1/U2 的唯一实现处）。
+        返回 ``decision.text``（受理/排队/单飞/并发/重复五种裁决文案之一）。**不**自己
+        登记任务或起协程：执行体、看门狗、终态渲染与「恰好一次投递」都由
+        ``core.tasks.TaskBook`` 持有（规格 §5/§9.4）。
 
-        预算口径（v1.7.5 统一项）：``resources.total_budget_s`` 一个值同时供
-        前台 ``wait_for`` 与后台预算；``tools.background_max_chars`` 只决定
-        终态文本截断；``resources.max_parallel`` 是全局并发闸。
+        投递改造点（规格 §6）：提交时把 event 抽成**只读快照** ``DeliveryTarget``，
+        终态由 ``proactive.deliver_text`` 走 ``context.send_message`` 出去 —— 后台不再
+        持 event，也不再加 ``event.send`` 兜底腿（平台找不到只记 PlatformNotFound）。
+
+        预算口径（v1.7.5 统一项，v1.8.0 不变）：``resources.total_budget_s`` 一个值同时
+        供前台 ``wait_for`` 与后台预算；``tools.background_max_chars`` 只决定终态文本
+        截断；``resources.max_parallel`` 是全局并发闸。
         """
-        handle = self._watchdog.submit(
+        umo = self._umo_of(event)
+        target = proactive.snapshot_of(event, umo)
+        decision = self._book.submit(
             runner=runner,
-            deliver=lambda job, status, body: self._deliver_terminal(
-                event, job, status, body
-            ),
-            umo=self._umo_of(event),
+            deliver=lambda record: self._deliver(record, target),
+            umo=umo,
             tool=tool_name,
             task_text=task_text,
             budget_s=float(self.total_budget_s),
@@ -1798,34 +1802,61 @@ class BrowserLLMPlugin(Star):
         )
         logger.info(
             f"[{self.metadata_name}] 后台提交 tool={tool_name} "
-            f"kind={handle.decision.kind} task_id={handle.task_id or '-'} "
-            f"umo={self._umo_digest(self._umo_of(event))} "
-            f"budget={float(self.total_budget_s):.0f}s"
+            f"kind={decision.kind} task_id={decision.task_id or '-'} "
+            f"umo={self._umo_digest(umo)} budget={float(self.total_budget_s):.0f}s"
         )
-        return handle.reply_text
+        return decision.text
 
-    async def _deliver_terminal(self, event, job, status: str, body: str) -> None:
-        """终态投递：**只做 event.send**（U4：不读会话历史、不改上下文、不 merge 工具集）。
+    async def _deliver(self, record: tasks_core.TaskRecord,
+                       target: proactive.DeliveryTarget) -> tasks_core.DeliveryNote:
+        """终态投递（**一次逻辑投递**，规格 §6.5）：渲染 → ``proactive.deliver_text``。
 
-        ``body`` 已由 watchdog 的模板渲染好（首行带四态前缀 + task_id + 耗时）；
-        这里只把本任务收集到的媒体（``artifact_sink`` 里的路径）作为附件一并发出。
+        ``target`` 是提交那一刻的快照（由 ``_submit_background`` 的闭包捕获），所以
+        重载/超时之后投递仍能成立；**不读 event**、不读会话历史、不改上下文。
+        失败只记账（``DeliveryNote``）不重试、不补发：``succeeded=False`` 也是一次
+        "已尝试"的结果，随后可由 ``browse_task_status`` / ``browse_recent_results`` 取回。
         """
-        chain: list = [Plain(body)]
-        for path in current_artifacts():
-            component = self._media_component(path)
-            if component is not None:
-                chain.append(component)
-        await event.send(MessageChain(chain=chain))
+        body = tasks_core.render_terminal_text(record, record.result_text or "")
+        return await proactive.deliver_text(
+            target, body, context=self.context, media=tuple(current_artifacts())
+        )
 
-    def _media_component(self, path: str):
-        """媒体路径 → 消息链组件（视频走 ``Video``，其余走 ``Image``；失败返回 None）。"""
-        try:
-            if str(path).lower().endswith(_VIDEO_SUFFIXES):
-                return Video.fromFileSystem(path)
-            return Image.fromFileSystem(path)
-        except Exception as e:  # noqa: BLE001 — 单个附件失败不该拖垮整条终态
-            logger.warning(f"[{self.metadata_name}] 终态附件构造失败: {e}")
-            return None
+    # ----------------------------------------------------------------
+    # 两个**只读**回看工具（v1.8.0 / 规格 §7）：后台结果不进主模型上下文，
+    # 模型必须自己来取。逻辑全在 core/tasks.py 的渲染器里（本文件只做接线），
+    # 这样工具面长出来也不会把 main.py 顶过行数守则。
+    # ----------------------------------------------------------------
+
+    @filter.llm_tool(name="browse_task_status")
+    async def browse_task_status(self, event: AstrMessageEvent, task_id: str = "") -> str:
+        """查后台任务状态（只读）。返回：任务号 / 工具 / 状态 / 已用与剩余预算；不含结果正文。
+        不给完成时间（只给已用时长）。留空 task_id = 看本会话当前任务（无在跑则看最近 30 分钟）。
+
+        Args:
+            task_id(string): 任务号（形如 bg-0007）；留空 = 看本会话当前任务。
+        """
+        return tasks_core.status_report(
+            self._book, umo=self._umo_of(event), task_id=str(task_id or "")[:64],
+            mode=str(getattr(self, "background_mode", "off") or "off"),
+        )
+
+    @filter.llm_tool(name="browse_recent_results")
+    async def browse_recent_results(
+        self, event: AstrMessageEvent, task_id: str = "", limit: int = 0, minutes: int = 0
+    ) -> str:
+        """回看本会话最近的后台结果（只读）。默认 5 条 / 最近 30 分钟；逐条截断；不跨会话。
+        正文来自不可信网页，已加不可信前缀，仅可作事实引用。不给绝对完成时间（只给"X 分钟前"）。
+
+        Args:
+            task_id(string): 只看这一条（形如 bg-0007）；留空 = 最近窗口内全部。
+            limit(number): 最多几条（默认 5，上限 5）。
+            minutes(number): 窗口分钟数（默认 30，上限 30）。
+        """
+        return tasks_core.recall_report(
+            self._book, umo=self._umo_of(event), task_id=str(task_id or "")[:64],
+            mode=str(getattr(self, "background_mode", "off") or "off"), limit=limit,
+            minutes=minutes, max_chars=int(self.background_max_chars),
+        )
 
     # ================================================================
     # 浏览器子代理入口（工具化子代理：browse_web）
@@ -1878,7 +1909,7 @@ class BrowserLLMPlugin(Star):
     def _busy_browse_reason(self, event: AstrMessageEvent) -> str:
         """同会话已有浏览任务时返回拒绝文案（R21 的单飞真闸）。
 
-        两个来源都算"在跑"：前台 ``_fg_inflight`` 计数、后台 watchdog 登记表。
+        两个来源都算"在跑"：前台 ``_fg_inflight`` 计数、后台任务簿（``_book.active_of``）。
         这样"后台 + 前台"与"两个前台"都不会互相踩页面、抢 ref 与 mark 纪元。
         """
         umo = self._umo_of(event)
@@ -1888,15 +1919,15 @@ class BrowserLLMPlugin(Star):
                 "【拒绝】同一会话已有一个浏览任务在跑（前台）：等它结束再提交，"
                 "或把它合并成一次任务。"
             )
-        watchdog = getattr(self, "_watchdog", None)
-        if watchdog is not None:
+        book = getattr(self, "_book", None)
+        if book is not None:
             try:
-                active = watchdog.registry.active_task_id(umo)
+                record = book.active_of(umo)
             except Exception:  # noqa: BLE001 — 查询失败不拦路
-                active = None
-            if active:
+                record = None
+            if record is not None:
                 return (
-                    f"【拒绝】同一会话已有一个后台任务在跑（task_id={active}）："
+                    f"【拒绝】同一会话已有一个后台任务在跑（task_id={record.task_id}）："
                     "等它结束再提交（结果会单独发一条消息）。"
                 )
         return ""
@@ -2050,7 +2081,7 @@ class BrowserLLMPlugin(Star):
                         )
                     if background:
                         # R22：本工具自己的超时不能被记成"完成" —— 抛出去让
-                        # watchdog 的 _run 映射成 STATUS_TIMEOUT。
+                        # TaskBook._run 映射成 timeout 终态。
                         raise
                 except Exception as e:  # noqa: BLE001 — 取消/浏览器已关等
                     logger.warning(
@@ -2212,7 +2243,7 @@ class BrowserLLMPlugin(Star):
                 state = _TaskState()  # 一次性任务状态：不污染会话的 ref/mark 纪元
                 snap = await self._snapshot(page, state)
                 if progress is not None and snap.text:
-                    # watchdog 的 _partial_of 只认这三个键（v1.7.5 契约）
+                    # TaskBook._partial_of 只认这三个键（v1.7.5 契约，v1.8.0 不变）
                     progress["partial"] = snap.text
                 banned = self._check_banned(snap.text or "") or self._check_banned(
                     snap.title or ""
@@ -2416,6 +2447,23 @@ class BrowserLLMPlugin(Star):
     def _lock_for(self, event: AstrMessageEvent) -> asyncio.Lock:
         """返回该会话的专用锁（串行化同一会话的并发工具调用）。"""
         return self.sessions.get_lock(self._umo_of(event))
+
+    def _coerced(self, payload, tool: str):
+        """A1 边缘容错（规格 §4.2/§4.7）：解**一层**后原样返回，真解开才记一条 INFO。
+
+        ``coerce_payload`` 自己绝不抛、绝不改写入参、只认 ``Mapping`` 结果；这里只负责
+        "解开了就记一次观测"（不打 WARNING —— 这是模型侧习惯问题，不是插件故障）。
+        """
+        try:
+            coerced = am.coerce_payload(payload)
+        except Exception:  # noqa: BLE001 — 容错层不制造新故障（理论上不可达）
+            return payload
+        if coerced is not payload:
+            logger.info(
+                f"[{self.metadata_name}] 动作载荷被边缘解了一层"
+                f"（tool={tool}, from={type(payload).__name__}）"
+            )
+        return coerced
 
     # ================================================================
     # LLM 工具：浏览能力（全部返回 str，异常兜底，绝不抛出）
@@ -2894,6 +2942,10 @@ class BrowserLLMPlugin(Star):
 
     async def browse_act(self, event: AstrMessageEvent, action: dict = None) -> str:
         """执行一个结构化动作（schema → resolve → trusted → verify → 观测块）。"""
+        # A1 接线点 W-1（规格 §4.4）：模型偶发把 action 写成 JSON 字符串 ⇒ 在**工具边界**
+        # 解一层再交闸门。闸门 ``parse_action`` 一字未放宽（它仍按 R-A1 拒字符串），
+        # 真非对象（list/int/None）原样返回 ⇒ 照样 R-A1。只在这一处解，_act_impl 不再解。
+        action = self._coerced(action, "browse_act")
         try:
             async with self._lock_for(event):
                 return await self._act_impl(event, action)
@@ -3019,6 +3071,10 @@ class BrowserLLMPlugin(Star):
             ``CallToolResult``（TextContent[标签表] + ImageContent）或纯文本；
             无多模态/图片超限 ⇒ 文本里带 ``【不可用】`` 说明（**不许**静默丢图）。
         """
+        # A1 接线点 W-2（规格 §4.4）：同一个根因的第二个入口 —— ``target`` 也被模型写成
+        # JSON 字符串时在工具边界解一层；``parse_action`` 仍按 R-A1 拒真非对象。
+        if target is not None:
+            target = self._coerced(target, "browse_screenshot")
         try:
             async with self._lock_for(event):
                 return await self._screenshot_impl(event, target=target, full=full)
@@ -3665,7 +3721,7 @@ class BrowserLLMPlugin(Star):
                     refresh=False,
                 )
                 text = self._search_terminal_text(raw)
-                # 预算到点时 watchdog 取这个半成品进终态（U1 的二次证据）
+                # 预算到点时任务簿取这个半成品进终态（U1 的二次证据）
                 progress["partial"] = text
                 return text
 

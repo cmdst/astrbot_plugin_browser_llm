@@ -32,6 +32,7 @@ from astrbot_plugin_browser_llm.core import action_model as am  # noqa: E402
 from astrbot_plugin_browser_llm.core import a11y  # noqa: E402
 from astrbot_plugin_browser_llm.core import agent as agent_core  # noqa: E402
 from astrbot_plugin_browser_llm.core import session as session_core  # noqa: E402
+from astrbot_plugin_browser_llm.core import tasks as tasks_core  # noqa: E402
 from astrbot_plugin_browser_llm.core import verify as vf  # noqa: E402
 
 EXPECTED_INNER = (
@@ -41,7 +42,8 @@ EXPECTED_INNER = (
     "browse_media",
     "browse_search",
 )
-EXPECTED_OUTER = ("browse_web", "browse_local_page", "browser_web_search")
+EXPECTED_OUTER = ("browse_web", "browse_local_page", "browser_web_search",
+                  "browse_task_status", "browse_recent_results")
 
 #: v1.7.0 的 26 个内层方法里，凡是**不再存在**的名字（覆盖 v1.7.5 §9.2 的合并面）。
 REMOVED_INNER = (
@@ -82,7 +84,7 @@ def test_inner_tool_surface_is_five():
     assert len(main_module.INNER_TOOLS) == 5
 
 
-def test_outer_tool_names_are_unchanged():
+def test_outer_tool_names_are_exactly_five():
     assert main_module._ALL_TOOL_NAMES == EXPECTED_OUTER
     tree = ast.parse((ROOT / "main.py").read_text(encoding="utf-8"))
     names: set[str] = set()
@@ -350,7 +352,7 @@ def _bare_plugin(tmp_path):
     plugin._search_service = None
     plugin._search_service_signature = None
     plugin._search_engines = {"必应搜索": "https://x/?q={keyword}"}
-    plugin._watchdog = main_module.BudgetWatchdog()
+    plugin._book = tasks_core.TaskBook()
     plugin._browser_tools = []
     plugin._browser_toolset = None
     plugin._agent_sync_task = None

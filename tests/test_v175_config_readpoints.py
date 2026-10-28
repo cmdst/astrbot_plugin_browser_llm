@@ -32,11 +32,12 @@ RUNTIME_SOURCES = {
         "core/agent.py",
         "core/a11y.py",
         "core/action_model.py",
-        "core/background.py",
         "core/browser.py",
         "core/config_map.py",
         "core/executor.py",
+        "core/proactive.py",
         "core/session.py",
+        "core/tasks.py",
         "core/verify.py",
     )
 }

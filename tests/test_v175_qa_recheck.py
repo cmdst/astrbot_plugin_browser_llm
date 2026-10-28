@@ -10,7 +10,8 @@
    （不静默、不猜坐标）。
 3. **U1/U2 的真实时钟复跑**（不跑实现者的假时钟用例）：预算到点 ⇒ 恰好一条终态；
    同键在跑 ⇒ 第二次提交只回执、不再投递。两条都用 1 秒级真实时钟，不依赖 sleep 抖动
-   （轮询等待交货，超时即判失败）。
+   （轮询等待交货，超时即判失败）。v1.8.0 起这两条跑在 ``core/tasks.TaskBook``（7 态）
+   上：终态由 ``render_terminal_text`` 渲染、投递回调形如 ``deliver(TaskRecord)``。
 
 跑法：``PYTHONDONTWRITEBYTECODE=1 /root/AstrBot/.venv/bin/python -m pytest \
 tests/test_v175_qa_recheck.py -q -p no:cacheprovider``
@@ -34,7 +35,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 import test_v175_tools as helpers  # noqa: E402 — 复用同一批 fake（不新增夹具）
 
 from astrbot_plugin_browser_llm.core import action_model as am  # noqa: E402
-from astrbot_plugin_browser_llm.core import background as bg  # noqa: E402
+from astrbot_plugin_browser_llm.core import tasks as tb  # noqa: E402
 
 
 # --------------------------------------------------------------- D8：不再静默
@@ -122,71 +123,75 @@ async def _wait_for(count_fn, timeout: float = 8.0) -> None:
     raise AssertionError("等待超时：后台任务没有按时交货")
 
 
+def _recorder(deliveries: list):
+    """替身投递：记账并**在 delivering 期间**渲染终态正文（与 main._deliver 同形）。"""
+    async def deliver(record: "tb.TaskRecord") -> "tb.DeliveryNote":
+        rendered = tb.render_terminal_text(record, record.result_text or "")
+        deliveries.append((record.task_id, record.state, rendered))
+        return tb.DeliveryNote(attempted=True, succeeded=True, channel="test")
+    return deliver
+
+
 def test_u1_budget_deadline_delivers_exactly_one_terminal_real_clock():
     """U1：整链墙钟预算到点 ⇒ **恰好一条**终态（真实时钟 1 秒预算）。"""
     deliveries: list[tuple[str, str, str]] = []
 
-    async def deliver(job, status, text):
-        deliveries.append((job.task_id, status, text))
-
     async def scenario():
-        watchdog = bg.BudgetWatchdog(budget_s=1.0)
+        book = tb.TaskBook()
 
         async def hanging(progress: dict) -> str:
             progress["partial"] = "中断前的半成品"
             await asyncio.sleep(30)
             return "never"
 
-        handle = watchdog.submit(
+        decision = book.submit(
             runner=hanging,
-            deliver=deliver,
+            deliver=_recorder(deliveries),
             umo="qa:u1:umo",
             tool="browse_web",
             task_text="U1 到点终态",
             budget_s=1.0,
             dedupe_window_s=600,
         )
-        await _wait_for(lambda: len(deliveries) >= 1)
-        await asyncio.sleep(0.3)  # 给第二层看门狗/迟到投递留出机会（必须仍然只有 1 条）
-        return handle, watchdog
+        await _wait_for(lambda: book.get(decision.task_id).is_terminal)
+        await asyncio.sleep(0.3)  # 给看门狗/迟到投递留出机会（必须仍然只有 1 条）
+        return decision, book
 
-    handle, _watchdog = asyncio.run(scenario())
-    mine = [d for d in deliveries if d[0] == handle.task_id]
+    decision, book = asyncio.run(scenario())
+    record = book.get(decision.task_id)
+    mine = [d for d in deliveries if d[0] == decision.task_id]
     assert len(mine) == 1, f"终态必须恰好一条，实际 {len(mine)} 条"
-    task_id, status, text = mine[0]
-    assert status == bg.STATUS_TIMEOUT, status
-    assert text.startswith("【后台任务超时】"), text.splitlines()[0]
+    task_id, _state, text = mine[0]
+    assert record.state == tb.STATE_TIMEOUT, record.state
+    assert "【后台任务超时】" in text.splitlines()[0], text.splitlines()[0]
     assert task_id in text and "browse_web" in text, "终态首行必须能归属到具体任务"
     assert "中断前的半成品" in text, "到点也必须带上已得的部分结果"
-    assert handle.task is not None and handle.task.done()
+    assert record.is_terminal and not record.is_active
 
 
 def test_u2_same_key_running_delivers_once_real_clock():
     """U2：同键（同 umo+tool+文本）在跑 ⇒ 第二次只回【已受理】，全程只投递 1 条。"""
     deliveries: list[tuple[str, str, str]] = []
 
-    async def deliver(job, status, text):
-        deliveries.append((job.task_id, status, text))
-
     async def scenario():
-        watchdog = bg.BudgetWatchdog(budget_s=3.0)
+        book = tb.TaskBook()
 
         async def slow(progress: dict) -> str:
             await asyncio.sleep(0.6)
             return "唯一结果"
 
-        first = watchdog.submit(
+        first = book.submit(
             runner=slow,
-            deliver=deliver,
+            deliver=_recorder(deliveries),
             umo="qa:u2:umo",
             tool="browse_web",
             task_text="  同一句话  ",
             budget_s=3.0,
             dedupe_window_s=600,
         )
-        second = watchdog.submit(
+        second = book.submit(
             runner=slow,
-            deliver=deliver,
+            deliver=_recorder(deliveries),
             umo="qa:u2:umo",
             tool="browse_web",
             task_text="同一句话",
@@ -195,9 +200,9 @@ def test_u2_same_key_running_delivers_once_real_clock():
         )
         await _wait_for(lambda: any(d[0] == first.task_id for d in deliveries))
         await asyncio.sleep(0.4)
-        third = watchdog.submit(
+        third = book.submit(
             runner=slow,
-            deliver=deliver,
+            deliver=_recorder(deliveries),
             umo="qa:u2:umo",
             tool="browse_web",
             task_text="同一句话",
@@ -207,16 +212,13 @@ def test_u2_same_key_running_delivers_once_real_clock():
         return first, second, third
 
     first, second, third = asyncio.run(scenario())
-    assert first.decision.kind == bg.SUBMIT_ACCEPTED
-    assert second.decision.kind in (
-        bg.SUBMIT_DUPLICATE_RUNNING,
-        bg.SUBMIT_SINGLE_FLIGHT,
-    ), second.decision.kind
-    assert second.task is None, "同键在跑不得再起第二个执行体"
-    assert "已受理" in second.reply_text
-    assert third.decision.kind == bg.SUBMIT_DUPLICATE_DONE, third.decision.kind
-    assert "重复请求" in third.reply_text
-    assert "唯一结果" in third.reply_text, "重复回执要把已完成的结果给模型，否则等于没说"
+    assert first.kind == tb.SUBMIT_ACCEPTED
+    assert second.kind in (tb.SUBMIT_DUPLICATE_RUNNING, tb.SUBMIT_SINGLE_FLIGHT), second.kind
+    assert second.task_id == first.task_id, "同键在跑不得再起第二个任务"
+    assert "已受理" in first.text
+    assert third.kind == tb.SUBMIT_DUPLICATE_DONE, third.kind
+    assert "重复请求" in third.text
+    assert "唯一结果" in third.text, "重复回执要把已完成的结果给模型，否则等于没说"
     assert len([d for d in deliveries if d[0] == first.task_id]) == 1, (
         f"同一 task 必须只投递一条，实际 {len(deliveries)} 条"
     )
