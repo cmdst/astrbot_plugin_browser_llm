@@ -2,30 +2,32 @@
 
 Agent 驱动的网页浏览插件 —— 让 LLM 通过 function-calling 自主浏览网页：导航、搜索、点击链接、填表、滚动、截图识图、下载媒体，无需用户手动指令。
 
-当前版本：**v1.7.0**（变更见 [CHANGELOG](./CHANGELOG.md)；v1.7.0 是**破坏性重构** —— 主 LLM 只做委派，网页交互/爬取/搜索由插件**内置的多模态子代理**承接；配置结构 v5：**7 组 / 配置叶 54 条 = JSON 叶子键 55 个**（旧 6 组 / 配置叶 45 条 / JSON 叶子键 46 个）。`v1.6.0` 是**已上生产**的版本，因此本次抬 minor 而不是发 patch）
+当前版本：**v1.7.0**（本分支代码版本），使用内嵌子代理与 v5 配置。变更见 [CHANGELOG](./CHANGELOG.md)。
+
+> **版本选择：**仓库默认分支 `main` 与 [v1.8.0 Release](https://github.com/cmdst/astrbot_plugin_browser_llm/releases/tag/v1.8.0) 是不同代码线：前者的版本字段为 v1.7.0，后者对应 v1.8.0 标签。普通仓库地址可能随默认分支更新；固定版本请核对标签和提交，不要只看版本号。本页描述 v1.7.0，不适用于 v1.8.0 的所有配置和工具。升级或降级前备份插件目录和配置；跨 v5/v6 时，遵循目标版本的迁移步骤并成对回滚配置与代码。
 
 > **看不懂「配置叶 54 条 = JSON 叶子键 55 个」？** 这是同一份 schema 的两种数法，两个都对，差 1 恒来自
 > `browser.viewport`（**1 条复合叶 ↔ 2 个 JSON 叶子键**）。说「配置叶 / 键条目」用 54；说「配置文件里有几个键 /
-> schema 展平几个」用 55。定义与复算命令见规格 `spec/20261026-v170-embedded-agent-spec.md` §6.1a。
+> schema 展平几个」用 55。以仓库内配置 schema 和 `core/config_map.py` 为准。
 > v1.6.0 的对应值是 **配置叶 45 条 / JSON 叶子键 46 个**。
 
 ## ✨ 功能特性
 
-- **两个委派入口 + 一个直调入口（v1.7.0）**：主 LLM 只调 `browse_web`（`search.mode=external` 且搜索池可用时还有 `browser_web_search`）把任务交出去，**26 个 `browse_*` 工具**（`search.mode=internal` 时 **27** 个）在**插件内置的内层多模态模型**上下文里运行；`browse_local_page` 仍是**直调**入口、**不进子代理**（安全理由见下文「三个入口的真实语义」），显著减少主 LLM 的 token 占用
+- **一个子代理委派入口 + 两个直调入口（v1.7.0）**：主 LLM 用 `browse_web` 把网页任务交给子代理；`browser_web_search` 在 external 模式可用时直接调用搜索服务，**26 个 `browse_*` 工具**（`search.mode=internal` 时 **27** 个）在**插件内置的内层多模态模型**上下文里运行；`browse_local_page` 仍是**直调**入口、**不进子代理**（安全理由见下文「三个入口的真实语义」），显著减少主 LLM 的 token 占用
 - **内嵌多模态子代理（v1.7.0）**：内层模型从 AstrBot 已配置的**多模态 provider** 里选（`agent.provider_id`，留空 = 继承当前会话）；截图以 `ImageContent` **原生直达**内层模型；纯文本内层模型自动走 caption 兜底（返回体首行加 `【注意】`）；显式指定却未加载 / 不支持 `tool_use` 时**拒绝执行**（不静默换模型、不静默清空工具集）
 - **搜索内外置两模式（v1.7.0）**：`search.mode=external`（默认，同 v1.6.0）= 池搜索挂外层工具 `browser_web_search`；`internal` = 挂内层工具 `browse_web_search`，外层强制停用（主 LLM 只能委派）。两档互斥、共用同一个搜索服务实例，见下文「搜索内外置两模式」
-- **内层人格三档（v1.7.0）**：`agent.persona_mode = default / current / custom` —— 默认只有工具提示词、`current` 注入当前会话人格、`custom` 用自定义提示词；三层只改语气，**结构上改不了红线、工具清单与输出契约**，见下文「内层人格三档」
-- **确定性执行台账（v1.7.0）**：`browse_web` 的返回体末尾附 `【执行台账】`，由插件按**真实发生**的工具调用生成（内层模型改不了），并给成功正文加 `【不可信外部内容】` 前缀 —— 页面里的"指令"不会被当成指令执行
+- **内层人格三档（v1.7.0）**：`agent.persona_mode = default / current / custom` —— 默认只有工具提示词、`current` 注入当前会话人格、`custom` 用自定义提示词；人格提示用于影响表达风格；提示词分层不能保证模型始终遵守红线，见下文「内层人格三档」
+- **确定性执行台账（v1.7.0）**：`browse_web` 的返回体末尾附 `【执行台账】`，由插件按**真实发生**的工具调用生成（内层模型改不了），并给成功正文加 `【不可信外部内容】` 前缀 —— 该前缀用于提醒模型区分页面内容与指令，但不能保证抵御提示注入
 - **完整网页交互**：打开网页、提取正文/链接、按文本/坐标/选择器点击、填表、按键、滚动、滑块、下拉框、复选框、标签页管理；v1.6.1 起多匹配控件可指定 `index`，失败时给「相近可点击文本 top-5」；v1.7.0 新增 `browse_get_interactive`（枚举可交互元素，含可直接点 `selector`）与 `browse_click_selector`（给上面那份枚举一个确定性落点）
 - **识图辅助**：接入多模态模型对截图做视觉理解，支持区域裁剪放大识图（`browse_zoom_crop`）
 - **媒体嗅探**：从页面嗅探图片/视频资源，下载并发送到群聊（`browse_sniff_media`）
 - **本地页面自检**：`browse_local_page` 渲染查看本地 HTML 供子代理/开发者自检页面（无头渲染 + 截图 + 视觉描述，视觉不可用时降级文本提取；路径白名单为工作区（AstrBot 工作区 + 平台工作区，如 `/root/workspace`）+ 插件 data 目录，可用环境变量 `BROWSER_LLM_EXTRA_LOCAL_ROOTS`（按系统路径分隔符分隔，Linux/macOS 为冒号、Windows 为分号）追加额外根目录；支持 `perception` 参数按任务控制感知方式——全文本子代理读文档/报错页可传 `perception="text"` 跳过截图识图）
 - **静默模式**：浏览截图仅内部识图，不往群聊刷图（`silent_mode`）
 - **感知模式精细化**：页面感知方式可精确控制——`browse_web` 参数级前缀 `perception=text|text_image|image` 按任务覆盖、`perception_rules` 按会话（UMO 子串匹配）设定默认、全局 `page_perception` 兜底；全文本子代理（前端/测试等）不再为每次浏览付出截图识图开销
-- **识图缓存（v1.6.1 换键，事故修复）**：缓存键从「同 URL」升级为**七元组** —— `(会话, 规范化URL, 工具种类, 裁剪参数, **图像内容哈希**, 提示词哈希, provider 哈希)`；同一 URL 换了画面**不再**返回旧描述。`vision_cache_ttl` 内同画面重复识图仍复用结果（带 `[缓存]` 前缀），`0` = 关闭
+- **识图缓存（v1.6.1 换键，20261026 事故修复）**：缓存键从「同 URL」升级为**七元组** —— `(会话, 规范化URL, 工具种类, 裁剪参数, **图像内容哈希**, 提示词哈希, provider 哈希)`；同一 URL 换了画面**不再**返回旧描述。`vision_cache_ttl` 内同画面重复识图仍复用结果（带 `[缓存]` 前缀），`0` = 关闭
 - **配置热更新**：会话黑白名单、内容禁词、内网拦截开关、截图开关、识图 Provider、感知规则、内层模型/人格档/搜索模式等修改后无需重启，下次工具调用即生效（Dashboard 保存即同步）
 - **后台异步执行（v1.5.0，默认关闭）**：`tools.background_mode` 打开后，`browse_web` / `browse_local_page` / `browser_web_search` 三个 LLM 工具**立刻**返回「已受理 + task_id」，真正的任务在后台跑，结果**单独作为一条消息**发到本会话（四态前缀、部分结果规则、并发上限、回滚见下文「后台异步执行」一节）；默认 `off` 与 v1.4.0 行为一致
-- **两种后台引擎（v1.6.0，默认 `plugin`）**：`tools.background_engine` 决定「后台化时用谁的机制」——`plugin`（默认，v1.5.0 路线 D：插件自管任务与终态投递，交付确定但结果不进主模型上下文）/ `core`（平台原生后台任务：只把 `browse_web` 的 `is_background_task` 置真，由核心派发、核心在完成后唤醒一轮主 LLM 交付，结果进上下文但**依赖模型主动调 `send_message_to_user`**，且**需要核心一行修复 + 重启 `astrbot.service` + 运营方批准**）。核心未修时插件自动拒绝 `core`、记 ERROR 并回落 `plugin`（绝不静默前台）；两个引擎**不会同时生效**，差别与代价见下文「两个引擎下 browse_web 的差别」
+- **两种后台引擎（v1.6.0，默认 `plugin`）**：`tools.background_engine` 决定「后台化时用谁的机制」——`plugin`（默认，v1.5.0 路线 D：插件自管任务与终态投递，投递可能失败且结果不进主模型上下文）/ `core`（平台原生后台任务：只把 `browse_web` 的 `is_background_task` 置真，由核心派发、核心在完成后唤醒一轮主 LLM 交付，结果进上下文但**依赖模型主动调 `send_message_to_user`**，且**需要核心一行修复 + 重启 `astrbot.service` + 运营方批准**）。核心未修时插件自动拒绝 `core`、记 ERROR 并回落 `plugin`（绝不静默前台）；两个引擎**不会同时生效**，差别与代价见下文「两个引擎下 browse_web 的差别」
 - **资源清理加固**：浏览器关闭/插件重载带超时保护与总超时兜底，避免 WebUI 重载后旧实例 chromium 残留进程
 - **安全防护**：SSRF 内网拦截、内容禁词过滤（`enable_banned_filter` 总开关，敏感词密集站点可关闭）、图形验证码自动停止、下载大小上限
 
@@ -42,7 +44,7 @@ Agent 驱动的网页浏览插件 —— 让 LLM 通过 function-calling 自主�
   │           │     ├── SafetyFilter（SSRF / 禁词 / 内网拦截）
   │           │     └── 影像原生（截图 → ImageContent → 内层多模态模型）
   │           └── 预算 / 截断 / 确定性台账 / 结果归类（不可信前缀）
-  ├── browser_web_search（委派入口，仅 search.mode=external 且池可用时可见）
+  ├── browser_web_search（直调搜索服务，仅 search.mode=external 且池可用时可见）
   │     └── 搜索服务 core/search.py（并行波次 / 去重 / 缓存 / 冷却；不启浏览器）
   └── browse_local_page（直调入口，永不进子代理）
         ├── 无头渲染（独立页面，用完即关）
@@ -58,15 +60,15 @@ Agent 驱动的网页浏览插件 —— 让 LLM 通过 function-calling 自主�
 
 ## 🧠 内嵌多模态子代理（v1.7.0）：三个入口、内层模型、人格、搜索、预算
 
-### 三个入口的真实语义（两个委派 + 一个直调）
+### 三个入口的真实语义（一个子代理委派 + 两个直调）
 
 | 工具名 | 类型 | 谁在执行 | 可见性 | 返回体 |
 | --- | --- | --- | --- | --- |
 | `browse_web` | **委派入口** | 插件内置的内层子代理（`core/agent.py`） | 常驻（`active` 恒 True） | `【不可信外部内容】` 前缀 + 结论 + `【执行台账】`；内层模型是纯文本时首行另有 `【注意】` |
-| `browser_web_search` | **委派入口**（搜索） | 搜索服务 `core/search.py`（不启浏览器） | 仅 `search.mode=external` 且池可用时可见；`internal` 时插件**强制停用** | JSON 字符串（前台）/ 人读摘要（后台终态） |
+| `browser_web_search` | **直调入口**（搜索） | 搜索服务 `core/search.py`（不启浏览器） | 仅 `search.mode=external` 且池可用时可见；`internal` 时插件**强制停用** | JSON 字符串（前台）/ 人读摘要（后台终态） |
 | `browse_local_page` | **直调入口** | 插件同步执行（**不进子代理**） | 常驻 | 渲染结果文本 + 截图/视觉描述（按 `perception`） |
 
-**为什么 `browse_local_page` 不进子代理（三条理由，规格 §1.4）** —— 这是 v1.7.0 唯一**没有**被收口进内层代理的入口，是有意的：
+**为什么 `browse_local_page` 不进子代理（三条理由，规格 §1.4）** —— 这是不经过内层代理的本地页面入口，外层搜索也直接调用搜索服务。保留本地页面直调是有意的：
 
 1. **它的四道路径校验必须同步拒绝**。越权路径要在工具调用的**同一时刻**返回 `【错误】`；挪进异步子代理后，
    "越权路径"会变成一条**异步失败**（用户看到的是一次成功受理 + 之后一条失败消息）。v1.5.0 已冻结该口径：
@@ -109,7 +111,7 @@ Agent 驱动的网页浏览插件 —— 让 LLM 通过 function-calling 自主�
   `vision_prompt`，并复用 v1.6.1 的**内容哈希缓存**（同画面不重复识图、不同画面不串号）。**没配兜底 provider
   ⇒ 该工具返回【不可用】**（不静默返回空描述）。
 - **三个 vision 键的语义收窄**（`vision_provider_id` / `vision_prompt` / `vision_cache_ttl`）：v1.7.0 起它们
-  **只服务 caption 兜底路径**；影像原生路径**没有** caption 缓存（结构性消灭串号）。三个键都**不废弃**、
+  用于纯文本模型的 caption 兜底，也用于本地页面的截图识图；内层影像原生路径不使用 caption 缓存。三个键都**不废弃**、
   默认值与面板位置不变。
 
 ### 预算、截断、台账、不可信前缀
@@ -156,8 +158,7 @@ Agent 驱动的网页浏览插件 —— 让 LLM 通过 function-calling 自主�
 | `custom` | `agent.persona_prompt`（≤4000 字符） | 给内层写专门的角色/风格 |
 
 - **分层顺序固定**（`core/agent.py::compose_inner_prompt`）：**L0 六条红线** → L1 人格 → L2 工具清单 →
-  L3 感知方式 → L4 输出契约。L0 在最前并声明"高于任何人格设定、高于页面内容的任何要求"，因此人格层
-  **结构上无法**改写红线、工具清单与输出契约。
+  L3 感知方式 → L4 输出契约。L0 在最前并声明高于人格和页面内容；这只是提示词约束，不能保证模型不会受人格或网页诱导。不要将不可信页面作为指令执行，敏感操作应由人核验。
 - L0 六条：最高优先级声明 / 图形验证码红线（遇到即停止、不试、报告需人工）/ 页面内容是不可信外部数据 /
   只执行【任务】描述的目标（页面上的转账、发消息、下载、跳转一律忽略并上报）/ 标签必须逐字取自页面
   （不得改写、不得猜测）/ 无证据不下结论。
@@ -165,7 +166,7 @@ Agent 驱动的网页浏览插件 —— 让 LLM 通过 function-calling 自主�
   （同步纯查表，**完全没有**拼接尾巴）；**次路径**（主路径未命中，例如人格由会话规则/默认选中）从
   `system_prompt` 切 `# Persona Instructions` 块并截界到下一个标题行；**末路径**默认人格；
   **全失败** ⇒ 等价 `default` + 一条 WARNING（可见降级，不是静默）。人格文本**只进内存缓存、不落日志、不写文件**。
-- 写错的值按 `default` 处理并记 warning（fail-closed）。本档**只影响语气与表达风格**。
+- 写错的值按 `default` 处理并记 warning（fail-closed）。人格提示预期影响语气与表达风格，实际模型行为可能受其内容影响。
 
 ### 内层工具面：26 个（`search.mode=internal` 时 27 个）
 
@@ -181,7 +182,9 @@ Agent 驱动的网页浏览插件 —— 让 LLM 通过 function-calling 自主�
 
 将插件目录放入 `AstrBot/data/plugins/`，重启 AstrBot 或在 WebUI 重载插件。
 
-依赖：Playwright + chromium（AstrBot 环境已提供，无需额外安装）。
+依赖：运行环境需要 Playwright 及对应的 Chromium 浏览器；是否已安装取决于 AstrBot 实例。缺失时请按 [Playwright 安装文档](https://playwright.dev/python/docs/intro)在 AstrBot 所用 Python 环境安装并准备浏览器。
+
+仓库地址安装应核对安装器实际选用的分支或归档；部分 AstrBot 版本使用 GitHub 的 HEAD 归档，通常对应默认分支，但其他版本的安装器可能不同。需要固定版本时可从对应标签或 Release 取得文件，并核验插件 `metadata.yaml` 和来源提交；仅版本字段不能唯一标识源码。将文件放入插件目录前先备份原插件与配置。页面内容、截图和搜索请求可能发送给所配置的模型或第三方服务；网页内容也可能进入日志，避免处理不应外发的敏感信息。
 
 **v1.7.0 的前置**：建议先在 AstrBot 里配好一个**多模态 + 支持函数调用**的聊天 provider（内层子代理用）；
 留空 `agent.provider_id` 也能跑（继承当前会话），但那种模式下挑不了模型。
@@ -197,7 +200,7 @@ v1.4.0 起配置按**分组**组织（Dashboard 中折叠显示），v1.7.0 起�
 | `browser` | 6 | 不变 |
 | `limits` | 7 | 不变 |
 | `security` | 5 | 不变 |
-| `perception` | 7 | 键不变，**语义收窄**（3 个 vision 键只服务 caption 兜底路径） |
+| `perception` | 7 | 键不变，**语义收窄**（3 个 vision 键用于 caption 兜底及本地页面识图） |
 | `search` | 17 | **+1**：`search.mode` |
 | `tools` | 4 | 不变 |
 | **`agent`** | **8** | **新增组**（内嵌子代理：provider / 人格 / 预算 / 影像 / 台账） |
@@ -234,9 +237,9 @@ v1.7.0 新增的内嵌子代理组（8 条，见本节末尾）。
 | `perception.silent_mode` | true | 静默模式：截图仅内部识图不发群 |
 | `perception.page_perception` | text_image | 全局页面感知方式：text / text_image / image |
 | `perception.perception_rules` | [] | 会话级感知规则：按 UMO 子串匹配设定会话默认感知方式。每条含 `match`、`perception`、可选 `note`；命中第一条生效 |
-| `perception.vision_provider_id` | - | **caption 兜底用的**多模态识图模型 Provider ID（下拉自动同步已配置模型）。v1.7.0 起**只服务 caption 兜底路径**：内层子代理是多模态模型时走影像原生、不经过它；留空则纯文本内层模型的截图**没有**文字描述（该工具返回【不可用】） |
-| `perception.vision_prompt` | - | caption 兜底路径的自定义识图提示词（v1.7.0 起只在该路径生效；进缓存键的提示词哈希） |
-| `perception.vision_cache_ttl` | 60 | caption 兜底路径的识图短时缓存秒数（键 = 七元组，含**图像内容哈希**；v1.6.1 事故修复）；0 关闭 |
+| `perception.vision_provider_id` | - | **caption 兜底用的**多模态识图模型 Provider ID（下拉自动同步已配置模型）。用于 caption 兜底和本地页面识图；内层子代理是多模态模型时走影像原生、不经过它；留空则纯文本内层模型的截图**没有**文字描述（该工具返回【不可用】） |
+| `perception.vision_prompt` | - | caption 兜底及本地页面识图的自定义提示词（进缓存键的提示词哈希） |
+| `perception.vision_cache_ttl` | 60 | caption 兜底及本地页面识图的短时缓存秒数（键 = 七元组，含**图像内容哈希**；v1.6.1 事故修复）；0 关闭 |
 
 > 类型健壮性（v1.3.1）：数值/布尔配置遇非法值（字符串、None、类型错误）自动回退
 > schema 默认值并记录警告，手动编辑 config.json 不会导致插件加载失败；字符串
@@ -468,15 +471,13 @@ LOG=/root/AstrBot/data/logs/astrbot.log
 grep -c "后台任务受理" "$LOG"                     # 分母：受理成功次数（被拒绝的不算）
 grep -c "后台任务终态 status=" "$LOG"             # 四态合计；与上行相等 = 每个受理都收尾了
 grep -c "后台任务终态 status=ok" "$LOG"           # 成功（失败/超时/取消不算）
-grep -c "【后台任务完成】" "$LOG"                 # 用户真的看到的"成功"消息
+grep -c "【后台任务完成】" "$LOG"                 # 日志中的成功终态首行，不能证明用户收到
 grep -c "【后台任务失败】\|【后台任务超时】\|【后台任务已取消】" "$LOG"
 ```
 
-"受理"与"终态"条数不相等 = 还有任务在跑（正常）或投递前进程被杀（异常）；
-用户侧 `【后台任务…】` 条数与终态日志条数不相等 = 有终态消息没投递出去
-（`send_message` 返回 False，按 `task_id` 查日志）。返工后搜索的**可预期失败**
-（空检索词 / 会话被拒 / 禁词 / 无可用后端 / 内部异常）都计 `status=failed`，
-不会再出现在 `【后台任务完成】`/`status=ok` 里 —— 拿这两个数算成功率才是真的。
+同一统计窗口内，受理与终态条数不同可能是任务仍在运行、进程中断或日志窗口不完整；应按 `task_id` 排查。日志中的终态首行即使投递失败也可能出现，**不能用日志前缀计数证明送达，也不能以两项计数之差判断漏投**。请检查投递失败日志，并在接收端核实消息；发送接口返回成功也不等于用户已读。
+
+搜索的**可预期失败**（空检索词 / 会话被拒 / 禁词 / 无可用后端 / 内部异常）计入 `status=failed`；`status=ok` 反映任务执行结果，不等同于送达成功。
 
 ## 🔀 两种后台引擎：两个引擎下 browse_web 的差别（同一工具，两种行为；v1.6.0）
 
@@ -498,7 +499,7 @@ grep -c "【后台任务失败】\|【后台任务超时】\|【后台任务已�
 | 谁在跑 | 插件的后台任务（`asyncio.create_task`，任务表在插件内存 `BackgroundRegistry`） | 核心的后台任务（`is_background_task`，任务归核心 `active_event_registry` 持有） |
 | **谁发消息** | **插件**自己 `context.send_message`，四态前缀（`【后台任务完成】` / `【后台任务失败】` / `【后台任务超时】` / `【后台任务已取消】`） | **核心唤醒一轮主 LLM**，由它用人格口吻在群里交付（返回值里要求它调 `send_message_to_user`） |
 | **是否进上下文** | ❌ 不进（用户追问"刚才看到什么"时模型不知道） | ✅ 进（`persist_agent_history`，用户追问时模型知道） |
-| **交付确定性** | **确定**：只要进程活着，终态必有一条消息（投递失败只记日志） | **不确定**：依赖模型主动调 `send_message_to_user`；不调就只有一条 `nothing was sent to the user` 的 WARNING，**用户收不到** |
+| **交付确定性** | 插件尝试投递终态消息；投递失败可能只记日志，不能保证用户收到 | **不确定**：依赖模型主动调 `send_message_to_user`；不调就只有一条 `nothing was sent to the user` 的 WARNING，**用户收不到** |
 | **前置校验** | **同步拒绝**：会话黑白名单 / 禁词 / 参数 / 路径白名单全在前台，主模型当场看到 `【拒绝】` 并能自纠 | **后台失败**：核心已先回"已提交"，校验失败只能变成唤醒轮上下文里的一条结果，主模型在提交那一刻看到的是"已提交" |
 | **超时** | `tools.background_timeout`（钳 30-900，默认 240）是**唯一**预算 | 同一个键仍然有效（插件在返回前用 `asyncio.wait_for` 自截断，超时以 `【错误】` 文本返回），但**核心另有一层 3600 秒硬上限**（`astr_agent_tool_exec.py:510`） |
 | **重载语义** | `terminate()` 取消在跑任务（等至多 5 秒）并发一条 `【后台任务已取消】` ⇒ **重载即止血** | 任务归核心持有，**插件重载不取消**（也不补终态消息）；止血改用 `/停止`、`/重置`，或把 `background_mode` 改回 `off` |
@@ -604,7 +605,7 @@ grep -c "【后台任务失败】\|【后台任务超时】\|【后台任务已�
 
 | 路径 | 操作 | 生效延迟 | 回滚后行为 |
 |---|---|---|---|
-| **R1** | `tools.background_engine` 改回 **`plugin`** | 下一次工具调用起；**跨着改配置那一刻的那次调用是不确定窗口**（可能一次重复投递，见「热更新窗口」） | `browse_web` 回到插件引擎（`mode=browse_only`/`all` 时仍后台，但恢复"插件保证交付 + 结果不进上下文"） |
+| **R1** | `tools.background_engine` 改回 **`plugin`** | 下一次工具调用起；**跨着改配置那一刻的那次调用是不确定窗口**（可能一次重复投递，见「热更新窗口」） | `browse_web` 回到插件引擎（`mode=browse_only`/`all` 时仍后台，但恢复"插件尝试投递终态 + 结果不进上下文"） |
 | **R2** | `tools.background_mode` 改回 **`off`** | 同上（窗口内那次仍按旧值派发，但交付只有一条：真实结果） | 三个工具全前台同步（v1.4.0 行为），后台标志随之清空 |
 
 两条都**不需要重启、不需要重载插件**：每个工具入口第一行重读配置。
@@ -693,11 +694,9 @@ grep -c "tools.background_engine=core 拒绝启用" "$LOG"    # 核心未修被�
 
 ### 交付口径
 
-v1.7.0 交付的是**库内特性分支与派单**：出厂默认是 `search.mode=external`、`agent.provider_id=""`
-（继承当前会话）、`agent.persona_mode=default`、`tools.background_mode=off` + `tools.background_engine=plugin`
-—— 即**结构与默认值都不改变现有行为**，四项新能力要运营方按需开启。
-生产实例的版本以 fix 的部署回执为准（本版交付时生产为 `v1.6.0`；`v1.6.1` 止血版另有一份派单）。
-本 README 不描述部署状态：**`main` 未合并、未打 tag、未部署**，三件事都要用户显式授权。
+v1.7.0 出厂默认值为 `search.mode=external`、`agent.provider_id=""`（继承当前会话）、
+`agent.persona_mode=default`、`tools.background_mode=off` 和 `tools.background_engine=plugin`。
+实际运行版本及配置应在自己的实例中核对，不能根据仓库分支或标签推断。
 
 ## 🔁 配置迁移与成对回滚（v5：配置叶 45 → 54）
 
@@ -943,9 +942,7 @@ PYTHONDONTWRITEBYTECODE=1 python -m pytest tests/ -q -p no:cacheprovider   # 112
   `core/delivery.py` 只含 artifact 三件套、`SearchService` 无串行入口、
   数据目录走 `_resolve_data_dir()`、`main.py` 无"重复插件检测" WARN 块。
 
-发布流程（**v1.7.0 只走到第 2 步**）：commit → 推特性分支 → （用户授权后）合并 `main` → 打 tag（如 `v1.7.0`）
-→ release.yml 自动打包发布（zip 已排除 `dist/`、`.github/`、`data/`、`__pycache__`）。
-v1.7.0 交付时**未**合并 `main`、**未**打 tag、**未**部署生产 —— 这三件事都要用户显式授权，见交付摘要。
+版本历史见 [CHANGELOG](./CHANGELOG.md)，标签和发布包见 [GitHub Releases](https://github.com/cmdst/astrbot_plugin_browser_llm/releases)。标签、默认分支与运行中的安装副本是不同的版本锚点。
 
 ## 🤝 致谢
 

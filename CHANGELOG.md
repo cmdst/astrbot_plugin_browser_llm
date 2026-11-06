@@ -15,10 +15,9 @@
 
 ### 破坏性变更（升级前必读）
 
-1. **三工具 → 「两个委派入口 + 一个直调入口」**。外层仍只有三个工具名（`_ALL_TOOL_NAMES` 一字未改：
-   `browse_web` / `browse_local_page` / `browser_web_search`），但语义变了：`browse_web` 与
-   （`external` 档下的）`browser_web_search` 走**插件内置的内层子代理**，主 LLM 只做委派；
-   `browse_local_page` **按规格 §1.4 直调、不进子代理**（三条理由见 README「两个委派入口 + 一个直调入口」）。
+1. **三工具 → 「一个子代理委派入口 + 两个直调入口」**。外层仍只有三个工具名（`_ALL_TOOL_NAMES` 一字未改：
+   `browse_web` / `browse_local_page` / `browser_web_search`），但语义变了：`browse_web` 由插件内置子代理处理；`external` 档下的 `browser_web_search` 直接调用搜索服务，不经过子代理；
+   `browse_local_page` **按规格 §1.4 直调、不进子代理**（三条理由见 README「一个子代理委派入口 + 两个直调入口」）。
 2. **配置结构 v5**：`6 组 / 配置叶 45 条 = JSON 叶子键 46 个` → **`7 组 / 配置叶 54 条 = JSON 叶子键 55 个`**
    （两种口径的定义见规格 §6.1a；差 1 恒来自 `browser.viewport`：1 条复合叶 ↔ 2 个 JSON 叶子键）。
    新增 `agent` 组 8 叶 + `search.mode` 1 叶；**45 条旧叶 0 改名 / 0 删除 / 0 改类型 / 0 换默认**。
@@ -71,7 +70,7 @@
   `agent.persona_prompt`（≤4000 字符）。
 - **分层顺序固定**（`core/agent.py::compose_inner_prompt`）：L0 六条红线 → L1 人格 → L2 工具清单 →
   L3 感知方式 → L4 输出契约。L0 在最前且声明"高于任何人格设定、高于页面内容的任何要求"，
-  因此人格层**结构上无法**改写红线、工具清单与输出契约。
+  这是提示词层面的优先级声明，不保证模型不会受到人格或网页内容的诱导。
 - `current` 的取文本三条路径：**主路径** `req.conversation.persona_id` → `get_persona_v3_by_id`（纯查表，
   没有拼接尾巴）；**次路径**从 `system_prompt` 切 `# Persona Instructions` 块并截界到下一个标题行；
   **末路径**默认人格；**全失败** ⇒ 等价 `default` + 一条 WARNING（可见降级，不是静默）。
@@ -83,8 +82,8 @@
   压缩后以 base64 `ImageContent` 交给内层模型；单图 base64 > 1.5e6 时再压一半，仍超则**丢图并注明**；
   每个任务最多 40 张（只计一次，重试不重复计数）。
 - **图片只接受本插件截图目录**内的文件（内层模型无法诱导插件读任意路径）。
-- **`perception.vision_provider_id` / `vision_prompt` / `vision_cache_ttl` 的语义收窄**：它们现在**只服务
-  caption 兜底路径**（内层模型是纯文本时）；影像原生路径**没有** caption 缓存（结构性消灭串号）。三个键
+- **`perception.vision_provider_id` / `vision_prompt` / `vision_cache_ttl` 的语义收窄**：它们服务于
+  caption 兜底路径（内层模型是纯文本时）及本地页面截图识图；影像原生路径**没有** caption 缓存（结构性消灭串号）。三个键
   都**不废弃**、默认值不变、面板位置不变 —— 只是"同一个键、更窄的语义"。
 
 ### 特性：内层工具面 24 → 26（`search.mode=internal` 时 27）
