@@ -15,9 +15,9 @@
 
 ### 破坏性变更（升级前必读）
 
-1. **三工具 → 「两个委派入口 + 一个直调入口」**。外层仍只有三个工具名（`_ALL_TOOL_NAMES` 一字未改：
+1. **三工具 → 「一个子代理委派入口 + 两个直调入口」**。外层仍只有三个工具名（`_ALL_TOOL_NAMES` 一字未改：
    `browse_web` / `browse_local_page` / `browser_web_search`），但语义变了：`browse_web` 由插件内置子代理处理；`external` 档下的 `browser_web_search` 直接调用搜索服务，不经过子代理；
-   `browse_local_page` **按规格 §1.4 直调、不进子代理**（三条理由见 README「两个委派入口 + 一个直调入口」）。
+   `browse_local_page` **按规格 §1.4 直调、不进子代理**（三条理由见 README「一个子代理委派入口 + 两个直调入口」）。
 2. **配置结构 v5**：`6 组 / 配置叶 45 条 = JSON 叶子键 46 个` → **`7 组 / 配置叶 54 条 = JSON 叶子键 55 个`**
    （两种口径的定义见规格 §6.1a；差 1 恒来自 `browser.viewport`：1 条复合叶 ↔ 2 个 JSON 叶子键）。
    新增 `agent` 组 8 叶 + `search.mode` 1 叶；**45 条旧叶 0 改名 / 0 删除 / 0 改类型 / 0 换默认**。
