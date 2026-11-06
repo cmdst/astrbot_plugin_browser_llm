@@ -167,7 +167,7 @@
   "perception": {
     "type": "object",
     "description": "页面感知与识图",
-    "hint": "截图、识图模型、感知方式与会话级规则。内层多模态模型可直接接收原生截图；vision_provider_id / vision_prompt / vision_cache_ttl 用于内层纯文本模型的 caption 兜底，也用于本地页面截图识图，不作用于内层影像原生路径。",
+    "hint": "截图、识图模型、感知方式与会话级规则。内层截图的识图配置语义收窄：多模态模型可直接接收原生截图；vision_provider_id / vision_prompt / vision_cache_ttl 用于内层纯文本模型的 caption 兜底，也用于本地页面截图识图，不作用于内层影像原生路径。",
     "items": {
       "enable_screenshot": {
         "type": "bool",
