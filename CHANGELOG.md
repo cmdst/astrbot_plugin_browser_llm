@@ -117,20 +117,34 @@
 
 **升级（v1.6.0/v1.6.1 → v1.7.0）：配置先、代码后**
 
+以下为分步操作，不要整段粘贴执行；每步成功后再继续。目标通常是实例内的 `data/config/astrbot_plugin_browser_llm_config.json`，应先自行核实。记录升级前的 `BACKUP`；跨会话回滚时重新设置并核实所有路径。失败闸门可能退出当前 shell，建议使用单独 shell。
+
+落盘后复核失败时配置可能已改写，旧类型归一化也可能导致比较失败。不要更换代码或重载旧插件；确认实例和升级前备份后，先按下方恢复步骤还原配置并逐字节核对，再排查干跑警告与失败原因。
+
 ```bash
-CFG=/root/AstrBot/data/config/astrbot_plugin_browser_llm_config.json   # 注意：不是 data/cmd_config.json
-LIB=/root/workspace/projects/astrbot_plugin_browser_llm
-cp -p "$CFG" "$CFG.bak-pre-v5-$(date +%Y%m%d%H%M%S)" && chmod 600 "$CFG".bak-pre-v5-*
-/root/AstrBot/.venv/bin/python "$LIB/tools/migrate_config_v5.py" --config "$CFG" --dry-run
-/root/AstrBot/.venv/bin/python "$LIB/tools/migrate_config_v5.py" --config "$CFG" --apply
-# —— 到这里配置已是 54 配置叶 / 55 JSON 叶子键；下一步才换代码 ——
-/root/AstrBot/.venv/bin/python "$LIB/tools/migrate_config_v5.py" --config "$CFG" --verify --baseline "$CFG.bak-pre-v5-<TS>"
+# 设置并核对 CFG（目标插件配置，不是 data/cmd_config.json）、LIB（v1.7.0 插件库）
+# 与 PYTHON（目标环境的 Python 可执行文件）；迁移会写入配置。
+: "${CFG:?请设置插件配置文件路径}" "${LIB:?请设置插件库路径}" "${PYTHON:?请设置 Python 路径}"
+test -f "$CFG" && test -f "$LIB/tools/migrate_config_v5.py" && test -x "$PYTHON" || { echo '路径检查失败，请停止'; return 1 2>/dev/null || exit 1; }
+umask 077
+BACKUP="${CFG}.bak-pre-v5-$(date +%Y%m%d%H%M%S)"
+( set -C; : > "$BACKUP" ) || { echo '备份已存在或无法创建，请停止'; return 1 2>/dev/null || exit 1; }
+cp "$CFG" "$BACKUP" && chmod 600 "$BACKUP" && cmp -s "$CFG" "$BACKUP" || { echo '备份或校验失败，请停止'; return 1 2>/dev/null || exit 1; }
+"$PYTHON" "$LIB/tools/migrate_config_v5.py" --config "$CFG" --dry-run || { echo '干跑失败，请停止'; return 1 2>/dev/null || exit 1; }
+"$PYTHON" "$LIB/tools/migrate_config_v5.py" --config "$CFG" --apply || { echo '迁移失败，请停止，勿换代码'; return 1 2>/dev/null || exit 1; }
+# 换代码前，先与升级前备份对照验证；失败时不得换代码。
+"$PYTHON" "$LIB/tools/migrate_config_v5.py" --config "$CFG" --verify --baseline "$BACKUP" || { echo '复核失败，请停止，勿换代码'; return 1 2>/dev/null || exit 1; }
+# —— 到这里配置已是 54 配置叶 / 55 JSON 叶子键；先换代码并重载，再执行下方复核 ——
+"$PYTHON" "$LIB/tools/migrate_config_v5.py" --config "$CFG" --verify --baseline "${BACKUP:?请设置并确认升级前备份文件路径}" || { echo '复核失败，请停止'; return 1 2>/dev/null || exit 1; }
 ```
 
 **降级（v1.7.0 → v1.6.1/v1.6.0）：配置先、代码后（方向相反，同样是配置先动）**
 
+确认 `BACKUP` 来自同一实例、同一次升级之前且与目标旧版配置结构匹配；迁移器和字节比较不能判断备份版本。无法确认时停止，不要换旧代码。
+
 ```bash
-/root/AstrBot/.venv/bin/python "$LIB/tools/migrate_config_v5.py" --config "$CFG" --restore-from "$CFG.bak-pre-v5-<TS>"
+"$PYTHON" "$LIB/tools/migrate_config_v5.py" --config "$CFG" --restore-from "${BACKUP:?请设置并确认升级前备份文件路径}" || { echo '恢复失败，请停止，勿换代码'; return 1 2>/dev/null || exit 1; }
+cmp -s "$CFG" "$BACKUP" || { echo '恢复校验失败，请停止，勿换代码'; return 1 2>/dev/null || exit 1; }
 # —— 配置退回 45 配置叶 / 46 JSON 叶子键之后，再拷回 v1.6.x 插件目录 ——
 ```
 
@@ -672,7 +686,7 @@ fix 上线核心的一行修复并重启，再由运营方批准把 `background_
   False 解析（原实现 `bool("false")` 强转 True，语义反转）。
 - **P2-3 browse_local_page 白名单纳入平台工作区**：`_resolve_local_page_roots()`
   恒加入运行时工作区（`get_astrbot_workspaces_path()`，目录存在时），并追加平台
-  工作区候选 `/root/workspace`（存在即加入）与环境变量
+  代码中的平台固定工作区候选（存在即加入，具体路径见 `main.py` 的 `_resolve_local_page_roots`）与环境变量
   `BROWSER_LLM_EXTRA_LOCAL_ROOTS`（冒号分隔，可配置额外根目录）；去重保序，
   标准 AstrBot 部署行为不变。
 - **P2-4 多行链接文本可点击**：`extract_links` 对链接可见文本做空白清洗
@@ -884,7 +898,7 @@ fix 上线核心的一行修复并重启，再由运营方批准把 `background_
 - **repo 地址补齐**（P3）：`metadata.yaml` 的 `repo` 填入
   `https://github.com/cmdst/astrbot_plugin_browser_llm`；
 - **数据脱敏**（P2）：`_LOCAL_PAGE_WORKSPACE_FALLBACK` 移除硬编码真实服务器路径
-  （`/root/AstrBot/data/workspaces`），改为由插件安装位置平台无关推导
+  （此前的服务器专用工作区目录），改为由插件安装位置平台无关推导
   （插件位于 `<astrbot_root>/data/plugins/<plugin>/`，其上级两级即
   `<astrbot_root>/data`，同级 `workspaces`）；`_resolve_local_page_roots` 与
   `browse_local_page` docstring 同步去掉真实路径。「任务约定工作区优先 +

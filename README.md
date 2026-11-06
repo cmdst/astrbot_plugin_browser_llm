@@ -21,7 +21,7 @@ Agent 驱动的网页浏览插件 —— 让 LLM 通过 function-calling 自主�
 - **完整网页交互**：打开网页、提取正文/链接、按文本/坐标/选择器点击、填表、按键、滚动、滑块、下拉框、复选框、标签页管理；v1.6.1 起多匹配控件可指定 `index`，失败时给「相近可点击文本 top-5」；v1.7.0 新增 `browse_get_interactive`（枚举可交互元素，含可直接点 `selector`）与 `browse_click_selector`（给上面那份枚举一个确定性落点）
 - **识图辅助**：接入多模态模型对截图做视觉理解，支持区域裁剪放大识图（`browse_zoom_crop`）
 - **媒体嗅探**：从页面嗅探图片/视频资源，下载并发送到群聊（`browse_sniff_media`）
-- **本地页面自检**：`browse_local_page` 渲染查看本地 HTML 供子代理/开发者自检页面（无头渲染 + 截图 + 视觉描述，视觉不可用时降级文本提取；路径白名单为工作区（AstrBot 工作区 + 平台工作区，如 `/root/workspace`）+ 插件 data 目录，可用环境变量 `BROWSER_LLM_EXTRA_LOCAL_ROOTS`（按系统路径分隔符分隔，Linux/macOS 为冒号、Windows 为分号）追加额外根目录；支持 `perception` 参数按任务控制感知方式——全文本子代理读文档/报错页可传 `perception="text"` 跳过截图识图）
+- **本地页面自检**：`browse_local_page` 渲染查看本地 HTML 供子代理/开发者自检页面（无头渲染 + 截图 + 视觉描述，视觉不可用时降级文本提取；路径白名单为工作区（AstrBot 工作区 + 平台工作区，含代码中存在时启用的固定候选目录，实际路径见 `main.py` 的 `_resolve_local_page_roots`）+ 插件 data 目录，可用环境变量 `BROWSER_LLM_EXTRA_LOCAL_ROOTS`（按系统路径分隔符分隔，Linux/macOS 为冒号、Windows 为分号）追加额外根目录；支持 `perception` 参数按任务控制感知方式——全文本子代理读文档/报错页可传 `perception="text"` 跳过截图识图）
 - **静默模式**：浏览截图仅内部识图，不往群聊刷图（`silent_mode`）
 - **感知模式精细化**：页面感知方式可精确控制——`browse_web` 参数级前缀 `perception=text|text_image|image` 按任务覆盖、`perception_rules` 按会话（UMO 子串匹配）设定默认、全局 `page_perception` 兜底；全文本子代理（前端/测试等）不再为每次浏览付出截图识图开销
 - **识图缓存（v1.6.1 换键，20261026 事故修复）**：缓存键从「同 URL」升级为**七元组** —— `(会话, 规范化URL, 工具种类, 裁剪参数, **图像内容哈希**, 提示词哈希, provider 哈希)`；同一 URL 换了画面**不再**返回旧描述。`vision_cache_ttl` 内同画面重复识图仍复用结果（带 `[缓存]` 前缀），`0` = 关闭
@@ -467,7 +467,8 @@ title + url + 摘要片段 ≤120 字）/ 其余条数的省略提示 / `备注�
 ### 生产判据（部署后照抄；日志口径与用户口径分开数）
 
 ```bash
-LOG=/root/AstrBot/data/logs/astrbot.log
+# 先设置 LOG 为目标 AstrBot 实例的日志文件路径并确认实例与统计窗口
+: "${LOG:?请先设置 LOG 为目标日志文件路径}"
 grep -c "后台任务受理" "$LOG"                     # 分母：受理成功次数（被拒绝的不算）
 grep -c "后台任务终态 status=" "$LOG"             # 四态合计；与上行相等 = 每个受理都收尾了
 grep -c "后台任务终态 status=ok" "$LOG"           # 成功（失败/超时/取消不算）
@@ -684,7 +685,8 @@ grep -c "【后台任务失败】\|【后台任务超时】\|【后台任务已�
 ### 日志判据（只看两条）
 
 ```bash
-LOG=/root/AstrBot/data/logs/astrbot.log
+# 先设置 LOG 为目标 AstrBot 实例的日志文件路径并确认实例与统计窗口
+: "${LOG:?请先设置 LOG 为目标日志文件路径}"
 grep -c "后台引擎=core（原生后台任务）" "$LOG"            # 探测通过、core 真的生效（每次配置签名变化一条 INFO）
 grep -c "tools.background_engine=core 拒绝启用" "$LOG"    # 核心未修被拒（每次签名变化至多一条 ERROR，附修复指引）
 ```
@@ -738,33 +740,48 @@ v5 本身是**纯新增**（9 条新叶：`search.mode` + `agent` 组 8 条）�
 
 ### 升级步骤（配置先 → 代码后）
 
-```bash
-CFG=/root/AstrBot/data/config/astrbot_plugin_browser_llm_config.json   # ← 插件自己的配置文件，**不是** data/cmd_config.json
-LIB=/root/workspace/projects/astrbot_plugin_browser_llm
+以下为分步操作，不要整段粘贴执行；每步成功后再继续，`BACKUP` 记录升级前备份。目标通常是实例内的 `data/config/astrbot_plugin_browser_llm_config.json`，应先自行核实。跨会话回滚时重新设置并核实 `CFG`、`LIB`、`PYTHON` 和 `BACKUP`；失败闸门可能退出当前 shell，建议使用单独 shell。
 
-# 0) 先自己留一份（迁移器也会自动留，但这一步保证"换代码之前一定存在备份"）
-cp -p "$CFG" "$CFG.bak-pre-v5-$(date +%Y%m%d%H%M%S)" && chmod 600 "$CFG".bak-pre-v5-*
+**落盘后复核失败时**，配置可能已经被改写；迁移器对旧类型做归一化也可能使基线比较失败。不要更换代码或重载旧插件；在确认目标实例和备份后，用下方恢复步骤先恢复升级前配置并逐字节核对，再排查干跑警告和失败原因。
+
+```bash
+# 运行前设置 CFG（插件配置文件，不是 data/cmd_config.json）、LIB（v1.7.0 插件库）
+# 和 PYTHON（AstrBot 环境的 Python 可执行文件），确认均指向预期实例和版本。
+: "${CFG:?请设置插件配置文件路径}" "${LIB:?请设置插件库路径}" "${PYTHON:?请设置 Python 路径}"
+test -f "$CFG" && test -f "$LIB/tools/migrate_config_v5.py" && test -x "$PYTHON" || { echo '路径检查失败，请停止'; return 1 2>/dev/null || exit 1; }
+
+# 0) 备份配置；记录本次备份路径，确保不覆盖已有备份。
+umask 077
+BACKUP="${CFG}.bak-pre-v5-$(date +%Y%m%d%H%M%S)"
+( set -C; : > "$BACKUP" ) || { echo '备份已存在或无法创建，请停止'; return 1 2>/dev/null || exit 1; }
+cp "$CFG" "$BACKUP" && chmod 600 "$BACKUP" && cmp -s "$CFG" "$BACKUP" || { echo '备份或校验失败，请停止'; return 1 2>/dev/null || exit 1; }
 
 # 1) 干跑（只看计划：键数 / 分组名 / 新增叶名，不看值）
-/root/AstrBot/.venv/bin/python "$LIB/tools/migrate_config_v5.py" --config "$CFG" --dry-run
+"$PYTHON" "$LIB/tools/migrate_config_v5.py" --config "$CFG" --dry-run || { echo '干跑失败，请停止'; return 1 2>/dev/null || exit 1; }
 
 # 2) 落盘（自动再备份一次 + 原子替换 + 保 BOM / 0600）
-/root/AstrBot/.venv/bin/python "$LIB/tools/migrate_config_v5.py" --config "$CFG" --apply
+"$PYTHON" "$LIB/tools/migrate_config_v5.py" --config "$CFG" --apply || { echo '迁移失败，请停止，勿换代码'; return 1 2>/dev/null || exit 1; }
+
+# 换代码前先验证迁移后的配置与升级前备份：
+"$PYTHON" "$LIB/tools/migrate_config_v5.py" --config "$CFG" --verify --baseline "$BACKUP" || { echo '复核失败，请停止，勿换代码'; return 1 2>/dev/null || exit 1; }
 
 # 3) —— 到这里配置已是 7 组 / 配置叶 54 条 / JSON 叶子键 55 个；**下一步才换代码** ——
 #    换代码 = 把插件目录覆盖成 v1.7.0 → WebUI 重载插件（或重启 AstrBot）
 
 # 4) 换完代码复核：45 条旧叶值不变 + 9 条新叶存在
-/root/AstrBot/.venv/bin/python "$LIB/tools/migrate_config_v5.py" --config "$CFG" \
-    --verify --baseline "$CFG.bak-pre-v5-<TS>"
+"$PYTHON" "$LIB/tools/migrate_config_v5.py" --config "$CFG" \
+    --verify --baseline "${BACKUP:?请设置并确认升级前备份文件路径}" || { echo '复核失败，请停止并排查'; return 1 2>/dev/null || exit 1; }
 ```
 
 ### 降级步骤（v1.7.0 → v1.6.1 / v1.6.0；方向相反，但**同样是配置先动**）
 
+确认 `BACKUP` 确实来自同一实例、同一次升级之前且与目标旧版配置结构匹配；迁移器和下方字节比较不能替你判断备份版本。无法确认时停止，不要换旧代码。
+
 ```bash
 # 1) 配置退回升级前（45 配置叶 / 46 JSON 叶子键）
-/root/AstrBot/.venv/bin/python "$LIB/tools/migrate_config_v5.py" --config "$CFG" \
-    --restore-from "$CFG.bak-pre-v5-<TS>"
+"$PYTHON" "$LIB/tools/migrate_config_v5.py" --config "$CFG" \
+    --restore-from "${BACKUP:?请设置并确认升级前备份文件路径}" || { echo '恢复失败，请停止，勿换代码'; return 1 2>/dev/null || exit 1; }
+cmp -s "$CFG" "$BACKUP" || { echo '恢复校验失败，请停止，勿换代码'; return 1 2>/dev/null || exit 1; }
 # 2) 再拷回 v1.6.x 的插件目录 → 重载
 ```
 
@@ -886,7 +903,7 @@ text_image）。全文本子代理（前端/测试/工程等）读取本地 HTML
 ```bash
 cd astrbot_plugin_browser_llm
 PYTHONDONTWRITEBYTECODE=1 python -m pytest tests/ -q -p no:cacheprovider   # 1128 passed（2026-10-26，v1.7.0）
-/root/AstrBot/.venv/bin/ruff check .                                        # All checks passed!
+ruff check .  # 请先在所用开发环境安装 ruff；历史结果为通过
 ```
 
 测试覆盖（`tests/test_*.py` **50** 个文件 / **1128** 条用例；`tests/` 目录 .py 文件 **51** 个，含 `conftest.py`）：
