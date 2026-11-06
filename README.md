@@ -184,7 +184,7 @@ Agent 驱动的网页浏览插件 —— 让 LLM 通过 function-calling 自主�
 
 依赖：运行环境需要 Playwright 及对应的 Chromium 浏览器；是否已安装取决于 AstrBot 实例。缺失时请按 [Playwright 安装文档](https://playwright.dev/python/docs/intro)在 AstrBot 所用 Python 环境安装并准备浏览器。
 
-仓库地址安装应核对安装器实际选用的分支或归档；本机 AstrBot 的普通 GitHub 地址使用 HEAD 归档，通常对应默认分支，但其他版本的安装器可能不同。需要固定版本时可从对应标签或 Release 取得文件，并核验插件 `metadata.yaml` 和来源提交；仅版本字段不能唯一标识源码。将文件放入插件目录前先备份原插件与配置。页面内容、截图和搜索请求可能发送给所配置的模型或第三方服务；网页内容也可能进入日志，避免处理不应外发的敏感信息。
+仓库地址安装应核对安装器实际选用的分支或归档；部分 AstrBot 版本使用 GitHub 的 HEAD 归档，通常对应默认分支，但其他版本的安装器可能不同。需要固定版本时可从对应标签或 Release 取得文件，并核验插件 `metadata.yaml` 和来源提交；仅版本字段不能唯一标识源码。将文件放入插件目录前先备份原插件与配置。页面内容、截图和搜索请求可能发送给所配置的模型或第三方服务；网页内容也可能进入日志，避免处理不应外发的敏感信息。
 
 **v1.7.0 的前置**：建议先在 AstrBot 里配好一个**多模态 + 支持函数调用**的聊天 provider（内层子代理用）；
 留空 `agent.provider_id` 也能跑（继承当前会话），但那种模式下挑不了模型。
@@ -239,7 +239,7 @@ v1.7.0 新增的内嵌子代理组（8 条，见本节末尾）。
 | `perception.perception_rules` | [] | 会话级感知规则：按 UMO 子串匹配设定会话默认感知方式。每条含 `match`、`perception`、可选 `note`；命中第一条生效 |
 | `perception.vision_provider_id` | - | **caption 兜底用的**多模态识图模型 Provider ID（下拉自动同步已配置模型）。用于 caption 兜底和本地页面识图；内层子代理是多模态模型时走影像原生、不经过它；留空则纯文本内层模型的截图**没有**文字描述（该工具返回【不可用】） |
 | `perception.vision_prompt` | - | caption 兜底及本地页面识图的自定义提示词（进缓存键的提示词哈希） |
-| `perception.vision_cache_ttl` | 60 | caption 兜底路径的识图短时缓存秒数（键 = 七元组，含**图像内容哈希**；v1.6.1 事故修复）；0 关闭 |
+| `perception.vision_cache_ttl` | 60 | caption 兜底及本地页面识图的短时缓存秒数（键 = 七元组，含**图像内容哈希**；v1.6.1 事故修复）；0 关闭 |
 
 > 类型健壮性（v1.3.1）：数值/布尔配置遇非法值（字符串、None、类型错误）自动回退
 > schema 默认值并记录警告，手动编辑 config.json 不会导致插件加载失败；字符串
